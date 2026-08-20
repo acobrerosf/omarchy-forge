@@ -33,8 +33,15 @@ per session, panels subscribe to it.
 The helper always prints exactly one object on stdout, whatever failed:
 
 ```json
-{"ok": bool, "status": int, "rateRemaining": int|null, "body": any, "error": string|null}
+{"ok": bool, "status": int, "rateRemaining": int|null, "rateReset": int|null,
+ "body": any, "error": string|null}
 ```
+
+`rateReset` is **seconds from now**, not a header value. Forge is Laravel, so a refusal carries
+`Retry-After` (seconds) and `X-RateLimit-Reset` (a unix timestamp) and a successful response
+carries neither. Folding both into one number in the helper keeps header formats in the file that
+already parses headers, and keeps the widget from comparing its clock against another machine's.
+
 
 Transport failures, HTTP errors and success arrive through the same door. Two brittle couplings
 live here:
@@ -72,6 +79,17 @@ whole reason polling lives in the service and not the widget.
 
 The ledger lives in the `budget` object inside `Service.qml`. Nothing outside the service reads
 it, so unlike the state panels bind to it is mutated in place rather than copy-on-write.
+
+**Absorbing a 429.** The ledger counts only what this process spent, so a browser tab or another
+script on the same Forge user can burn the minute behind its back. A refusal therefore holds the
+*bucket* — `budget.block` / `budget.blockedMs`, keyed the same way the ledger is, so every
+organization behind that identity waits together. Three things follow from it: work already queued
+for the bucket is dropped, because it would land inside the same closed minute and the `sweepDone`
+markers going with it are why `_holdAccount` ends those refreshes by hand; `refresh()` is the one
+gate that consults the hold, since `nextDueMs` alone cannot hold anything through a `_reconcile`
+that zeroes it; and `deploy()` refuses with the time remaining rather than spending a request that
+would only push the hold further out. The refusal is reported as the organization's `lastError` —
+`accountError` would read as "not set up" and blank the server list the bar icon judges.
 
 ## Queue, scheduling, pagination
 

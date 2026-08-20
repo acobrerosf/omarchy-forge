@@ -234,29 +234,56 @@ token_clear() {
 #
 # Prints one JSON envelope on stdout, always, whatever happened:
 #
-#   {"ok":bool,"status":int,"rateRemaining":int|null,"body":any,"error":string|null}
+#   {"ok":bool,"status":int,"rateRemaining":int|null,"rateReset":int|null,
+#    "body":any,"error":string|null}
 #
 # The widget parses exactly that shape, so transport failures and HTTP errors
-# arrive through the same door as a successful response.
+# arrive through the same door as a successful response. `rateReset` is seconds
+# from now, not a header value — see rate_reset_seconds.
 
 envelope() {
   jq -n \
     --argjson ok "$1" \
     --argjson status "$2" \
     --arg remaining "$3" \
-    --arg error "$4" \
+    --arg reset "$4" \
+    --arg error "$5" \
     '{
       ok: $ok,
       status: $status,
       rateRemaining: (if $remaining == "" then null else ($remaining | tonumber? // null) end),
+      rateReset: (if $reset == "" then null else ($reset | tonumber? // null) end),
       body: null,
       error: (if $error == "" then null else $error end)
     }'
 }
 
+# One header out of a --dump-header file. The last occurrence wins: --location
+# appends a header block per redirect hop.
+header_value() {
+  grep -i "^$2:" "$1" 2>/dev/null | tail -n 1 | tr -d '\r' | cut -d: -f2- | tr -d '[:space:]' || true
+}
+
+# Seconds until the rate limit resets, from Laravel's two throttle headers —
+# `Retry-After` is already a count of seconds, `X-RateLimit-Reset` is a unix
+# timestamp, and both only appear on the response that refuses. Folding them
+# into one number here keeps the widget from reasoning about another machine's
+# wall clock. Prints nothing when neither header says anything usable.
+rate_reset_seconds() {
+  local retry=$1 reset=$2 now
+  if [[ $retry =~ ^[0-9]+$ ]]; then
+    printf '%s' "$retry"
+    return 0
+  fi
+  [[ $reset =~ ^[0-9]+$ ]] || return 0
+  printf -v now '%(%s)T' -1
+  ((reset > now)) && printf '%s' "$((reset - now))"
+  return 0
+}
+
 api_request() {
   local method=$1 path=$2 account=${3:-}
-  local token escaped url tmp status remaining ok=false
+  local token escaped url tmp status remaining reset ok=false
 
   [[ -n $account ]] || account=$(default_account)
 
@@ -264,7 +291,7 @@ api_request() {
   if [[ -z $token ]]; then
     # The widget matches on this prefix to tell "not set up yet" apart from a
     # request that actually failed, so it has to stay stable.
-    envelope false 0 "" "No API token for account '$account'. Run: omarchy-forge add"
+    envelope false 0 "" "" "No API token for account '$account'. Run: omarchy-forge add"
     return 3
   fi
 
@@ -297,8 +324,10 @@ api_request() {
         --write-out '%{http_code}' \
         "$url" 2>"$tmp/curl_err"
   ); then
-    remaining=$(grep -i '^x-ratelimit-remaining:' "$tmp/headers" 2>/dev/null |
-      tail -n 1 | tr -d '\r' | cut -d: -f2- | tr -d '[:space:]' || true)
+    remaining=$(header_value "$tmp/headers" 'x-ratelimit-remaining')
+    reset=$(rate_reset_seconds \
+      "$(header_value "$tmp/headers" 'retry-after')" \
+      "$(header_value "$tmp/headers" 'x-ratelimit-reset')")
     ((status < 400)) && ok=true
 
     # An empty body (204) and a non-JSON body (an HTML page from a proxy) both
@@ -308,17 +337,19 @@ api_request() {
       --argjson ok "$ok" \
       --argjson status "$status" \
       --arg remaining "$remaining" \
+      --arg reset "$reset" \
       --slurpfile body "$tmp/body" \
       '{
         ok: $ok,
         status: $status,
         rateRemaining: (if $remaining == "" then null else ($remaining | tonumber? // null) end),
+        rateReset: (if $reset == "" then null else ($reset | tonumber? // null) end),
         body: ($body[0] // null),
         error: null
       }' 2>/dev/null ||
-      envelope "$ok" "$status" "$remaining" "HTTP $status with a non-JSON body"
+      envelope "$ok" "$status" "$remaining" "$reset" "HTTP $status with a non-JSON body"
   else
-    envelope false 0 "" "$(tr -d '\r' <"$tmp/curl_err" | tail -n 1)"
+    envelope false 0 "" "" "$(tr -d '\r' <"$tmp/curl_err" | tail -n 1)"
   fi
 
   rm -rf "$tmp"

@@ -149,6 +149,13 @@ The site sweep for an organization is dropped for that tick if it would take its
 minute over 40 requests; the panel says so when that happens. A server list is never dropped,
 because the bar icon depends on it.
 
+That ledger only counts what the widget itself spent, so Forge can still refuse a request — the
+dashboard in a browser tab is spending the same minute. When it does, the panel says "rate limited"
+and everything on that Forge account stops until the limit resets: queued work is dropped rather
+than sent, refreshes wait, and a deploy tells you how many seconds are left instead of asking again.
+It resumes on its own. Forge says when the reset is due on the response that refuses; if it doesn't,
+the wait is a minute.
+
 If you have a lot of servers, either raise the interval or turn **Watch deployments** off — that
 drops the cost to one request per organization per tick, at the price of showing server health only.
 
@@ -200,8 +207,11 @@ ln -sf ~/.config/omarchy/plugins/acobrerosf.forge/omarchy-forge ~/.local/bin/oma
 `api` always prints one envelope, whatever went wrong:
 
 ```json
-{"ok": true, "status": 200, "rateRemaining": 57, "body": { }, "error": null}
+{"ok": true, "status": 200, "rateRemaining": 57, "rateReset": null, "body": { }, "error": null}
 ```
+
+`rateReset` is how many seconds are left before the limit resets, or `null` — Forge only says when
+it is the response refusing you.
 
 `--account` names the credential to use and `--org` picks it by which organization owns it; with
 neither, the account behind the default organization is used. `$FORGE_TOKEN` overrides the keyring
@@ -225,8 +235,6 @@ one reaches, and which is the default. Tokens are never in there.
   `{serverId}` is available if you need the numeric server id instead. Note that a server's
   slug is fixed at creation and does not follow a rename, which is why it has to come from the API
   rather than be derived from the name.
-- **A 429 is reported but not yet absorbed.** The panel says "rate limited" when Forge refuses a
-  request, but the refresh interval does not actually lengthen in response.
 - Server actions — reboot, restarting nginx or PHP — are deliberately not here yet. Deploying is
   the one write this version does.
 - **Long lists stop at 150 rows.** Forge returns 30 rows a page — whatever `page[size]` asks for —

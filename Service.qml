@@ -400,6 +400,22 @@ Item {
       var times = _spentAt[bucket]
       if (times && times.length > 0) times.pop()
     }
+
+    // bucket → the moment it may be used again. The ledger above only counts
+    // what this process spent, so a 429 means something else on the same Forge
+    // user burnt the minute — a browser tab, another script — and the hold has
+    // to outrank the local count until Forge says otherwise.
+    property var _blockedUntil: ({})
+
+    function block(bucket, untilMs) {
+      if (untilMs > (_blockedUntil[bucket] || 0)) _blockedUntil[bucket] = untilMs
+    }
+
+    // Milliseconds still to wait for this account's identity, 0 when clear.
+    function blockedMs(account) {
+      var left = (_blockedUntil[bucketFor(account)] || 0) - Date.now()
+      return left > 0 ? left : 0
+    }
   }
 
   // ------------------------------------------------------------------ queue
@@ -432,13 +448,19 @@ Item {
       return _jobs.length > 0 ? _jobs.shift() : null
     }
 
+    // The one filter. What counts as work worth throwing away is the service's
+    // judgement, so it arrives as a predicate rather than as knowledge here.
+    function drop(shouldDrop) {
+      var kept = []
+      for (var i = 0; i < _jobs.length; i++)
+        if (!shouldDrop(_jobs[i])) kept.push(_jobs[i])
+      _jobs = kept
+    }
+
     // Work queued for an organization nobody watches any more is spend with no
     // reader.
     function keepOrgs(wanted) {
-      var kept = []
-      for (var i = 0; i < _jobs.length; i++)
-        if (wanted[_jobs[i].org] !== undefined) kept.push(_jobs[i])
-      _jobs = kept
+      drop(function (job) { return wanted[job.org] === undefined })
     }
   }
 
@@ -520,6 +542,11 @@ Item {
     var key = String(org)
     var state = orgs[key]
     if (!state || state.refreshing) return
+    // The one gate every refresh passes through — the ticker, the CLI, a middle
+    // click, and the short look-again after a deploy. `nextDueMs` alone could
+    // not hold them: `_reconcile` zeroes it whenever the state file changes.
+    // The 429 already left its word in `lastError`, so this says nothing new.
+    if (budget.blockedMs(state.account || accountForOrg(key)) > 0) return
     _patch(key, { refreshing: true, note: "" })
     queue.push({ org: key, account: state.account || accountForOrg(key),
                  kind: "servers", page: 1, rows: [] })
@@ -561,6 +588,17 @@ Item {
       return false
     }
 
+    // Being refused for the minute is the whole Forge identity's problem, and
+    // every organization behind it has to stop rather than take turns being
+    // told no. This is the choke point every response passes through, so one
+    // branch covers the server list, the sweep and a deploy alike.
+    if (envelope.status === 429) {
+      changes.hasToken = true
+      _patchAccount(account, changes)
+      _holdAccount(account, envelope)
+      return false
+    }
+
     // A rejected token is the account's problem too, and worth saying once
     // rather than once per organization behind it.
     if (envelope.status === 401 || envelope.status === 403) {
@@ -574,6 +612,27 @@ Item {
     // restored, for as long as anything else kept going wrong.
     if (org) _patch(org, { lastError: Model.envelopeError(envelope), accountError: "" })
     return false
+  }
+
+  // Everything already queued for this identity would land inside the same
+  // closed minute, so it is thrown away rather than sent — and with it go the
+  // `sweepDone` markers that would have ended those refreshes, which is why
+  // each one is ended here instead.
+  function _holdAccount(account, envelope) {
+    var bucket = budget.bucketFor(account)
+    budget.block(bucket, Model.backoffUntilMs(envelope, Date.now()))
+    queue.drop(function (job) { return budget.bucketFor(job.account) === bucket })
+
+    var message = Model.envelopeError(envelope)
+    for (var org in _config) {
+      var state = orgs[org]
+      if (!state) continue
+      if (budget.bucketFor(state.account || accountForOrg(org)) !== bucket) continue
+      // `lastError`, not `accountError`: an account-level verdict blanks the
+      // server list further down, and the bar icon judges what it can see.
+      _patch(org, { lastError: message, accountError: "" })
+      if (state.refreshing) _finishRefresh(org)
+    }
   }
 
   function _onServers(job, text) {
@@ -671,9 +730,15 @@ Item {
   }
 
   function _finishRefresh(org) {
+    var state = orgs[org]
     var config = _config[org]
     var seconds = config ? config.refreshIntervalSec : 60
-    _patch(org, { refreshing: false, nextDueMs: Date.now() + seconds * 1000 })
+    var now = Date.now()
+    // A hold on the account outlives the configured interval: coming back
+    // before the minute resets only spends another refusal. Every path that
+    // ends a refresh goes through here, so none of them can undercut it.
+    var held = state ? budget.blockedMs(state.account || accountForOrg(org)) : 0
+    _patch(org, { refreshing: false, nextDueMs: now + Math.max(seconds * 1000, held) })
   }
 
   // ----------------------------------------------------------- notifications
@@ -731,6 +796,16 @@ Item {
     _deployOrg = String(org)
     _deployAccount = (orgs[_deployOrg] && orgs[_deployOrg].account)
       || accountForOrg(_deployOrg)
+    // Sending it anyway would only earn another refusal and push the hold out
+    // further, so say when it can be pressed again rather than spending it.
+    var held = budget.blockedMs(_deployAccount)
+    if (held > 0) {
+      _deployOrg = ""
+      _deployAccount = ""
+      deployFinished(site.key, false,
+                     "Rate limited — try again in " + Math.ceil(held / 1000) + "s")
+      return
+    }
     deployingSiteKey = site.key
     budget.charge(budget.bucketFor(_deployAccount))
     actionProcess.command = [cliPath, "api", "--account", _deployAccount, "POST",
@@ -839,8 +914,8 @@ Item {
       var text = String(fetchOut.text || "")
       if (root._timedOut) {
         root._timedOut = false
-        text = JSON.stringify({ ok: false, status: 0, rateRemaining: null, body: null,
-                                error: "The Forge helper timed out" })
+        text = JSON.stringify({ ok: false, status: 0, rateRemaining: null, rateReset: null,
+                                body: null, error: "The Forge helper timed out" })
       }
       root._current = null
       if (job) {

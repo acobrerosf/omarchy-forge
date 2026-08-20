@@ -101,6 +101,6 @@ Don't reword that message without changing both.
 
 ## Known gaps (from README)
 
-A 429 is reported but does not lengthen the interval; the dashboard URL is a template because the
-API hands out no web link; server actions beyond deploy are deliberately absent; a cursor chain
-stops at 5 pages (150 rows) or when the account's minute is nearly spent, and says so.
+The dashboard URL is a template because the API hands out no web link; server actions beyond
+deploy are deliberately absent; a cursor chain stops at 5 pages (150 rows) or when the account's
+minute is nearly spent, and says so.

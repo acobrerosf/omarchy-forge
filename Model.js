@@ -12,20 +12,35 @@ function parseEnvelope(text) {
     var parsed = JSON.parse(String(text || ""))
     if (parsed && typeof parsed === "object") return parsed
   } catch (e) {}
-  return { ok: false, status: 0, rateRemaining: null, body: null,
+  return { ok: false, status: 0, rateRemaining: null, rateReset: null, body: null,
            error: "The Forge helper returned something that wasn't JSON" }
 }
 
 function envelopeError(envelope) {
   if (!envelope) return "No response"
   if (envelope.error) return String(envelope.error)
-  var body = envelope.body
-  if (body && body.message) return String(body.message)
+  // Status before the body's own message: Forge words a 429 as "Too Many
+  // Attempts.", which says nothing about what the widget just did with it.
   if (envelope.status === 401) return "Token rejected"
   if (envelope.status === 403) return "Token is missing a scope for this"
   if (envelope.status === 404) return "Not found"
   if (envelope.status === 429) return "Rate limited — backing off"
+  var body = envelope.body
+  if (body && body.message) return String(body.message)
   return "HTTP " + envelope.status
+}
+
+// When to start sending again after a refusal. `rateReset` is seconds from now
+// when the helper could read it off the response; a 429 without one still has
+// to wait, or the next tick just spends another request inside the same closed
+// minute. The ceiling keeps a nonsense header from parking the widget.
+var backoffFallbackSec = 60
+var backoffCeilingSec = 300
+
+function backoffUntilMs(envelope, now) {
+  var seconds = Number(envelope ? envelope.rateReset : NaN)
+  if (!isFinite(seconds) || seconds <= 0) seconds = backoffFallbackSec
+  return now + Math.min(seconds, backoffCeilingSec) * 1000
 }
 
 // -------------------------------------------------------------------- servers
