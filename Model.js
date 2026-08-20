@@ -209,6 +209,83 @@ function deploymentLabel(status) {
   return value.replace(/-/g, " ")
 }
 
+// -------------------------------------------------------------------- rows
+
+// One panel row's text and tone, whatever the row stands for. The panel
+// resolves a row into its facts and hands them over as `ctx`; the branching on
+// which of the three kinds it is lives here, in one readable place, rather
+// than repeated inside four separate bindings in the delegate.
+//
+// ctx: { server, site, orgLabel, orgHealth, orgSummary, siteCount,
+//        showOrgHeaders }
+//
+// Nothing here may touch a QML type, so the result carries `depth` rather than
+// a pixel indent and `tone` rather than a colour — ForgeRow owns the metrics
+// and the palette those turn into.
+function rowView(row, ctx) {
+  var kind = row ? String(row.kind) : ""
+  var c = ctx || {}
+
+  if (kind === "org") {
+    // An organization row stands for everything under it, so it wears the
+    // same verdict the bar icon would give that one.
+    var health = String(c.orgHealth || "setup")
+    var tone = health === "bad" || health === "error" ? "bad"
+      : health === "setup" ? "idle"
+      : health === "busy" ? "busy" : "ok"
+    // The slug is what the dashboard URL uses, so it is worth showing when the
+    // name differs from it.
+    var slug = String(row.org)
+    return {
+      kind: kind,
+      label: String(c.orgLabel || slug),
+      detail: String(c.orgLabel || slug) === slug ? "" : slug,
+      status: String(c.orgSummary || ""),
+      tone: tone,
+      depth: 0,
+      showChevron: true,
+      siteKey: "",
+      deployedAt: ""
+    }
+  }
+
+  if (kind === "site") {
+    var site = c.site
+    var parts = []
+    if (site && site.branch) parts.push(site.branch)
+    if (site && site.commitHash) parts.push(site.commitHash)
+    return {
+      kind: kind,
+      label: site ? String(site.name) : "",
+      detail: parts.join(" · "),
+      status: site ? deploymentLabel(site.deploymentStatus) : "",
+      tone: site ? deploymentTone(site.deploymentStatus) : "idle",
+      // Servers sit under their organization when there is one to sit under,
+      // and sites under their server either way.
+      depth: (c.showOrgHeaders ? 1 : 0) + 1,
+      showChevron: false,
+      siteKey: site ? String(site.key) : "",
+      deployedAt: site ? site.deployedAt : ""
+    }
+  }
+
+  var server = c.server
+  var count = Number(c.siteCount || 0)
+  return {
+    kind: "server",
+    label: server ? String(server.name) : "",
+    detail: server ? serverMeta(server) : "",
+    status: !server ? ""
+      : server.state !== "ready" ? serverStateLabel(server.state)
+      : count > 0 ? pluralize(count, "site") : "ready",
+    tone: server ? serverTone(server.state) : "idle",
+    depth: c.showOrgHeaders ? 1 : 0,
+    showChevron: true,
+    siteKey: "",
+    deployedAt: ""
+  }
+}
+
 // ----------------------------------------------------------------- org state
 
 // The shape the panel reads for one organization. Defined here so the service
@@ -374,13 +451,34 @@ function encode(value) {
   return encodeURIComponent(String(value))
 }
 
-function serversPath(org) {
-  return "/orgs/" + encode(org) + "/servers?page%5Bsize%5D=100&sort=name"
+// Forge caps a page at 30 however large `page[size]` asks for, and says so
+// only in `meta.per_page` — no error, no warning. Asking for a bigger number
+// therefore buys nothing but the illusion of a complete list, so ask for what
+// is actually available and follow the cursor for the rest.
+var pageSize = 30
+
+function pagedPath(path, cursor) {
+  var url = path + (path.indexOf("?") === -1 ? "?" : "&") + "page%5Bsize%5D=" + pageSize
+  return cursor ? url + "&page%5Bcursor%5D=" + encode(cursor) : url
 }
 
-function sitesPath(org, serverId) {
-  return "/orgs/" + encode(org) + "/servers/" + encode(serverId)
-    + "/sites?include=latestDeployment&page%5Bsize%5D=100&sort=name"
+// Pagination is cursor-based rather than offset-based, and `meta.next_cursor`
+// is the only signal worth reading: `links` comes back as an empty *array*
+// when there is nothing to link to, so probing it for `.next` would work on
+// every page but the last one, which is the only page that matters.
+function nextCursor(body) {
+  var meta = body ? body.meta : null
+  var cursor = meta ? meta.next_cursor : null
+  return cursor ? String(cursor) : ""
+}
+
+function serversPath(org, cursor) {
+  return pagedPath("/orgs/" + encode(org) + "/servers?sort=name", cursor)
+}
+
+function sitesPath(org, serverId, cursor) {
+  return pagedPath("/orgs/" + encode(org) + "/servers/" + encode(serverId)
+    + "/sites?include=latestDeployment&sort=name", cursor)
 }
 
 function deployPath(org, serverId, siteId) {

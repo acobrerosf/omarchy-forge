@@ -137,6 +137,8 @@ records who a token belongs to.
 One refresh costs one request per organization for its server list, plus one per ready server for
 its sites and their latest deployment (`?include=latestDeployment` folds those into a single call).
 So five servers in one organization cost six requests a minute at the default 60-second interval.
+A list longer than 30 rows costs one more request per extra page, since that is how Forge hands
+long lists out — see below.
 
 That figure does not change with the number of screens. Polling lives in a single service the
 shell loads once per session, not in the bar widget — which is created once per monitor. Two
@@ -229,7 +231,11 @@ time anything is written.
   request, but the refresh interval does not actually lengthen in response.
 - Server actions — reboot, restarting nginx or PHP — are deliberately not here yet. Deploying is
   the one write this version does.
-- Pagination stops at 100 organizations, 100 servers, and 100 sites per server.
+- **Long lists stop at 150 rows.** Forge returns 30 rows a page — whatever `page[size]` asks for —
+  and points at the rest with a cursor. The widget follows it, up to five pages, or until the
+  account's minute is nearly spent. Past that the panel says "showing the first 150 servers" rather
+  than quietly showing a prefix. `omarchy-forge` does the same on the command line and warns on
+  stderr; `FORGE_MAX_PAGES` raises the cap for a one-off run.
 
 ## License
 

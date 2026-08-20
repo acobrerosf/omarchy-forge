@@ -218,6 +218,24 @@ Panel {
     return null
   }
 
+  // Everything a row needs drawing, gathered here so the delegate itself holds
+  // no service reference. The volatile per-screen bits — cursor, armed,
+  // deploying, relative time — are bound separately on the delegate, so moving
+  // the cursor or the clock ticking doesn't re-derive every row's text.
+  function rowView(row) {
+    if (!row) return Model.rowView(null, {})
+    var isOrg = row.kind === "org"
+    return Model.rowView(row, {
+      server: isOrg ? null : serverById(row.org, row.serverId),
+      site: siteFor(row),
+      orgLabel: orgLabel(row.org),
+      orgHealth: isOrg && forge ? forge.healthFor(row.org) : "",
+      orgSummary: isOrg && forge ? forge.summaryFor(row.org) : "",
+      siteCount: row.kind === "server" ? sitesFor(row.org, row.serverId).length : 0,
+      showOrgHeaders: showOrgHeaders
+    })
+  }
+
   function currentRow() { return rowAt(cursorIndex) }
   function currentServer() {
     var row = currentRow()
@@ -568,207 +586,60 @@ Panel {
             Repeater {
               model: root.rows
 
-              Rectangle {
+              ForgeRow {
                 id: rowItem
                 required property var modelData
                 required property int index
 
-                readonly property bool isOrg: modelData.kind === "org"
-                readonly property bool isSite: modelData.kind === "site"
-                readonly property var server: rowItem.isOrg
-                  ? null : root.serverById(modelData.org, modelData.serverId)
-                readonly property var site: rowItem.isSite ? root.siteFor(modelData) : null
-                readonly property bool hasCursor: root.cursorActive && root.cursorIndex === index
-                readonly property bool armed: rowItem.isSite && rowItem.site
-                  && root.armedSiteKey === rowItem.site.key
-                readonly property bool deploying: rowItem.isSite && rowItem.site
-                  && root.deployingKey === rowItem.site.key
-
-                // An organization row stands for everything under it, so it
-                // wears the same verdict the bar icon would give that one.
-                readonly property string tone: {
-                  if (rowItem.isOrg) {
-                    switch (root.forge ? root.forge.healthFor(modelData.org) : "setup") {
-                    case "bad": return "bad"
-                    case "error": return "bad"
-                    case "setup": return "idle"
-                    case "busy": return "busy"
-                    }
-                    return "ok"
-                  }
-                  if (rowItem.isSite)
-                    return rowItem.site ? Model.deploymentTone(rowItem.site.deploymentStatus) : "idle"
-                  return rowItem.server ? Model.serverTone(rowItem.server.state) : "idle"
-                }
-
-                readonly property color toneColor: {
-                  switch (rowItem.tone) {
-                  case "bad": return root.badColor
-                  case "busy": return root.busyColor
-                  case "ok": return root.okColor
-                  }
-                  return root.dim
-                }
-
-                readonly property bool expanded: rowItem.isOrg
-                  ? root.isOrgExpanded(modelData.org)
-                  : root.isExpanded(modelData.org, modelData.serverId)
-
-                // Servers sit under their organization when there is one to
-                // sit under, and sites under their server either way.
-                readonly property int indent: rowItem.isOrg ? 0
-                  : (root.showOrgHeaders ? Style.space(16) : 0)
-                    + (rowItem.isSite ? Style.space(16) : 0)
+                readonly property var view: root.rowView(modelData)
 
                 width: parent.width
-                implicitHeight: rowContent.implicitHeight + Style.space(10)
-                height: implicitHeight
-                radius: Style.cornerRadius
-                color: rowItem.hasCursor ? root.hoverFill : "transparent"
+                indentStep: Style.space(16)
 
-                MouseArea {
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  acceptedButtons: Qt.LeftButton | Qt.RightButton
-                  onEntered: { root.cursorActive = true; root.cursorIndex = rowItem.index }
-                  onClicked: function(mouse) {
-                    root.cursorIndex = rowItem.index
-                    root.cursorActive = true
-                    if (mouse.button === Qt.RightButton) root.openCurrentInForge()
-                    else root.activate()
-                  }
+                kind: rowItem.modelData.kind
+                label: rowItem.view.label
+                detail: rowItem.view.detail
+                status: rowItem.view.status
+                tone: rowItem.view.tone
+                depth: rowItem.view.depth
+                showChevron: rowItem.view.showChevron
+                expanded: rowItem.modelData.kind === "org"
+                  ? root.isOrgExpanded(rowItem.modelData.org)
+                  : root.isExpanded(rowItem.modelData.org, rowItem.modelData.serverId)
+
+                // Bound separately rather than folded into `view`: these change
+                // on their own clock, and re-deriving every row's text on a
+                // cursor move or a tick would be wasted work.
+                hasCursor: root.cursorActive && root.cursorIndex === rowItem.index
+                armed: rowItem.view.siteKey !== ""
+                  && root.armedSiteKey === rowItem.view.siteKey
+                deploying: rowItem.view.siteKey !== ""
+                  && root.deployingKey === rowItem.view.siteKey
+                timeText: rowItem.view.deployedAt
+                  ? Model.relativeTime(rowItem.view.deployedAt, root.nowMs) : ""
+
+                foreground: root.foreground
+                dimColor: root.dim
+                badColor: root.badColor
+                busyColor: root.busyColor
+                okColor: root.okColor
+                urgentColor: root.urgent
+                cursorFill: root.hoverFill
+                fontFamily: root.fontFamily
+
+                onEntered: {
+                  root.cursorActive = true
+                  root.cursorIndex = rowItem.index
                 }
-
-                Row {
-                  id: rowContent
-                  anchors.left: parent.left
-                  anchors.right: parent.right
-                  anchors.verticalCenter: parent.verticalCenter
-                  anchors.leftMargin: Style.space(8) + rowItem.indent
-                  anchors.rightMargin: Style.space(8)
-                  spacing: Style.space(8)
-
-                  Rectangle {
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: Style.space(6)
-                    height: width
-                    radius: width / 2
-                    color: rowItem.toneColor
-                    opacity: rowItem.tone === "idle" ? 0.4 : 1.0
-
-                    SequentialAnimation on opacity {
-                      running: rowItem.tone === "busy"
-                      loops: Animation.Infinite
-                      alwaysRunToEnd: true
-                      NumberAnimation { from: 1.0; to: 0.3; duration: 700 }
-                      NumberAnimation { from: 0.3; to: 1.0; duration: 700 }
-                    }
-                  }
-
-                  Column {
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: Math.max(0, parent.width - Style.space(6) - trailing.implicitWidth
-                      - parent.spacing * 2 - chevron.width)
-                    spacing: Style.space(2)
-
-                    Text {
-                      width: parent.width
-                      elide: Text.ElideRight
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: rowItem.isSite ? Style.font.bodySmall : Style.font.body
-                      font.bold: rowItem.isOrg
-                      text: {
-                        if (rowItem.isOrg) return root.orgLabel(rowItem.modelData.org)
-                        if (rowItem.isSite) return rowItem.site ? rowItem.site.name : ""
-                        return rowItem.server ? rowItem.server.name : ""
-                      }
-                    }
-
-                    Text {
-                      width: parent.width
-                      elide: Text.ElideRight
-                      visible: text !== ""
-                      color: root.foreground
-                      opacity: 0.5
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      text: {
-                        if (rowItem.isOrg) {
-                          // The slug is what the dashboard URL uses, so it is
-                          // worth showing when the name differs from it.
-                          var slug = String(rowItem.modelData.org)
-                          return root.orgLabel(slug) === slug ? "" : slug
-                        }
-                        if (rowItem.isSite) {
-                          if (!rowItem.site) return ""
-                          var parts = []
-                          if (rowItem.site.branch) parts.push(rowItem.site.branch)
-                          if (rowItem.site.commitHash) parts.push(rowItem.site.commitHash)
-                          return parts.join(" · ")
-                        }
-                        return rowItem.server ? Model.serverMeta(rowItem.server) : ""
-                      }
-                    }
-                  }
-
-                  // Right-aligned inside a Column has to come from the text's
-                  // own alignment: anchoring children to a Column whose width
-                  // is derived from those same children loops.
-                  Column {
-                    id: trailing
-                    anchors.verticalCenter: parent.verticalCenter
-                    spacing: Style.space(2)
-                    width: Math.max(statusText.implicitWidth, timeText.implicitWidth)
-
-                    Text {
-                      id: statusText
-                      width: parent.width
-                      horizontalAlignment: Text.AlignRight
-                      color: rowItem.armed ? root.urgent : root.foreground
-                      opacity: rowItem.armed ? 1.0 : 0.75
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      text: {
-                        if (rowItem.deploying) return "sending…"
-                        if (rowItem.armed) return "press again to deploy"
-                        if (rowItem.isOrg)
-                          return root.forge ? root.forge.summaryFor(rowItem.modelData.org) : ""
-                        if (rowItem.isSite)
-                          return rowItem.site ? Model.deploymentLabel(rowItem.site.deploymentStatus) : ""
-                        if (!rowItem.server) return ""
-                        var sites = root.sitesFor(rowItem.modelData.org, rowItem.server.id)
-                        if (rowItem.server.state !== "ready")
-                          return Model.serverStateLabel(rowItem.server.state)
-                        return sites.length > 0 ? Model.pluralize(sites.length, "site") : "ready"
-                      }
-                    }
-
-                    Text {
-                      id: timeText
-                      width: parent.width
-                      horizontalAlignment: Text.AlignRight
-                      visible: text !== ""
-                      color: root.foreground
-                      opacity: 0.45
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.caption
-                      text: rowItem.isSite && rowItem.site
-                        ? Model.relativeTime(rowItem.site.deployedAt, root.nowMs) : ""
-                    }
-                  }
-
-                  Text {
-                    id: chevron
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: rowItem.isSite ? 0 : implicitWidth
-                    visible: !rowItem.isSite
-                    color: root.foreground
-                    opacity: 0.5
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                    text: rowItem.expanded ? "󰅀" : "󰅂"
-                  }
+                onActivated: {
+                  root.cursorIndex = rowItem.index
+                  root.cursorActive = true
+                  root.activate()
+                }
+                onContextRequested: {
+                  root.cursorIndex = rowItem.index
+                  root.cursorActive = true
+                  root.openCurrentInForge()
                 }
               }
             }

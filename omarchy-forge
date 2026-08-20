@@ -22,10 +22,20 @@ readonly KEYRING_SERVICE="omarchy-forge"
 # Still read for the `default` account so an existing keyring needs no surgery.
 readonly KEYRING_LEGACY_ACCOUNT="api-token"
 readonly STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/forge.json"
+# Forge caps a page at 30 however large `page[size]` asks for, reporting the
+# truth only in `meta.per_page`. The rest is reached by following a cursor, and
+# the page cap is what stops one enormous organization from spending the whole
+# minute's allowance walking it.
+readonly PAGE_SIZE=30
+readonly MAX_PAGES="${FORGE_MAX_PAGES:-5}"
 
 die() {
   echo "omarchy-forge: $1" >&2
   exit 1
+}
+
+warn() {
+  echo "omarchy-forge: $1" >&2
 }
 
 need() {
@@ -368,10 +378,60 @@ envelope_error() {
   echo "$1" | jq -r '.error // (.body.message // ("HTTP " + (.status | tostring)))'
 }
 
+# A whole list, however many pages Forge splits it across. Pagination is
+# cursor-based — each response carries `meta.next_cursor` — so this walks the
+# chain and merges the pages back into one envelope, leaving every caller with
+# the single shape `api_request` promises. `page[size]` and `page[cursor]` are
+# owned here rather than by the caller's path, which is the only way the page
+# cap can be enforced in one place. A list stopped by the cap says so on
+# stderr; silently returning a prefix is what this whole function exists to
+# stop doing.
+api_paged() {
+  local path=$1 account=${2:-} cursor="" page=0 sep url out pages rc=0
+
+  pages=$(mktemp)
+  while :; do
+    sep='?'
+    [[ $path == *\?* ]] && sep='&'
+    url="$path${sep}page%5Bsize%5D=$PAGE_SIZE"
+    [[ -n $cursor ]] && url+="&page%5Bcursor%5D=$(jq -rn --arg c "$cursor" '$c | @uri')"
+
+    if ! out=$(api_request GET "$url" "$account"); then
+      rm -f "$pages"
+      printf '%s\n' "$out"
+      return 1
+    fi
+    printf '%s\n' "$out" >>"$pages"
+    page=$((page + 1))
+
+    cursor=$(printf '%s\n' "$out" | jq -r '.body.meta.next_cursor // ""')
+    [[ -n $cursor ]] || break
+    if ((page >= MAX_PAGES)); then
+      warn "showing the first $((page * PAGE_SIZE)) results — there are more"
+      break
+    fi
+  done
+
+  # The last page's status and rate headers are the current ones; only `data`
+  # and `included` are the union of what arrived. `included` is left off
+  # entirely when no page carried one, so the merged body is shaped like a
+  # single response rather than like a response with an empty relationship.
+  jq -s '
+    (map(.body.data // []) | add) as $data
+    | (map(.body.included // []) | add) as $included
+    | .[-1]
+    | .body = ((.body // {})
+        | .data = $data
+        | if ($included | length) > 0 then .included = $included else . end)
+  ' "$pages" || rc=$?
+  rm -f "$pages"
+  return $rc
+}
+
 # Organizations a token can actually see, as "slug<TAB>name".
 remote_orgs() {
   local account=$1 out
-  out=$(api_request GET "/orgs?page%5Bsize%5D=100" "$account") ||
+  out=$(api_paged "/orgs" "$account") ||
     die "could not list organizations: $(envelope_error "$out")"
   echo "$out" | jq -r '.body.data[] | .attributes.slug + "\t" + (.attributes.name // .attributes.slug)'
 }
@@ -807,7 +867,7 @@ cmd_status() {
       echo "# $org ($account)"
     fi
 
-    if ! out=$(api_request GET "/orgs/$org/servers?page%5Bsize%5D=100&sort=name" "$account"); then
+    if ! out=$(api_paged "/orgs/$org/servers?sort=name" "$account"); then
       echo "  $(envelope_error "$out")" >&2
       continue
     fi

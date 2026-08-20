@@ -3,24 +3,11 @@ import Quickshell
 import Quickshell.Io
 import "Model.js" as Model
 
-// Everything that talks to Forge, for the whole session.
-//
-// The shell instantiates this once, as a `service` plugin, and keeps it alive
-// for exactly as long as the widget sits in the bar layout. That single
-// instance is the point: a bar widget is created once per monitor, so a poller
-// living inside the widget would multiply its request rate and its
-// notifications by the number of screens, against a budget Forge measures per
-// user rather than per screen.
-//
-// Panels subscribe to a set of organizations and read state back out; they own
-// their own cursor, folding and confirm state, which is per-screen by nature.
-// Two panels watching the same organization share one poll.
-//
-// Credentials are per *account*, and an organization is polled through exactly
-// one of them — the helper's state file says which. No request is made from
-// QML directly: each one shells out to the bundled `omarchy-forge` helper,
-// naming an account, and the helper owns the keyring. That keeps every token
-// out of this process and out of any argv assembled here.
+// Everything that talks to Forge, for the whole session: polling, scheduling,
+// the rate ledger, the request queue, deploys and notifications. One instance
+// per session, whatever the monitor count. Panels subscribe and read state
+// back out. Every request shells out to the bundled helper, so no token ever
+// reaches this process. See ARCHITECTURE.md.
 Item {
   id: root
 
@@ -28,11 +15,9 @@ Item {
   property var shell: null
 
   // --------------------------------------------------------------- setup
-  //
-  // The accounts and the organizations they reach, as the helper recorded
-  // them. Read-only here: `omarchy-forge add` is what writes this, so a token
-  // never has to travel through QML to be stored.
 
+  // The accounts and the organizations they reach, as the helper recorded
+  // them. Read-only here: `omarchy-forge add` is what writes this.
   property var setup: Model.emptySetup()
   readonly property string defaultOrganization: setup.defaultOrganization
   readonly property var watchedOrganizations: setup.organizationList
@@ -64,11 +49,11 @@ Item {
     + "/omarchy/forge.json"
 
   // ------------------------------------------------------- account state
-  //
-  // Whether a token is there and whether Forge accepts it are facts about an
-  // account, not about an organization — three organizations behind one bad
-  // token have one problem between them, and should say so once.
 
+  // Whether a token is there and whether Forge accepts it are facts about an
+  // account, not about an organization, so three orgs behind one bad token
+  // report one problem. See ARCHITECTURE.md.
+  //
   // name → {hasToken: bool|undefined, rateRemaining: int, error: string}
   property var accountStates: ({})
 
@@ -106,9 +91,7 @@ Item {
 
   // Watcher id → what that panel asked for. Panels come and go with monitors
   // and with config reloads, so subscriptions are keyed by an issued token
-  // rather than by anything the panel might not keep stable. One watcher can
-  // name several organizations, so a panel showing all of them is still one
-  // subscription.
+  // rather than by anything the panel might not keep stable.
   property var _watchers: ({})
   property int _nextWatcherId: 0
 
@@ -221,12 +204,7 @@ Item {
     }
     orgs = nextOrgs
 
-    // Work already queued for an organization nobody watches any more is spend
-    // with no reader.
-    var kept = []
-    for (var j = 0; j < _queue.length; j++)
-      if (merged[_queue[j].org] !== undefined) kept.push(_queue[j])
-    _queue = kept
+    queue.keepOrgs(merged)
 
     _tick()
   }
@@ -379,63 +357,93 @@ Item {
   }
 
   // ------------------------------------------------------------ rate budget
-  //
-  // Forge allows 60 requests a minute per authenticated user — not per
-  // organization, not per token and not per screen. Two tokens issued by the
-  // same person therefore share one budget, which is why the ledger is keyed
-  // by the Forge identity behind an account rather than by the account itself.
-  // A sweep costs one request per server on top of the server list, so the
-  // sweep is what gets dropped when a budget runs thin; never the server list,
-  // which is what the bar icon depends on.
 
-  // bucket → [request timestamps]
-  property var _budgets: ({})
-  readonly property int budgetCeiling: 40
+  // Forge's 60-a-minute is per Forge user, so the ledger is keyed by the
+  // identity behind an account rather than by the account. The ceiling is the
+  // margin that decides when a sweep gets dropped. See ARCHITECTURE.md.
+  QtObject {
+    id: budget
 
-  function _bucketFor(account) {
-    return Model.budgetBucket(setup, account)
-  }
+    readonly property int ceiling: 40
 
-  function _spentLastMinute(bucket) {
-    var now = Date.now()
-    var times = _budgets[bucket] || []
-    var kept = []
-    for (var i = 0; i < times.length; i++)
-      if (now - times[i] < 60000) kept.push(times[i])
-    if (kept.length !== times.length) {
-      var next = _shallowCopy(_budgets)
-      next[bucket] = kept
-      _budgets = next
+    // bucket → [request timestamps]. Nothing outside this object reads it, so
+    // unlike the state panels bind to it is mutated rather than reassigned.
+    property var _spentAt: ({})
+
+    function bucketFor(account) {
+      return Model.budgetBucket(root.setup, account)
     }
-    return kept.length
-  }
 
-  function _charge(bucket) {
-    var times = (_budgets[bucket] || []).slice()
-    times.push(Date.now())
-    var next = _shallowCopy(_budgets)
-    next[bucket] = times
-    _budgets = next
-  }
+    function spent(bucket) {
+      var now = Date.now()
+      var times = _spentAt[bucket] || []
+      var kept = []
+      for (var i = 0; i < times.length; i++)
+        if (now - times[i] < 60000) kept.push(times[i])
+      _spentAt[bucket] = kept
+      return kept.length
+    }
 
-  // A request that never left the machine — no token to send it with — should
-  // not eat into the minute's allowance.
-  function _refund(bucket) {
-    var times = (_budgets[bucket] || []).slice()
-    if (times.length === 0) return
-    times.pop()
-    var next = _shallowCopy(_budgets)
-    next[bucket] = times
-    _budgets = next
+    // Whether `count` more requests for this account would breach the ceiling.
+    function wouldExceed(account, count) {
+      return spent(bucketFor(account)) + count > ceiling
+    }
+
+    function charge(bucket) {
+      var times = _spentAt[bucket] || (_spentAt[bucket] = [])
+      times.push(Date.now())
+    }
+
+    // A request that never left the machine — no token to send it with —
+    // should not eat into the minute's allowance.
+    function refund(bucket) {
+      var times = _spentAt[bucket]
+      if (times && times.length > 0) times.pop()
+    }
   }
 
   // ------------------------------------------------------------------ queue
-  //
-  // One request at a time for the whole session. Two organizations coming due
-  // together interleave rather than racing, and the queue doubles as the place
-  // where work for a dropped organization is thrown away.
 
-  property var _queue: []
+  // The pending list, and nothing else — dispatch policy lives in `_pump`,
+  // which needs to see the whole service. See ARCHITECTURE.md.
+  QtObject {
+    id: queue
+
+    // Mutated in place. Nothing may bind to this — a binding would not
+    // re-evaluate on a push, which is exactly the trap `_patch` exists to
+    // avoid for the state panels do bind to.
+    property var _jobs: []
+
+    function push(job) {
+      _jobs.push(job)
+      root._pump()
+    }
+
+    // A continuation page belongs to a fetch that is already under way, so it
+    // goes in front of whatever is queued behind it — not least the
+    // `sweepDone` marker, which would otherwise fire on a half-walked sweep
+    // and publish it.
+    function pushFront(job) {
+      _jobs.unshift(job)
+      root._pump()
+    }
+
+    function take() {
+      return _jobs.length > 0 ? _jobs.shift() : null
+    }
+
+    // Work queued for an organization nobody watches any more is spend with no
+    // reader.
+    function keepOrgs(wanted) {
+      var kept = []
+      for (var i = 0; i < _jobs.length; i++)
+        if (wanted[_jobs[i].org] !== undefined) kept.push(_jobs[i])
+      _jobs = kept
+    }
+  }
+
+  // The request in flight, which pairs with fetchProcess and its watchdog
+  // rather than with the pending list.
   property var _current: null
   property double _currentStartedMs: 0
   property bool _timedOut: false
@@ -443,20 +451,12 @@ Item {
   // well past that is stuck rather than slow.
   readonly property int requestTimeoutMs: 25000
 
-  function _enqueue(job) {
-    var next = _queue.slice()
-    next.push(job)
-    _queue = next
-    _pump()
-  }
-
+  // One request at a time for the whole session, so two organizations coming
+  // due together interleave rather than racing.
   function _pump() {
     if (fetchProcess.running) return
-    while (_queue.length > 0) {
-      var next = _queue.slice()
-      var job = next.shift()
-      _queue = next
-
+    var job
+    while ((job = queue.take()) !== null) {
       // A marker rather than a request: it runs the moment every site fetch
       // ahead of it has landed, whichever organizations interleaved.
       if (job.kind === "sweepDone") { _finishSweep(job.org); continue }
@@ -464,14 +464,54 @@ Item {
 
       _current = job
       _currentStartedMs = Date.now()
-      _charge(_bucketFor(job.account))
+      budget.charge(budget.bucketFor(job.account))
       fetchProcess.command = [cliPath, "api", "--account", job.account, "GET",
                               job.kind === "servers"
-                                ? Model.serversPath(job.org)
-                                : Model.sitesPath(job.org, job.serverId)]
+                                ? Model.serversPath(job.org, job.cursor)
+                                : Model.sitesPath(job.org, job.serverId, job.cursor)]
       fetchProcess.running = true
       return
     }
+  }
+
+  // ------------------------------------------------------------- pagination
+
+  // A cursor chain is stopped by a page cap or by the budget ceiling, and a
+  // list cut short always leaves a note — a short list that doesn't say so is
+  // indistinguishable from a complete one. The ceiling applies to
+  // continuations only, so the first page always lands. See ARCHITECTURE.md.
+
+  // 5 pages is 150 rows. Past that, an organization is being used in a way a
+  // bar widget is the wrong shape for, and the dashboard is the better tool.
+  readonly property int maxPages: 5
+
+  // "next" when another page was queued, "" when the list is complete, and
+  // otherwise why it was cut short. The caller words the note, because "the
+  // first 150" means a different thing for an organization's servers than for
+  // one server's sites.
+  function _continuePage(job, envelope, rows) {
+    var cursor = Model.nextCursor(envelope.body)
+    if (cursor === "") return ""
+    if (job.page >= maxPages) return "cap"
+    if (budget.wouldExceed(job.account, 1)) return "budget"
+
+    var next = _shallowCopy(job)
+    next.cursor = cursor
+    next.page = job.page + 1
+    next.rows = rows
+    queue.pushFront(next)
+    return "next"
+  }
+
+  // Notes are cleared at the start of every refresh, so they accumulate across
+  // one cycle rather than overwriting each other: a sweep that was skipped and
+  // a list that was cut short are two separate things the user has to be told.
+  function _addNote(org, text) {
+    var state = orgs[org]
+    if (!state) return
+    if (state.note === "") { _patch(org, { note: text }); return }
+    if (state.note.indexOf(text) !== -1) return
+    _patch(org, { note: state.note + " · " + text })
   }
 
   // -------------------------------------------------------------- refreshing
@@ -481,7 +521,8 @@ Item {
     var state = orgs[key]
     if (!state || state.refreshing) return
     _patch(key, { refreshing: true, note: "" })
-    _enqueue({ org: key, account: state.account || accountForOrg(key), kind: "servers" })
+    queue.push({ org: key, account: state.account || accountForOrg(key),
+                 kind: "servers", page: 1, rows: [] })
   }
 
   function refreshList(list) {
@@ -513,7 +554,7 @@ Item {
       changes.hasToken = false
       changes.error = ""
       _patchAccount(account, changes)
-      _refund(_bucketFor(account))
+      budget.refund(budget.bucketFor(account))
       if (org)
         _patch(org, { lastError: "",
                       accountError: "No token for " + accountLabel(account) })
@@ -547,7 +588,14 @@ Item {
       return
     }
 
-    var servers = Model.serversFrom(envelope.body)
+    var servers = job.rows.concat(Model.serversFrom(envelope.body))
+    var more = _continuePage(job, envelope, servers)
+    if (more === "next") return
+    if (more === "cap")
+      _addNote(org, "Showing the first " + Model.pluralize(servers.length, "server"))
+    else if (more === "budget")
+      _addNote(org, "Server list cut short to stay inside the rate limit")
+
     // Sites belonging to a server that has disappeared would linger forever.
     var kept = ({})
     var existing = orgs[org].sitesByServer
@@ -569,24 +617,35 @@ Item {
     if (ready.length === 0) { _finishRefresh(org); return }
 
     var account = orgs[org].account || accountForOrg(org)
-    if (_spentLastMinute(_bucketFor(account)) + ready.length > budgetCeiling) {
-      _patch(org, { note: "Deployment check skipped to stay inside the rate limit" })
+    if (budget.wouldExceed(account, ready.length)) {
+      _addNote(org, "Deployment check skipped to stay inside the rate limit")
       _finishRefresh(org)
       return
     }
 
     _patch(org, { pendingSites: ({}) })
     for (var j = 0; j < ready.length; j++)
-      _enqueue({ org: org, account: account, kind: "sites", serverId: ready[j] })
-    _enqueue({ org: org, account: account, kind: "sweepDone" })
+      queue.push({ org: org, account: account, kind: "sites", serverId: ready[j],
+                   page: 1, rows: [] })
+    queue.push({ org: org, account: account, kind: "sweepDone" })
   }
 
   function _onSites(job, text) {
     var envelope = Model.parseEnvelope(text)
     if (!orgs[job.org]) return
     if (!_applyEnvelope(job.org, job.account, envelope)) return
+
+    var sites = job.rows.concat(Model.sitesFrom(envelope.body, job.serverId))
+    var more = _continuePage(job, envelope, sites)
+    if (more === "next") return
+    if (more === "cap")
+      _addNote(job.org, "Some servers show only their first "
+                        + Model.pluralize(sites.length, "site"))
+    else if (more === "budget")
+      _addNote(job.org, "Some site lists cut short to stay inside the rate limit")
+
     var pending = _shallowCopy(orgs[job.org].pendingSites)
-    pending[job.serverId] = Model.sitesFrom(envelope.body, job.serverId)
+    pending[job.serverId] = sites
     _patch(job.org, { pendingSites: pending })
   }
 
@@ -673,7 +732,7 @@ Item {
     _deployAccount = (orgs[_deployOrg] && orgs[_deployOrg].account)
       || accountForOrg(_deployOrg)
     deployingSiteKey = site.key
-    _charge(_bucketFor(_deployAccount))
+    budget.charge(budget.bucketFor(_deployAccount))
     actionProcess.command = [cliPath, "api", "--account", _deployAccount, "POST",
                              Model.deployPath(_deployOrg, site.serverId, site.id)]
     actionProcess.running = true
