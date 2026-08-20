@@ -440,7 +440,11 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    tooltipText: "Forge — " + summary
+    // `summary` can be an API error message, and the shell's own components
+    // render what they are handed in a `Text` with no `textFormat` — which we
+    // cannot set from out here. So the string is neutralised on the way in
+    // instead. Same for the two PanelHero bindings below. See Model.plainText.
+    tooltipText: "Forge — " + Model.plainText(summary)
 
     iconComponent: Component {
       Item {
@@ -523,8 +527,9 @@ Panel {
 
           PanelHero {
             width: parent.width
-            title: root.organizations.length === 1 ? root.orgLabel(root.organizations[0]) : "Forge"
-            meta: summary
+            title: root.organizations.length === 1
+              ? Model.plainText(root.orgLabel(root.organizations[0])) : "Forge"
+            meta: Model.plainText(summary)
             detail: root.refreshing ? "refreshing…"
                                     : Model.relativeMs(root.lastRefreshMs, root.nowMs)
             foreground: root.foreground
@@ -553,6 +558,7 @@ Panel {
             Text {
               width: parent.width
               wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
               color: root.foreground
               opacity: 0.7
               font.family: root.fontFamily
@@ -654,6 +660,7 @@ Panel {
             width: parent.width
             visible: root.rows.length === 0 && root.organizations.length > 0 && !needsSetup
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.55
             font.family: root.fontFamily
@@ -675,6 +682,7 @@ Panel {
             width: parent.width
             visible: text !== ""
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             color: root.problems.length > 0 && root.flash === "" ? root.urgent : root.foreground
             opacity: root.problems.length > 0 && root.flash === "" ? 0.9 : 0.6
             font.family: root.fontFamily
@@ -695,6 +703,7 @@ Panel {
             width: parent.width
             visible: root.rows.length > 0
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.4
             font.family: root.fontFamily

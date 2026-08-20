@@ -531,6 +531,50 @@ function dashboardUrl(template, org, server, siteId) {
   return /\{[^}]*\}/.test(url) ? "" : externalUrl(url)
 }
 
+// The companion to externalUrl for the other kind of string that leaves this
+// process: an API string handed to another program as an argv element is as
+// untrusted as one handed to a shell. `omarchy-notification-send` takes the
+// headline and the description positionally with no `--` in front of them, and
+// two parsers read a leading `-` there as a flag — its own option loop, which
+// recognises `--exec` and friends and would swallow the next argument as the
+// value, and notify-send's GLib parser, which permutes and so reads options
+// after positionals. So a site named `--hint=string:omarchy-exec:…` becomes the
+// command the toast runs on click. Leading hyphens go, and the whitespace
+// around them, in whatever order and however many — and the C0 controls with
+// them, so a name can't smuggle a newline into an argv either. A leading hyphen
+// is not legal in a domain, which is what a Forge site name is, so nothing real
+// is lost. Returns "" for a string that was nothing else, like externalUrl;
+// the caller decides what to say instead.
+function notifyText(value) {
+  return String(value === undefined || value === null ? "" : value)
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .replace(/^[\s-]+/, "")
+    .replace(/\s+$/, "")
+}
+
+// The third member of that family, for a string entering a `Text` this plugin
+// does not own. A `Text` with no `textFormat` is `Text.AutoText`: Qt sniffs the
+// string and renders it as HTML the moment it looks like markup, and an `<img
+// src="http://…">` inside a server name is fetched when the text is laid out —
+// a beacon with an attacker-chosen scheme and host, which `elide` does not
+// prevent. Our own elements declare `Text.PlainText` and need nothing else, but
+// the shell's `PanelHero`, `BarIconButton` and `NotificationCard` take a string
+// and render it in a `Text` we cannot reach, so the guard moves to the caller.
+// The notification is the one that matters most: its card asks for
+// `Text.StyledText`, which renders `<img>` too, and a toast fetches on arrival
+// without being opened and is persisted so it can do it again after a restart.
+//
+// Dropping `<` is enough: it is the only character that makes Qt decide a
+// string might be rich text. Escaping it to `&lt;` would be worse — the
+// receiving `Text` would then find no markup, choose plain rendering, and show
+// the entity literally. The C0 controls go the way `notifyText` sends them,
+// since these strings also reach a bar tooltip and an argv.
+function plainText(value) {
+  return String(value === undefined || value === null ? "" : value)
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .replace(/</g, "")
+}
+
 // Every address that leaves this plugin passes through here first.
 //
 // A site's URL arrives from the API, and a deployment notification puts it

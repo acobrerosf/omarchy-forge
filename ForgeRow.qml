@@ -114,6 +114,7 @@ Rectangle {
       Text {
         width: parent.width
         elide: Text.ElideRight
+        textFormat: Text.PlainText
         color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: root.isSite ? Style.font.bodySmall : Style.font.body
@@ -125,6 +126,7 @@ Rectangle {
         width: parent.width
         elide: Text.ElideRight
         visible: text !== ""
+        textFormat: Text.PlainText
         color: root.foreground
         opacity: 0.5
         font.family: root.fontFamily
@@ -146,6 +148,7 @@ Rectangle {
         id: statusLabel
         width: parent.width
         horizontalAlignment: Text.AlignRight
+        textFormat: Text.PlainText
         color: root.armed ? root.urgentColor : root.foreground
         opacity: root.armed ? 1.0 : 0.75
         font.family: root.fontFamily
@@ -158,6 +161,7 @@ Rectangle {
         width: parent.width
         horizontalAlignment: Text.AlignRight
         visible: text !== ""
+        textFormat: Text.PlainText
         color: root.foreground
         opacity: 0.45
         font.family: root.fontFamily
@@ -171,6 +175,7 @@ Rectangle {
       anchors.verticalCenter: parent.verticalCenter
       width: root.showChevron ? implicitWidth : 0
       visible: root.showChevron
+      textFormat: Text.PlainText
       color: root.foreground
       opacity: 0.5
       font.family: root.fontFamily

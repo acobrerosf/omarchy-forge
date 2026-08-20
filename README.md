@@ -242,6 +242,16 @@ one reaches, and which is the default. Tokens are never in there.
   account's minute is nearly spent. Past that the panel says "showing the first 150 servers" rather
   than quietly showing a prefix. `omarchy-forge` does the same on the command line and warns on
   stderr; `FORGE_MAX_PAGES` raises the cap for a one-off run.
+- **Notification text is scrubbed harder than it should need to be.**
+  `omarchy-notification-send` passes the headline and the description to `notify-send` as bare
+  positionals with no `--` in front of them, so both its own option loop and notify-send's GLib
+  parser — which permutes, and so reads options *after* positionals — take a leading `-` as a
+  flag. A site named `--hint=string:omarchy-exec:…` would become the command the toast runs when
+  clicked. This plugin defends itself by stripping leading hyphens and control characters from
+  both strings, so a site name that starts with a hyphen loses it in the notification. The real
+  fix is one line in `/usr/bin/omarchy-notification-send` — `notify-send "${args[@]}" --
+  "$headline" "$description"` — which protects every other plugin too, but that script is
+  package-owned, so it is a report to file upstream rather than something this repo can change.
 
 ## License
 

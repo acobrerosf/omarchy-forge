@@ -85,8 +85,12 @@ state_apply() {
   mv "$STATE_FILE.tmp" "$STATE_FILE"
 }
 
+# Same shape as state_apply: the filter first, then whatever --arg bindings it
+# needs. A name reaching a filter is always bound, never interpolated into it.
 state_get() {
-  state | jq -r "$1"
+  local filter=$1
+  shift
+  state | jq -r "$@" "$filter"
 }
 
 account_count() {
@@ -304,9 +308,15 @@ api_request() {
   tmp=$(mktemp -d)
 
   # curl config files take a double-quoted string, so a backslash or a quote
-  # inside the token has to survive the round trip.
+  # inside the token has to survive the round trip. A line terminator has to as
+  # well, and for a different reason: the config format is line-based, so a raw
+  # newline would end the header directive and let whatever followed it be read
+  # as another one. curl understands \n and \r inside the quotes. Backslash
+  # first, or the escapes below would be escaped again.
   escaped=${token//\\/\\\\}
   escaped=${escaped//\"/\\\"}
+  escaped=${escaped//$'\r'/\\r}
+  escaped=${escaped//$'\n'/\\n}
 
   # The credential reaches curl on stdin rather than through argv, which is
   # world-readable in /proc/<pid>/cmdline. `--fail` is deliberately absent: a
@@ -546,7 +556,7 @@ EOF
   # if its owner differs that is a token being displaced, not refreshed.
   if account_exists "$name"; then
     local held
-    held=$(state_get "$(printf '.accounts["%s"].user' "$name")")
+    held=$(state_get '.accounts[$a].user' --arg a "$name")
     if [[ -n $held && -n $user && $held != "$user" ]]; then
       echo "Warning: '$name' currently holds the token for $held." >&2
       echo "         Replacing it with the one for $user." >&2
@@ -713,8 +723,8 @@ cmd_accounts() {
     printf 'ACCOUNT\tLABEL\tTOKEN\tORGANIZATIONS\n'
     while read -r name; do
       [[ -n $name ]] || continue
-      label=$(state_get "$(printf '.accounts["%s"].label' "$name")")
-      user=$(state_get "$(printf '.accounts["%s"].user' "$name")")
+      label=$(state_get '.accounts[$a].label' --arg a "$name")
+      user=$(state_get '.accounts[$a].user' --arg a "$name")
       [[ -n $user ]] && label="$label <$user>"
       token=$([[ -n $(token_read "$name") ]] && echo "in keyring" || echo "MISSING")
       orgs=$(orgs_of_account "$name" | paste -sd', ' || true)
@@ -841,7 +851,10 @@ cmd_status() {
       echo "# $org ($account)"
     fi
 
-    if ! out=$(api_paged "/orgs/$org/servers?sort=name" "$account"); then
+    # The slug is the user's own, but every path the widget builds is encoded
+    # (Model.js `encode`) and this one is no different — same @uri idiom the
+    # cursor already uses.
+    if ! out=$(api_paged "/orgs/$(jq -rn --arg o "$org" '$o | @uri')/servers?sort=name" "$account"); then
       echo "  $(envelope_error "$out")" >&2
       continue
     fi

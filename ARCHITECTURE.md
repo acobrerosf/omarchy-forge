@@ -142,7 +142,7 @@ into one poll and one notification.
 org is reached through; `FileView { watchChanges: true }` on `forge.json` means `omarchy-forge add`
 is picked up without a restart.
 
-## Addresses that leave the process
+## Strings that leave the process
 
 Everything this plugin opens, copies or hands to another program is built from API data, and one
 of those paths ends in a shell. `omarchy-notification-send --exec` does not take an argv array
@@ -164,6 +164,17 @@ load-bearing, and quoting without validation would still hand the browser a `jav
 a leading `-` read as a flag. Neither layer should be the only thing standing between a remote
 string and a shell.
 
+The same argv carries two strings that are not addresses — the notification's
+headline and description — and they sit in a position two parsers read as options.
+`omarchy-notification-send`'s own option loop recognises `--exec` and friends there and
+swallows the argument after them as the value; notify-send's GLib parser permutes, so it
+reads options *after* positionals. Neither call is given a `--`, so a site named
+`--hint=string:omarchy-exec:…` becomes the command the toast runs on click. Both
+positionals therefore go through `Model.notifyText`, which strips leading hyphens and the
+C0 controls. The rule that generalises from it: **an API string handed to another program
+as an argv element is as untrusted as one handed to a shell**, and gets a guard on the way
+out even when no shell is involved.
+
 `Model.sshCommand` is the same problem with a human in the loop — its output goes to the
 clipboard for the user to paste into a terminal — so it refuses an `ip` that isn't plain address
 characters.
@@ -183,3 +194,31 @@ scalar properties in, signals out, no reference back to the panel or the service
 volatile state (cursor, armed, deploying, relative time) is bound directly on the delegate rather
 than folded into `rowView`, so moving the cursor — or the clock ticking — doesn't re-derive every
 row's text.
+
+### Text is never left to guess
+
+Almost everything drawn here is API data — server and site names, provider and region, the
+organization label, error messages — and a `Text` without a `textFormat` is `Text.AutoText`, which
+means Qt sniffs the string and renders it as HTML the moment it looks like markup. An `<img
+src="http://…">` inside a server name is then *fetched* when the text is laid out: a blind beacon
+with an attacker-chosen scheme and host, which `elide` does not prevent. So the third rule, beside
+the address rule and the argv rule above: **an API string entering a `Text` gets an explicit
+`textFormat`.** Every `Text` in this repo declares `Text.PlainText`, static ones included — a rule
+that holds for all of them is checkable at a glance, where one that holds for "the ones bound to
+API data" has to be re-derived every time a binding changes.
+
+Three strings leave for a `Text` this plugin does not own and cannot give a format to:
+`PanelHero`'s `title` and `meta`, and `BarIconButton`'s `tooltipText`. The organization label is
+API-derived (`omarchy-forge add` stores the org's `name` from the API in the state file) and the
+summary can be an account's error message, so those go through `Model.plainText` on the way out
+instead — the same shape as `externalUrl` and `notifyText`, a guard applied where the string
+crosses a boundary. It drops `<`, which is the only character that makes Qt decide a string might
+be rich text.
+
+That one `StyledText` is the fourth sink, and the worst of them. The shell draws every toast with
+`notifications/components/NotificationCard.qml`, which asks for `Text.StyledText` — and StyledText
+renders `<img>`. So a site name carrying one is fetched on a notification the user never opened,
+and the toast is persisted under `~/.local/state/omarchy/notifications/`, so it outlives a
+restart. `_notify` therefore applies both guards, and the order is load-bearing: `plainText`
+runs first because dropping a `<` can turn `<--exec…` into `--exec…`, which is exactly what
+`notifyText` is there to strip.

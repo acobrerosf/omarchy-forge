@@ -22,7 +22,10 @@ omarchy restart shell                  # full shell restart (drops all service s
                                        #   the panels but keeps the running service instance
 journalctl -t omarchy-shell -f         # QML console.warn/errors and load failures land here
 omarchy plugin validate "$PWD"         # manifest.json against the plugin schema (silent = ok)
-qmllint -I /usr/share/omarchy/shell Panel.qml Service.qml ForgeRow.qml ForgeIcon.qml
+# Qt 6's qmllint, by full path. Plain `qmllint` on Arch is qt5-declarative's, whose parser
+# predates typed function signatures — the `function open(): void` form IpcHandler requires —
+# so it dies on Panel.qml with a silent exit 255 and lints nothing.
+/usr/lib/qt6/bin/qmllint -I /usr/share/omarchy/shell Panel.qml Service.qml ForgeRow.qml ForgeIcon.qml
 bash -n omarchy-forge
 ```
 

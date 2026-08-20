@@ -790,7 +790,18 @@ Item {
     if (safe)
       command = command.concat(["--exec",
                                 "omarchy-launch-browser " + Util.shellQuote(safe)])
-    Quickshell.execDetached(command.concat([headline, description]))
+    // The address is not the only untrusted string in this argv: the headline is
+    // site.name, and both positionals sit where two parsers read a leading `-`
+    // as a flag. See Model.notifyText and ARCHITECTURE.md.
+    //
+    // Both guards apply here, and in this order. The toast is drawn by the
+    // shell's own NotificationCard, which is the one Text in the shell that asks
+    // for `Text.StyledText` — and StyledText renders `<img>`, so a name carrying
+    // one is fetched on a toast the user never opened and which outlives a
+    // restart. plainText has to run first: it can turn `<--exec…` into
+    // `--exec…`, which is exactly what notifyText is there to strip.
+    var scrub = function (text) { return Model.notifyText(Model.plainText(text)) }
+    Quickshell.execDetached(command.concat([scrub(headline) || "Forge", scrub(description)]))
   }
 
   // --------------------------------------------------------------- deploying

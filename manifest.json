@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "acobrerosf.forge",
   "name": "Forge",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "author": "acobrerosf",
   "license": "MIT",
   "description": "Laravel Forge server health and deployment status in the Omarchy bar, across every organization you have a token for, with one-key deploys.",
