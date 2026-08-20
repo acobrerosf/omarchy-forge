@@ -56,10 +56,6 @@ per-org panel rows. But facts about a *credential* — has a token, token reject
 belong to the account (`accountStates`), so three organizations behind one bad token report one
 problem, not three.
 
-A pre-accounts install must keep working: flat `{"organization": …}` state, token under keyring
-account `api-token`. `STATE_NORMALIZE`, `adopt_legacy_token` and the `default`-account fallback in
-`token_read`/`token_clear` are that path.
-
 ## Rate budget
 
 Forge allows 60 requests/minute **per Forge user**, shared with their browser dashboard. The

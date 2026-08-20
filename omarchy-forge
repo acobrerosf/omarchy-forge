@@ -18,9 +18,6 @@ set -euo pipefail
 
 readonly FORGE_API="${FORGE_API:-https://forge.laravel.com/api}"
 readonly KEYRING_SERVICE="omarchy-forge"
-# What a single-token install stored its token under before accounts existed.
-# Still read for the `default` account so an existing keyring needs no surgery.
-readonly KEYRING_LEGACY_ACCOUNT="api-token"
 readonly STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/forge.json"
 # Forge caps a page at 30 however large `page[size]` asks for, reporting the
 # truth only in `meta.per_page`. The rest is reached by following a cursor, and
@@ -49,30 +46,19 @@ need secret-tool
 # ------------------------------------------------------------------- state
 #
 # {
-#   "version": 2,
 #   "organization": "acme",                        the default for a widget
 #   "accounts":      {"default": {"label": …, "user": …}},
 #   "organizations": {"acme": {"account": "default", "name": "Acme Inc"}}
 # }
 #
-# Every read goes through `state`, which normalises whatever is on disk —
-# including the flat {"organization": "…"} a pre-accounts install left behind —
-# so no command below has to know more than one shape. The migrated form is
-# only written when something else is being written anyway.
+# Every read goes through `state`, which fills in what is missing and coerces
+# what is the wrong type, so no command below has to check either. The file is
+# hand-editable, so it is not trusted to hold the shape it was written with.
 
 readonly STATE_NORMALIZE='
   def str: if type == "string" then . else "" end;
-  (. // {}) as $raw
-  | (if ($raw.version // 1) >= 2 then $raw
-     else
-       ($raw.organization | str) as $org
-       | { version: 2,
-           organization: $org,
-           accounts: (if $org == "" then {} else {"default": {label: "default", user: ""}} end),
-           organizations: (if $org == "" then {} else {($org): {account: "default", name: ""}} end) }
-     end)
-  | { version: 2,
-      organization: (.organization | str),
+  (. // {})
+  | { organization: (.organization | str),
       accounts: ((.accounts // {})
         | with_entries(.value = {label: ((.value.label // .key) | str),
                                  user:  ((.value.user  // "")   | str)})),
@@ -86,8 +72,8 @@ state() {
 }
 
 # jq filter plus its --arg options, applied to the normalised state and written
-# back atomically. The one writer, so a v1 file migrates the first time
-# anything changes.
+# back atomically. The one writer, so whatever `state` repaired on the way in is
+# what lands on disk.
 state_apply() {
   local filter=$1
   shift
@@ -147,26 +133,8 @@ account_for_user() {
   state | jq -r --arg u "$1" '.accounts | to_entries[] | select(.value.user == $u) | .key' | head -n 1
 }
 
-# The same token, byte for byte, already in the keyring under some account.
-# Matching on the identity behind a token is not enough on its own: an account
-# carried over from before accounts existed has nobody recorded against it, so
-# the token itself is the only thing left to recognise it by.
-account_for_token() {
-  local wanted=$1 name
-  [[ -n $wanted ]] || return 0
-  while read -r name; do
-    [[ -n $name ]] || continue
-    if [[ $(token_read "$name") == "$wanted" ]]; then
-      printf '%s' "$name"
-      return 0
-    fi
-  done < <(account_names)
-}
-
 # Record who a token belongs to. The rate limit is counted per Forge user, so
-# two accounts holding one person's tokens have to be recognised as one — and
-# an account carried over from before accounts existed has nobody recorded
-# against it until something asks.
+# two accounts holding one person's tokens have to be recognised as one.
 remember_account_user() {
   local account=$1 envelope=$2 user label
   user=$(echo "$envelope" | jq -r '.body.data.attributes.email // ""')
@@ -177,17 +145,6 @@ remember_account_user() {
     | (if (.accounts[$a].label // "") == "" or .accounts[$a].label == $a
        then .accounts[$a].label = $l else . end)' \
     --arg a "$account" --arg u "$user" --arg l "$label"
-}
-
-# A token stored before accounts existed has no entry in the state file. Claim
-# it as `default` rather than making the user log in again, and find out whose
-# it is so it can share a rate budget with that person's other tokens.
-adopt_legacy_token() {
-  [[ $(account_count) == 0 ]] || return 0
-  secret-tool lookup service "$KEYRING_SERVICE" account "$KEYRING_LEGACY_ACCOUNT" >/dev/null 2>&1 || return 0
-  state_apply '.accounts["default"] = {label: "default", user: ""}'
-  local out
-  out=$(api_request GET /user "default") && remember_account_user "default" "$out" || true
 }
 
 # Account names end up as keyring attributes, JSON keys and command-line
@@ -261,9 +218,6 @@ token_read() {
 
   local token
   token=$(secret-tool lookup service "$KEYRING_SERVICE" account "$account" 2>/dev/null || true)
-  if [[ -z $token && $account == "default" ]]; then
-    token=$(secret-tool lookup service "$KEYRING_SERVICE" account "$KEYRING_LEGACY_ACCOUNT" 2>/dev/null || true)
-  fi
   printf '%s' "$token"
 }
 
@@ -274,9 +228,6 @@ token_store() {
 
 token_clear() {
   secret-tool clear service "$KEYRING_SERVICE" account "$1" 2>/dev/null || true
-  [[ $1 == "default" ]] &&
-    secret-tool clear service "$KEYRING_SERVICE" account "$KEYRING_LEGACY_ACCOUNT" 2>/dev/null || true
-  return 0
 }
 
 # --------------------------------------------------------------------- api
@@ -514,8 +465,6 @@ cmd_add() {
     esac
   done
 
-  adopt_legacy_token
-
   if [[ -z $token ]]; then
     cat <<'EOF'
 Create a token at https://forge.laravel.com/profile/api
@@ -548,7 +497,6 @@ EOF
   if [[ -z $name ]]; then
     local known
     known=$(account_for_user "$user")
-    [[ -n $known ]] || known=$(account_for_token "$token")
     if [[ -n $known ]]; then
       name=$known
       echo "That is the account '$name', already set up. Updating it."
@@ -562,8 +510,6 @@ EOF
   fi
   name=$(slugify "$name")
   [[ -n $name ]] || die "an account needs a name"
-  [[ $name != "$KEYRING_LEGACY_ACCOUNT" ]] ||
-    die "'$KEYRING_LEGACY_ACCOUNT' is reserved — pick another name"
 
   # Only an explicitly named account can land on one that already exists, and
   # if its owner differs that is a token being displaced, not refreshed.
@@ -636,12 +582,11 @@ EOF
 # pause, so the terminal the widget spawned doesn't vanish before anything can
 # be read.
 cmd_setup() {
-  if [[ $(account_count) == 0 ]] && [[ -z $(token_read "$(default_account)") ]]; then
+  if [[ $(account_count) == 0 ]]; then
     cmd_add
   elif [[ $(state_get '.organizations | length') == 0 ]]; then
     # Tokens are on file but nothing is mapped — pick organizations for one of
     # them rather than asking for another token.
-    adopt_legacy_token
     cmd_org_pick "$(choose_account)"
   else
     cmd_add
@@ -675,7 +620,6 @@ cmd_login() {
   # account that already exists. Letting it fall through to `add`'s naming
   # would file the new token under a brand new account and quietly leave the
   # old one in place, still the token everything is actually polled with.
-  adopt_legacy_token
   [[ -n $named ]] || named=$(default_account)
   account_exists "$named" ||
     die "no account named '$named' — add one with: omarchy-forge add"
@@ -691,7 +635,6 @@ cmd_rename() {
   account_exists "$old" || die "no account named '$old'"
   new=$(slugify "$new")
   [[ -n $new ]] || die "that leaves nothing to name it"
-  [[ $new != "$KEYRING_LEGACY_ACCOUNT" ]] || die "'$KEYRING_LEGACY_ACCOUNT' is reserved"
   [[ $new != "$old" ]] || die "'$old' is already its name"
   ! account_exists "$new" || die "there is already an account called '$new'"
 
@@ -886,8 +829,6 @@ cmd_doctor() {
   echo "api        $FORGE_API"
   echo "state      $STATE_FILE"
   echo "default    $(state_get '.organization' | sed 's/^$/<unset>/')"
-
-  adopt_legacy_token
 
   if [[ $(account_count) == 0 ]]; then
     echo

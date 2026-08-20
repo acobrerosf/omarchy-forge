@@ -308,12 +308,10 @@ function emptyState() {
 
 // -------------------------------------------------------------- setup state
 
-// `~/.local/state/omarchy/forge.json`, as written by the helper. Two shapes
-// exist: the flat {"organization": "..."} a single-token install left behind,
-// and the accounts/organizations map that replaced it. The helper rewrites the
-// old one the first time it changes anything, but the shell may well read the
-// file before that ever happens, so both are understood here — in one place,
-// rather than in the service and the panel separately.
+// `~/.local/state/omarchy/forge.json`, as written by the helper — and
+// hand-editable, so nothing in it is trusted to be the type it should be.
+// Understood here in one place, rather than in the service and the panel
+// separately.
 function parseSetup(text) {
   var parsed = null
   try { parsed = JSON.parse(String(text || "{}")) } catch (e) { parsed = null }
@@ -350,15 +348,6 @@ function parseSetup(text) {
       }
       setup.organizationList.push(String(slug))
     }
-  }
-
-  // The pre-accounts shape: one organization, reached through the one token,
-  // which the helper stored under the account it calls `default`.
-  if (setup.organizationList.length === 0 && setup.defaultOrganization !== "") {
-    setup.organizations[setup.defaultOrganization] = { account: "default", name: "" }
-    setup.organizationList.push(setup.defaultOrganization)
-    if (!setup.accounts["default"])
-      setup.accounts["default"] = { label: "default", user: "" }
   }
 
   if (setup.defaultOrganization === "" && setup.organizationList.length > 0)

@@ -95,11 +95,8 @@ Don't reword that message without changing both.
   *why* a thing is shaped the way it is, not what the line does — match that density. A note that
   explains the line it sits next to belongs in the code; one that orients you to a subsystem
   belongs in `ARCHITECTURE.md`. Bash: `set -euo pipefail`,
-  errors via `die`, all state reads go through `state()` which normalises the legacy pre-accounts
-  shape so no command sees more than one.
-- **Backwards compatibility.** A pre-accounts install (flat `{"organization": …}` state, token under
-  keyring account `api-token`) must keep working; `STATE_NORMALIZE`, `adopt_legacy_token` and the
-  `default`-account fallback in `token_read`/`token_clear` are that path.
+  errors via `die`, all state reads go through `state()`, which fills in what is missing and coerces
+  what is the wrong type so no command has to check.
 - Bump `manifest.json` `version` for user-visible changes.
 
 ## Known gaps (from README)

@@ -209,9 +209,7 @@ for that one account, for CI or for trying a token without storing it — set `$
 alongside it to say which.
 
 State lives in `~/.local/state/omarchy/forge.json`: which accounts exist, which organizations each
-one reaches, and which is the default. Tokens are never in there. A single-token setup made before
-accounts existed keeps working untouched and is adopted as an account called `default` the first
-time anything is written.
+one reaches, and which is the default. Tokens are never in there.
 
 ## Requirements
 
