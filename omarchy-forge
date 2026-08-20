@@ -1,0 +1,973 @@
+#!/bin/bash
+
+# Laravel Forge from the Omarchy bar.
+#
+# The bar widget never handles an API token itself — it shells out to this
+# script, which reads tokens from the keyring and hands them to curl over a
+# config file on stdin. That keeps credentials out of argv (world-readable in
+# /proc/<pid>/cmdline) and out of the environment.
+#
+# One token belongs to an ACCOUNT; an account can see several ORGANIZATIONS;
+# an organization is watched through exactly one account. Org slugs are
+# globally unique in Forge — they are the first segment of a dashboard URL —
+# so org → account is a function, which is what lets everything downstream
+# (the widget's per-org state, its per-user rate ledger) stay keyed by
+# organization while the credential behind it varies.
+
+set -euo pipefail
+
+readonly FORGE_API="${FORGE_API:-https://forge.laravel.com/api}"
+readonly KEYRING_SERVICE="omarchy-forge"
+# What a single-token install stored its token under before accounts existed.
+# Still read for the `default` account so an existing keyring needs no surgery.
+readonly KEYRING_LEGACY_ACCOUNT="api-token"
+readonly STATE_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/forge.json"
+
+die() {
+  echo "omarchy-forge: $1" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
+}
+
+need curl
+need jq
+need secret-tool
+
+# ------------------------------------------------------------------- state
+#
+# {
+#   "version": 2,
+#   "organization": "acme",                        the default for a widget
+#   "accounts":      {"default": {"label": …, "user": …}},
+#   "organizations": {"acme": {"account": "default", "name": "Acme Inc"}}
+# }
+#
+# Every read goes through `state`, which normalises whatever is on disk —
+# including the flat {"organization": "…"} a pre-accounts install left behind —
+# so no command below has to know more than one shape. The migrated form is
+# only written when something else is being written anyway.
+
+readonly STATE_NORMALIZE='
+  def str: if type == "string" then . else "" end;
+  (. // {}) as $raw
+  | (if ($raw.version // 1) >= 2 then $raw
+     else
+       ($raw.organization | str) as $org
+       | { version: 2,
+           organization: $org,
+           accounts: (if $org == "" then {} else {"default": {label: "default", user: ""}} end),
+           organizations: (if $org == "" then {} else {($org): {account: "default", name: ""}} end) }
+     end)
+  | { version: 2,
+      organization: (.organization | str),
+      accounts: ((.accounts // {})
+        | with_entries(.value = {label: ((.value.label // .key) | str),
+                                 user:  ((.value.user  // "")   | str)})),
+      organizations: ((.organizations // {})
+        | with_entries(.value = {account: ((.value.account // "default") | str),
+                                 name:    ((.value.name    // "")        | str)})) }
+'
+
+state() {
+  { [[ -f $STATE_FILE ]] && cat "$STATE_FILE" || echo '{}'; } | jq "$STATE_NORMALIZE"
+}
+
+# jq filter plus its --arg options, applied to the normalised state and written
+# back atomically. The one writer, so a v1 file migrates the first time
+# anything changes.
+state_apply() {
+  local filter=$1
+  shift
+  local next dir
+  next=$(state | jq "$@" "$filter") || die "could not update $STATE_FILE"
+  dir=$(dirname "$STATE_FILE")
+  mkdir -p "$dir"
+  printf '%s\n' "$next" >"$STATE_FILE.tmp"
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+state_get() {
+  state | jq -r "$1"
+}
+
+account_count() {
+  state_get '.accounts | length'
+}
+
+account_names() {
+  state_get '.accounts | keys_unsorted[]'
+}
+
+account_exists() {
+  state | jq -e --arg a "$1" '.accounts[$a] != null' >/dev/null
+}
+
+org_names() {
+  state_get '.organizations | keys_unsorted[]'
+}
+
+orgs_of_account() {
+  state | jq -r --arg a "$1" '.organizations | to_entries[] | select(.value.account == $a) | .key'
+}
+
+account_of_org() {
+  state | jq -r --arg o "$1" '.organizations[$o].account // empty'
+}
+
+# The account a request falls back to when nothing names one: whoever owns the
+# default organization, else the first account on file.
+default_account() {
+  local org account
+  org=$(state_get '.organization')
+  if [[ -n $org ]]; then
+    account=$(account_of_org "$org")
+    [[ -n $account ]] && {
+      printf '%s' "$account"
+      return
+    }
+  fi
+  state_get '(.accounts | keys_unsorted[0]) // "default"'
+}
+
+account_for_user() {
+  [[ -n ${1:-} ]] || return 0
+  state | jq -r --arg u "$1" '.accounts | to_entries[] | select(.value.user == $u) | .key' | head -n 1
+}
+
+# The same token, byte for byte, already in the keyring under some account.
+# Matching on the identity behind a token is not enough on its own: an account
+# carried over from before accounts existed has nobody recorded against it, so
+# the token itself is the only thing left to recognise it by.
+account_for_token() {
+  local wanted=$1 name
+  [[ -n $wanted ]] || return 0
+  while read -r name; do
+    [[ -n $name ]] || continue
+    if [[ $(token_read "$name") == "$wanted" ]]; then
+      printf '%s' "$name"
+      return 0
+    fi
+  done < <(account_names)
+}
+
+# Record who a token belongs to. The rate limit is counted per Forge user, so
+# two accounts holding one person's tokens have to be recognised as one — and
+# an account carried over from before accounts existed has nobody recorded
+# against it until something asks.
+remember_account_user() {
+  local account=$1 envelope=$2 user label
+  user=$(echo "$envelope" | jq -r '.body.data.attributes.email // ""')
+  [[ -n $user ]] || return 0
+  label=$(echo "$envelope" | jq -r '.body.data.attributes.name // .body.data.attributes.email // ""')
+  state_apply '
+    .accounts[$a].user = $u
+    | (if (.accounts[$a].label // "") == "" or .accounts[$a].label == $a
+       then .accounts[$a].label = $l else . end)' \
+    --arg a "$account" --arg u "$user" --arg l "$label"
+}
+
+# A token stored before accounts existed has no entry in the state file. Claim
+# it as `default` rather than making the user log in again, and find out whose
+# it is so it can share a rate budget with that person's other tokens.
+adopt_legacy_token() {
+  [[ $(account_count) == 0 ]] || return 0
+  secret-tool lookup service "$KEYRING_SERVICE" account "$KEYRING_LEGACY_ACCOUNT" >/dev/null 2>&1 || return 0
+  state_apply '.accounts["default"] = {label: "default", user: ""}'
+  local out
+  out=$(api_request GET /user "default") && remember_account_user "default" "$out" || true
+}
+
+# Account names end up as keyring attributes, JSON keys and command-line
+# arguments, so they are reduced to plain ASCII. Accents are transliterated
+# rather than dropped — "Cózar" should become "cozar", not "c-zar" — and the
+# character class is matched in the C locale, because in a UTF-8 locale a
+# range like a-z follows the collation order and quietly admits "ó".
+# A handle for the credential, derived from whoever the token belongs to. It
+# is never shown in the bar — it exists so `--account` has something to name —
+# so it is derived rather than asked for. The one thing it must not do is
+# collide: two Forge accounts can easily share an email local part
+# ("info@one.com", "info@two.com"), and landing on an existing account would
+# overwrite a token that is still in use.
+suggest_account_name() {
+  local user=$1 label=$2 base alt taken i
+  base=$(slugify "${user%%@*}")
+  [[ -n $base ]] || base=$(slugify "$label")
+  [[ -n $base ]] || base="forge"
+
+  account_exists "$base" || {
+    printf '%s' "$base"
+    return
+  }
+
+  # Taken. The domain usually distinguishes two people who share a local part.
+  alt=$(slugify "${user##*@}")
+  alt=${alt%%-*}
+  if [[ -n $alt && $alt != "$base" ]] && ! account_exists "$alt"; then
+    printf '%s' "$alt"
+    return
+  fi
+
+  for i in $(seq 2 99); do
+    if ! account_exists "$base-$i"; then
+      printf '%s' "$base-$i"
+      return
+    fi
+  done
+  printf '%s' "$base-$$"
+}
+
+slugify() {
+  local text
+  # Losing iconv should cost the accents, not the whole name.
+  text=$(printf '%s' "$1" | iconv -f utf-8 -t ascii//TRANSLIT 2>/dev/null) || text=""
+  [[ -n $text ]] || text=$1
+  printf '%s' "$text" |
+    tr '[:upper:]' '[:lower:]' |
+    LC_ALL=C sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+# ------------------------------------------------------------------- token
+
+# `$FORGE_TOKEN` still wins, for CI and for trying a token out without storing
+# it, but now only for one account: `$FORGE_ACCOUNT` if set, otherwise the
+# default one. Overriding every account at once would be meaningless once more
+# than one exists. `$_TOKEN_OVERRIDE` is internal — how a token gets validated
+# before it is stored.
+token_read() {
+  local account=${1:-}
+  [[ -n $account ]] || account=$(default_account)
+
+  if [[ -n ${_TOKEN_OVERRIDE:-} ]]; then
+    printf '%s' "$_TOKEN_OVERRIDE"
+    return
+  fi
+  if [[ -n ${FORGE_TOKEN:-} && $account == "${FORGE_ACCOUNT:-$(default_account)}" ]]; then
+    printf '%s' "$FORGE_TOKEN"
+    return
+  fi
+
+  local token
+  token=$(secret-tool lookup service "$KEYRING_SERVICE" account "$account" 2>/dev/null || true)
+  if [[ -z $token && $account == "default" ]]; then
+    token=$(secret-tool lookup service "$KEYRING_SERVICE" account "$KEYRING_LEGACY_ACCOUNT" 2>/dev/null || true)
+  fi
+  printf '%s' "$token"
+}
+
+token_store() {
+  secret-tool store --label="Laravel Forge API token — $1 (Omarchy)" \
+    service "$KEYRING_SERVICE" account "$1"
+}
+
+token_clear() {
+  secret-tool clear service "$KEYRING_SERVICE" account "$1" 2>/dev/null || true
+  [[ $1 == "default" ]] &&
+    secret-tool clear service "$KEYRING_SERVICE" account "$KEYRING_LEGACY_ACCOUNT" 2>/dev/null || true
+  return 0
+}
+
+# --------------------------------------------------------------------- api
+#
+# Prints one JSON envelope on stdout, always, whatever happened:
+#
+#   {"ok":bool,"status":int,"rateRemaining":int|null,"body":any,"error":string|null}
+#
+# The widget parses exactly that shape, so transport failures and HTTP errors
+# arrive through the same door as a successful response.
+
+envelope() {
+  jq -n \
+    --argjson ok "$1" \
+    --argjson status "$2" \
+    --arg remaining "$3" \
+    --arg error "$4" \
+    '{
+      ok: $ok,
+      status: $status,
+      rateRemaining: (if $remaining == "" then null else ($remaining | tonumber? // null) end),
+      body: null,
+      error: (if $error == "" then null else $error end)
+    }'
+}
+
+api_request() {
+  local method=$1 path=$2 account=${3:-}
+  local token escaped url tmp status remaining ok=false
+
+  [[ -n $account ]] || account=$(default_account)
+
+  token=$(token_read "$account")
+  if [[ -z $token ]]; then
+    # The widget matches on this prefix to tell "not set up yet" apart from a
+    # request that actually failed, so it has to stay stable.
+    envelope false 0 "" "No API token for account '$account'. Run: omarchy-forge add"
+    return 3
+  fi
+
+  case $path in
+  /*) url="$FORGE_API$path" ;;
+  http*) url=$path ;;
+  *) url="$FORGE_API/$path" ;;
+  esac
+
+  tmp=$(mktemp -d)
+
+  # curl config files take a double-quoted string, so a backslash or a quote
+  # inside the token has to survive the round trip.
+  escaped=${token//\\/\\\\}
+  escaped=${escaped//\"/\\\"}
+
+  # The credential reaches curl on stdin rather than through argv, which is
+  # world-readable in /proc/<pid>/cmdline. `--fail` is deliberately absent: a
+  # 4xx body carries the error detail worth showing.
+  if status=$(
+    printf 'header = "Authorization: Bearer %s"\n' "$escaped" |
+      curl --silent --show-error --location \
+        --config - \
+        --request "$method" \
+        --max-time "${FORGE_TIMEOUT:-15}" \
+        --header 'Accept: application/vnd.api+json, application/json' \
+        --header 'Content-Type: application/json' \
+        --dump-header "$tmp/headers" \
+        --output "$tmp/body" \
+        --write-out '%{http_code}' \
+        "$url" 2>"$tmp/curl_err"
+  ); then
+    remaining=$(grep -i '^x-ratelimit-remaining:' "$tmp/headers" 2>/dev/null |
+      tail -n 1 | tr -d '\r' | cut -d: -f2- | tr -d '[:space:]' || true)
+    ((status < 400)) && ok=true
+
+    # An empty body (204) and a non-JSON body (an HTML page from a proxy) both
+    # have to come back as a valid envelope, so a slurpfile failure degrades to
+    # a null body instead of taking the whole call down.
+    jq -n \
+      --argjson ok "$ok" \
+      --argjson status "$status" \
+      --arg remaining "$remaining" \
+      --slurpfile body "$tmp/body" \
+      '{
+        ok: $ok,
+        status: $status,
+        rateRemaining: (if $remaining == "" then null else ($remaining | tonumber? // null) end),
+        body: ($body[0] // null),
+        error: null
+      }' 2>/dev/null ||
+      envelope "$ok" "$status" "$remaining" "HTTP $status with a non-JSON body"
+  else
+    envelope false 0 "" "$(tr -d '\r' <"$tmp/curl_err" | tail -n 1)"
+  fi
+
+  rm -rf "$tmp"
+  [[ $ok == true ]]
+}
+
+envelope_error() {
+  echo "$1" | jq -r '.error // (.body.message // ("HTTP " + (.status | tostring)))'
+}
+
+# Organizations a token can actually see, as "slug<TAB>name".
+remote_orgs() {
+  local account=$1 out
+  out=$(api_request GET "/orgs?page%5Bsize%5D=100" "$account") ||
+    die "could not list organizations: $(envelope_error "$out")"
+  echo "$out" | jq -r '.body.data[] | .attributes.slug + "\t" + (.attributes.name // .attributes.slug)'
+}
+
+# ------------------------------------------------------------------ choosing
+
+# Which account to act on, when the answer isn't forced by there being only one.
+choose_account() {
+  local names count
+  names=$(account_names)
+  count=$(printf '%s\n' "$names" | grep -c . || true)
+  if ((count <= 1)); then
+    default_account
+    return
+  fi
+  if command -v gum >/dev/null 2>&1; then
+    printf '%s\n' "$names" | gum choose --header "Which account?"
+    return
+  fi
+  printf '%s\n' "$names" | nl -w2 -s'. ' >&2
+  local pick
+  read -rp "Account number [1]: " pick || true
+  printf '%s\n' "$names" | sed -n "${pick:-1}p"
+}
+
+choose_orgs() {
+  local rows=$1 count picks n
+  count=$(printf '%s\n' "$rows" | grep -c . || true)
+
+  if ((count == 1)); then
+    printf '%s\n' "$rows" | cut -f1
+    return
+  fi
+  if command -v gum >/dev/null 2>&1; then
+    printf '%s\n' "$rows" |
+      gum choose --no-limit --header "Which organizations? (space selects, enter confirms)" |
+      cut -f1
+    return
+  fi
+
+  printf '%s\n' "$rows" | nl -w2 -s'. ' >&2
+  read -rp "Numbers to watch, space separated [all]: " picks
+  if [[ -z ${picks// /} ]]; then
+    printf '%s\n' "$rows" | cut -f1
+    return
+  fi
+  for n in $picks; do
+    printf '%s\n' "$rows" | sed -n "${n}p" | cut -f1
+  done
+}
+
+# ---------------------------------------------------------------- commands
+
+# Add a token, and the organizations it should watch. This is both the
+# first-run flow and how a second or third organization arrives, because from
+# here they are the same operation.
+cmd_add() {
+  local token="" name="" only_token=false
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+    --token-stdin)
+      IFS= read -r token || true
+      shift
+      ;;
+    --name)
+      [[ $# -ge 2 ]] || die "--name needs an account name"
+      name=$2
+      shift 2
+      ;;
+    --name=*)
+      name=${1#--name=}
+      shift
+      ;;
+    --token-only)
+      only_token=true
+      shift
+      ;;
+    *) die "unknown option '$1' for add" ;;
+    esac
+  done
+
+  adopt_legacy_token
+
+  if [[ -z $token ]]; then
+    cat <<'EOF'
+Create a token at https://forge.laravel.com/profile/api
+
+Scopes: read access to servers and sites is enough to watch them. Add the
+deployment scope only if you want to trigger deploys from the bar.
+
+One token per Forge account. A token that can already see several
+organizations only needs adding once.
+
+EOF
+    read -rsp "Forge API token: " token || true
+    echo
+  fi
+  [[ -n $token ]] || die "no token given"
+
+  local out user label
+  if ! out=$(_TOKEN_OVERRIDE=$token api_request GET /user); then
+    die "token rejected: $(envelope_error "$out")"
+  fi
+  user=$(echo "$out" | jq -r '.body.data.attributes.email // ""')
+  label=$(echo "$out" | jq -r '.body.data.attributes.name // .body.data.attributes.email // "Forge"')
+  echo "Token belongs to $label${user:+ <$user>}."
+
+  # A token that belongs to a Forge account already on file updates that
+  # account rather than starting a second one. Adding a token twice — which is
+  # exactly what "watch one more of this token's organizations" looks like —
+  # would otherwise store the same credential under two names, split its rate
+  # ledger in half against one 60/min budget, and leave two accounts to revoke.
+  if [[ -z $name ]]; then
+    local known
+    known=$(account_for_user "$user")
+    [[ -n $known ]] || known=$(account_for_token "$token")
+    if [[ -n $known ]]; then
+      name=$known
+      echo "That is the account '$name', already set up. Updating it."
+    fi
+  fi
+
+  local derived=false
+  if [[ -z $name ]]; then
+    name=$(suggest_account_name "$user" "$label")
+    derived=true
+  fi
+  name=$(slugify "$name")
+  [[ -n $name ]] || die "an account needs a name"
+  [[ $name != "$KEYRING_LEGACY_ACCOUNT" ]] ||
+    die "'$KEYRING_LEGACY_ACCOUNT' is reserved — pick another name"
+
+  # Only an explicitly named account can land on one that already exists, and
+  # if its owner differs that is a token being displaced, not refreshed.
+  if account_exists "$name"; then
+    local held
+    held=$(state_get "$(printf '.accounts["%s"].user' "$name")")
+    if [[ -n $held && -n $user && $held != "$user" ]]; then
+      echo "Warning: '$name' currently holds the token for $held." >&2
+      echo "         Replacing it with the one for $user." >&2
+    else
+      echo "Replacing the token on account '$name'."
+    fi
+  fi
+
+  printf '%s' "$token" | token_store "$name"
+  state_apply '.accounts[$n] = {label: $l, user: $u}' \
+    --arg n "$name" --arg l "$label" --arg u "$user"
+  if [[ $derived == true ]]; then
+    # Say what it is rather than asking for it: the handle only ever appears
+    # in this CLI, never in the bar, so there is nothing to choose between.
+    echo "Account: $name  (CLI handle — rename with: omarchy-forge rename $name <new>)"
+  else
+    echo "Account: $name"
+  fi
+
+  if [[ $only_token == true ]]; then
+    return 0
+  fi
+
+  # Organizations this token can see, minus any already watched through a
+  # different account. Two accounts claiming the same slug would make "which
+  # token polls it" a coin toss.
+  local rows available taken skipped
+  rows=$(remote_orgs "$name")
+  available=""
+  skipped=""
+  while IFS=$'\t' read -r slug orgname; do
+    [[ -n $slug ]] || continue
+    taken=$(account_of_org "$slug")
+    if [[ -n $taken && $taken != "$name" ]]; then
+      skipped+="  $slug (already watched through '$taken')"$'\n'
+      continue
+    fi
+    available+="$slug"$'\t'"$orgname"$'\n'
+  done <<<"$rows"
+
+  [[ -n $skipped ]] && printf '\nSkipped:\n%s' "$skipped"
+
+  if [[ -z ${available//[$'\n\t ']/} ]]; then
+    echo "No new organizations for this token."
+    return 0
+  fi
+
+  local chosen
+  chosen=$(choose_orgs "$(printf '%s' "$available" | sed '/^$/d')")
+  [[ -n ${chosen//[$'\n ']/} ]] || die "no organization chosen"
+
+  local orgname
+  while read -r slug; do
+    [[ -n $slug ]] || continue
+    orgname=$(printf '%s' "$available" | awk -F'\t' -v s="$slug" '$1 == s {print $2; exit}')
+    state_apply '.organizations[$s] = {account: $a, name: $n}
+                 | (if .organization == "" then .organization = $s else . end)' \
+      --arg s "$slug" --arg a "$name" --arg n "$orgname"
+    echo "Watching: $slug${orgname:+ — $orgname}"
+  done <<<"$chosen"
+}
+
+# What the panel's setup and "Add organization" buttons run. It is `add` plus a
+# pause, so the terminal the widget spawned doesn't vanish before anything can
+# be read.
+cmd_setup() {
+  if [[ $(account_count) == 0 ]] && [[ -z $(token_read "$(default_account)") ]]; then
+    cmd_add
+  elif [[ $(state_get '.organizations | length') == 0 ]]; then
+    # Tokens are on file but nothing is mapped — pick organizations for one of
+    # them rather than asking for another token.
+    adopt_legacy_token
+    cmd_org_pick "$(choose_account)"
+  else
+    cmd_add
+  fi
+  echo
+  echo "Done. The bar picks this up within a refresh interval."
+  # EOF here (a non-interactive run) is not a failure worth exiting on.
+  read -n1 -rsp "Press any key to close…" || true
+  echo
+}
+
+# Replace the token on an account without touching what it watches.
+cmd_login() {
+  local args=(--token-only) named=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+    --token-stdin) args+=(--token-stdin); shift ;;
+    --account | --name)
+      [[ $# -ge 2 ]] || die "$1 needs an account name"
+      named=$2
+      shift 2
+      ;;
+    --account=* | --name=*)
+      named=${1#*=}
+      shift
+      ;;
+    *) die "unknown option '$1' for login" ;;
+    esac
+  done
+  # Rotating a token means replacing one, so an unnamed login has to land on an
+  # account that already exists. Letting it fall through to `add`'s naming
+  # would file the new token under a brand new account and quietly leave the
+  # old one in place, still the token everything is actually polled with.
+  adopt_legacy_token
+  [[ -n $named ]] || named=$(default_account)
+  account_exists "$named" ||
+    die "no account named '$named' — add one with: omarchy-forge add"
+  cmd_add "${args[@]}" --name "$named"
+}
+
+# Give an account a different handle. The token moves first and is verified
+# before the old entry goes, so an interrupted rename leaves two copies rather
+# than none.
+cmd_rename() {
+  local old=${1:-} new=${2:-} token
+  [[ -n $old && -n $new ]] || die "usage: omarchy-forge rename <account> <new-name>"
+  account_exists "$old" || die "no account named '$old'"
+  new=$(slugify "$new")
+  [[ -n $new ]] || die "that leaves nothing to name it"
+  [[ $new != "$KEYRING_LEGACY_ACCOUNT" ]] || die "'$KEYRING_LEGACY_ACCOUNT' is reserved"
+  [[ $new != "$old" ]] || die "'$old' is already its name"
+  ! account_exists "$new" || die "there is already an account called '$new'"
+
+  token=$(token_read "$old")
+  if [[ -n $token ]]; then
+    printf '%s' "$token" | token_store "$new"
+    [[ $(token_read "$new") == "$token" ]] || die "the keyring copy did not verify — nothing changed"
+  fi
+
+  state_apply '
+    .accounts = (.accounts | with_entries(if .key == $old then .key = $new else . end))
+    | .organizations = (.organizations | with_entries(
+        if .value.account == $old then .value.account = $new else . end))' \
+    --arg old "$old" --arg new "$new"
+
+  [[ -n $token ]] && token_clear "$old"
+  echo "Renamed '$old' to '$new'."
+}
+
+cmd_logout() {
+  local account=${1:-}
+  if [[ -z $account ]]; then
+    if (($(account_count) > 1)); then
+      die "more than one account — name one: omarchy-forge logout <account>"
+    fi
+    account=$(default_account)
+  fi
+  token_clear "$account"
+  echo "Token for '$account' removed from the keyring."
+  local mapped
+  mapped=$(orgs_of_account "$account" | paste -sd', ' || true)
+  if [[ -n $mapped ]]; then
+    echo "Still mapped to $mapped — drop those too with:"
+    echo "  omarchy-forge remove --account $account"
+  fi
+}
+
+cmd_accounts() {
+  local name label user token orgs
+  if [[ $(account_count) == 0 ]]; then
+    echo "No accounts yet. Run: omarchy-forge add"
+    return 0
+  fi
+  {
+    printf 'ACCOUNT\tLABEL\tTOKEN\tORGANIZATIONS\n'
+    while read -r name; do
+      [[ -n $name ]] || continue
+      label=$(state_get "$(printf '.accounts["%s"].label' "$name")")
+      user=$(state_get "$(printf '.accounts["%s"].user' "$name")")
+      [[ -n $user ]] && label="$label <$user>"
+      token=$([[ -n $(token_read "$name") ]] && echo "in keyring" || echo "MISSING")
+      orgs=$(orgs_of_account "$name" | paste -sd', ' || true)
+      printf '%s\t%s\t%s\t%s\n' "$name" "$label" "$token" "${orgs:-—}"
+    done < <(account_names)
+  } | column -t -s$'\t'
+  echo
+  echo "Default organization: $(state_get '.organization' | sed 's/^$/<unset>/')"
+}
+
+# Organizations a token can see, which is not the same as the ones being
+# watched — `accounts` shows those.
+cmd_orgs() {
+  local account=${1:-}
+  if [[ -n $account ]]; then
+    remote_orgs "$account"
+    return
+  fi
+  if (($(account_count) <= 1)); then
+    remote_orgs "$(default_account)"
+    return
+  fi
+  while read -r account; do
+    [[ -n $account ]] || continue
+    echo "# $account"
+    # A subshell, because remote_orgs reports failure by exiting.
+    (remote_orgs "$account") || true
+  done < <(account_names)
+}
+
+cmd_org_pick() {
+  local account=${1:-$(default_account)} rows chosen slug orgname
+  rows=$(remote_orgs "$account")
+  [[ -n ${rows//[$'\n\t ']/} ]] || die "the token on '$account' can't see any organizations"
+  chosen=$(choose_orgs "$rows")
+  [[ -n ${chosen//[$'\n ']/} ]] || die "no organization chosen"
+  while read -r slug; do
+    [[ -n $slug ]] || continue
+    orgname=$(printf '%s' "$rows" | awk -F'\t' -v s="$slug" '$1 == s {print $2; exit}')
+    state_apply '.organizations[$s] = {account: $a, name: $n}
+                 | (if .organization == "" then .organization = $s else . end)' \
+      --arg s "$slug" --arg a "$account" --arg n "$orgname"
+    echo "Watching: $slug${orgname:+ — $orgname}"
+  done <<<"$chosen"
+}
+
+# Show or set the *default* organization — the one a widget with no override
+# falls back to. Adding one to the watch list is `add`.
+cmd_org() {
+  if [[ -n ${1:-} ]]; then
+    if [[ -z $(account_of_org "$1") ]]; then
+      die "'$1' is not watched. Add it with: omarchy-forge add"
+    fi
+    state_apply '.organization = $s' --arg s "$1"
+    echo "Default organization: $1"
+  elif [[ -n $(state_get '.organization') ]]; then
+    state_get '.organization'
+  else
+    cmd_org_pick
+  fi
+}
+
+cmd_remove() {
+  local account="" slug=""
+  case ${1:-} in
+  "") die "usage: omarchy-forge remove <org> | --account <name>" ;;
+  --account)
+    [[ $# -ge 2 ]] || die "--account needs an account name"
+    account=$2
+    ;;
+  --account=*) account=${1#--account=} ;;
+  *) slug=$1 ;;
+  esac
+
+  if [[ -n $slug ]]; then
+    [[ -n $(account_of_org "$slug") ]] || die "'$slug' is not being watched"
+    account=$(account_of_org "$slug")
+    state_apply 'del(.organizations[$s])
+                 | (if .organization == $s
+                    then .organization = ((.organizations | keys_unsorted[0]) // "")
+                    else . end)' --arg s "$slug"
+    echo "Stopped watching $slug."
+    if [[ -z $(orgs_of_account "$account") ]]; then
+      echo "Account '$account' now watches nothing."
+      echo "Remove it and its token with: omarchy-forge remove --account $account"
+    fi
+    return 0
+  fi
+
+  [[ -n $account ]] || die "usage: omarchy-forge remove --account <name>"
+  account_exists "$account" || die "no account named '$account'"
+  token_clear "$account"
+  state_apply 'del(.accounts[$a])
+               | .organizations = (.organizations | with_entries(select(.value.account != $a)))
+               | (if (.organizations[.organization] // null) == null
+                  then .organization = ((.organizations | keys_unsorted[0]) // "")
+                  else . end)' --arg a "$account"
+  echo "Removed account '$account', its token, and everything it watched."
+}
+
+cmd_status() {
+  local only="" org account out first=true
+  case ${1:-} in
+  --org) only=${2:-} ;;
+  --org=*) only=${1#--org=} ;;
+  esac
+
+  local targets
+  if [[ -n $only ]]; then
+    targets=$only
+  else
+    targets=$(org_names)
+  fi
+  [[ -n ${targets//[$'\n ']/} ]] || die "no organizations watched. Run: omarchy-forge add"
+
+  while read -r org; do
+    [[ -n $org ]] || continue
+    account=$(account_of_org "$org")
+    [[ -n $account ]] || account=$(default_account)
+
+    if [[ $first == false ]]; then echo; fi
+    first=false
+    if [[ $(state_get '.organizations | length') -gt 1 || -n $only ]]; then
+      echo "# $org ($account)"
+    fi
+
+    if ! out=$(api_request GET "/orgs/$org/servers?page%5Bsize%5D=100&sort=name" "$account"); then
+      echo "  $(envelope_error "$out")" >&2
+      continue
+    fi
+    echo "$out" | jq -r '
+      .body.data[]
+      | .attributes
+      | (if .revoked then "revoked" elif .is_ready then (.connection_status // "ready") else "provisioning" end) as $state
+      | "\(.name)\t\($state)\t\(.provider) \(.region)\t\(.ip_address // "-")"
+    ' | column -t -s$'\t'
+  done <<<"$targets"
+}
+
+cmd_doctor() {
+  local name token out org account failed=false
+
+  echo "api        $FORGE_API"
+  echo "state      $STATE_FILE"
+  echo "default    $(state_get '.organization' | sed 's/^$/<unset>/')"
+
+  adopt_legacy_token
+
+  if [[ $(account_count) == 0 ]]; then
+    echo
+    echo "No accounts. Run: omarchy-forge add"
+    return 1
+  fi
+
+  echo
+  echo "accounts"
+  while read -r name; do
+    [[ -n $name ]] || continue
+    token=$(token_read "$name")
+    if [[ -z $token ]]; then
+      printf '  %-14s TOKEN MISSING — run: omarchy-forge login --account %s\n' "$name" "$name"
+      failed=true
+      continue
+    fi
+    if out=$(api_request GET /user "$name"); then
+      remember_account_user "$name" "$out"
+      printf '  %-14s ok — %s · %s of 60 requests left this minute\n' \
+        "$name" \
+        "$(echo "$out" | jq -r '.body.data.attributes.email // "?"')" \
+        "$(echo "$out" | jq -r '.rateRemaining // "?"')"
+    else
+      printf '  %-14s FAILED — %s\n' "$name" "$(envelope_error "$out")"
+      failed=true
+    fi
+  done < <(account_names)
+
+  echo
+  echo "organizations"
+  if [[ $(state_get '.organizations | length') == 0 ]]; then
+    echo "  none — run: omarchy-forge add"
+    failed=true
+  fi
+  while read -r org; do
+    [[ -n $org ]] || continue
+    account=$(account_of_org "$org")
+    if account_exists "$account"; then
+      printf '  %-24s → %s\n' "$org" "$account"
+    else
+      printf '  %-24s → %s (no such account)\n' "$org" "$account"
+      failed=true
+    fi
+  done < <(org_names)
+
+  [[ $failed == false ]]
+}
+
+usage() {
+  cat <<'EOF'
+Laravel Forge for the Omarchy bar.
+
+  omarchy-forge setup                     guided setup, and how a second
+                                          organization gets added later
+  omarchy-forge add [--name NAME]         store a token and pick which of its
+                                          organizations to watch
+  omarchy-forge accounts                  accounts, tokens, and what each watches
+  omarchy-forge orgs [account]            organizations a token can see
+  omarchy-forge org [slug]                show or set the default organization
+  omarchy-forge remove <slug>             stop watching an organization
+  omarchy-forge remove --account NAME     drop an account, its token, and its orgs
+  omarchy-forge rename OLD NEW            give an account a different handle
+  omarchy-forge login [--account NAME]    replace the token on an account
+  omarchy-forge logout [account]          remove an account's token
+  omarchy-forge status [--org SLUG]       server health as a table
+  omarchy-forge doctor                    every account: token, auth, rate limit
+  omarchy-forge api [--account NAME|--org SLUG] GET /orgs/...
+                                          raw authenticated request (JSON envelope)
+
+One token per account; an account can watch several organizations. An account
+name is only a handle for this CLI — it is derived from whoever the token
+belongs to, and never appears in the bar.
+EOF
+}
+
+case "${1:-}" in
+setup) cmd_setup ;;
+add)
+  shift
+  cmd_add "$@"
+  ;;
+accounts) cmd_accounts ;;
+login)
+  shift
+  cmd_login "$@"
+  ;;
+rename)
+  shift
+  cmd_rename "$@"
+  ;;
+logout)
+  shift
+  cmd_logout "$@"
+  ;;
+orgs)
+  shift
+  cmd_orgs "$@"
+  ;;
+org)
+  shift
+  cmd_org "$@"
+  ;;
+remove)
+  shift
+  cmd_remove "$@"
+  ;;
+status)
+  shift
+  cmd_status "$@"
+  ;;
+api)
+  shift
+  account=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+    --account)
+      [[ $# -ge 2 ]] || die "--account needs an account name"
+      account=$2
+      shift 2
+      ;;
+    --account=*) account=${1#--account=}; shift ;;
+    --org)
+      [[ $# -ge 2 ]] || die "--org needs an organization slug"
+      account=$(account_of_org "$2")
+      [[ -n $account ]] || die "'$2' is not watched — which account should it use?"
+      shift 2
+      ;;
+    --org=*)
+      account=$(account_of_org "${1#--org=}")
+      [[ -n $account ]] || die "'${1#--org=}' is not watched — which account should it use?"
+      shift
+      ;;
+    *) break ;;
+    esac
+  done
+  [[ $# -ge 2 ]] || die "usage: omarchy-forge api [--account NAME] <METHOD> <path>"
+  api_request "$1" "$2" "$account"
+  ;;
+doctor) cmd_doctor ;;
+-h | --help | help | "") usage ;;
+*) die "unknown command '$1' (try: omarchy-forge help)" ;;
+esac

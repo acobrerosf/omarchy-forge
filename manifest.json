@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "id": "acobrerosf.forge",
+  "name": "Forge",
+  "version": "1.1.0",
+  "author": "acobrerosf",
+  "license": "MIT",
+  "description": "Laravel Forge server health and deployment status in the Omarchy bar, across every organization you have a token for, with one-key deploys.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Forge",
+    "description": "Watch Laravel Forge servers and site deployments across organizations, and deploy from the bar.",
+    "category": "Development",
+    "aliases": [
+      "forge",
+      "laravel",
+      "deploy",
+      "servers"
+    ],
+    "allowMultiple": true,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 60,
+      "watchDeployments": true,
+      "notifyDeployments": true,
+      "organization": "",
+      "dashboardUrlTemplate": "https://forge.laravel.com/{org}/{server}/{site}"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "description": "Forge allows 60 requests a minute per Forge account. One tick costs one request per organization, plus one per server when deployment watching is on.",
+        "min": 15,
+        "max": 3600,
+        "step": 15,
+        "defaultValue": 60
+      },
+      {
+        "key": "watchDeployments",
+        "type": "boolean",
+        "label": "Watch deployments",
+        "description": "Also fetch each server's sites and their latest deployment. Off means server health only, at one request per tick.",
+        "defaultValue": true
+      },
+      {
+        "key": "notifyDeployments",
+        "type": "boolean",
+        "label": "Notify on deployment changes",
+        "description": "Send a desktop notification when a deployment finishes or fails.",
+        "defaultValue": true
+      },
+      {
+        "key": "organization",
+        "type": "string",
+        "label": "Organizations to show",
+        "description": "Leave empty to show every organization set up with `omarchy-forge add`. Name one slug, or a comma-separated list, to narrow this copy of the widget to those.",
+        "defaultValue": ""
+      },
+      {
+        "key": "dashboardUrlTemplate",
+        "type": "string",
+        "label": "Dashboard URL template",
+        "description": "Where the 'open in Forge' action points. {org} is the organization slug, {server} the server slug (use {serverId} for the numeric id), {site} the site id. The {site} segment is dropped for a server row.",
+        "defaultValue": "https://forge.laravel.com/{org}/{server}/{site}"
+      }
+    ]
+  }
+}
