@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "acobrerosf.forge",
   "name": "Forge",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "author": "acobrerosf",
   "license": "MIT",
   "description": "Laravel Forge server health and deployment status in the Omarchy bar, across every organization you have a token for, with one-key deploys.",
@@ -69,7 +69,7 @@
         "key": "dashboardUrlTemplate",
         "type": "string",
         "label": "Dashboard URL template",
-        "description": "Where the 'open in Forge' action points. {org} is the organization slug, {server} the server slug (use {serverId} for the numeric id), {site} the site id. The {site} segment is dropped for a server row.",
+        "description": "Where the 'open in Forge' action points. Must be an http or https address. {org} is the organization slug, {server} the server slug (use {serverId} for the numeric id), {site} the site id. The {site} segment is dropped for a server row.",
         "defaultValue": "https://forge.laravel.com/{org}/{server}/{site}"
       }
     ]

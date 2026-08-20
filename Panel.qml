@@ -297,7 +297,10 @@ Panel {
   // Forge, which is what `f` reaches directly.
   function openCurrent() {
     var site = currentSite()
-    if (site && site.url && forge) { forge.openInBrowser(site.url); close(); return }
+    // Ask the model for the address rather than reading site.url directly: one
+    // it refuses has to fall through to the Forge link, not silently do nothing.
+    var url = site ? Model.externalUrl(site.url) : ""
+    if (url && forge) { forge.openInBrowser(url); close(); return }
     openCurrentInForge()
   }
 

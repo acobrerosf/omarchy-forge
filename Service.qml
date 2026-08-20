@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import qs.Commons
 import "Model.js" as Model
 
 // Everything that talks to Forge, for the whole session: polling, scheduling,
@@ -781,7 +782,14 @@ Item {
   function _notify(urgency, glyph, headline, description, url) {
     var command = ["omarchy-notification-send", "--app-name", "Forge",
                    "-u", urgency, "-g", glyph]
-    if (url) command = command.concat(["--exec", "omarchy-launch-browser " + url])
+    // Unlike every other command here, `--exec` is a shell *string* by contract:
+    // the shell's notification service runs it through `bash -lc` on click. The
+    // address came from the API, so it is validated on the way in and quoted on
+    // the way out — neither one alone is load-bearing. See ARCHITECTURE.md.
+    var safe = Model.externalUrl(url)
+    if (safe)
+      command = command.concat(["--exec",
+                                "omarchy-launch-browser " + Util.shellQuote(safe)])
     Quickshell.execDetached(command.concat([headline, description]))
   }
 
@@ -835,9 +843,13 @@ Item {
 
   // ---------------------------------------------------------------- actions
 
+  // An argv element, so no shell is involved — but omarchy-launch-browser hands
+  // its arguments straight to the browser binary, where an address beginning
+  // with `-` would read as a flag and a foreign scheme as something to open.
   function openInBrowser(url) {
-    if (!url) return
-    Quickshell.execDetached(["omarchy-launch-browser", String(url)])
+    var safe = Model.externalUrl(url)
+    if (!safe) return
+    Quickshell.execDetached(["omarchy-launch-browser", safe])
   }
 
   function copyToClipboard(text) {

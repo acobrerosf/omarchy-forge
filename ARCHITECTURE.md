@@ -142,6 +142,32 @@ into one poll and one notification.
 org is reached through; `FileView { watchChanges: true }` on `forge.json` means `omarchy-forge add`
 is picked up without a restart.
 
+## Addresses that leave the process
+
+Everything this plugin opens, copies or hands to another program is built from API data, and one
+of those paths ends in a shell. `omarchy-notification-send --exec` does not take an argv array
+like every other command here — it takes a shell **string**, which it parks in a libnotify hint,
+and the shell's own notification service runs that hint through `bash -lc` when the toast is
+clicked. A site's `url` reaching that string unquoted is arbitrary code execution on click, and
+the hint is persisted alongside the popup, so it stays clickable across a shell restart.
+
+So every address goes through `Model.externalUrl` first: absolute `http`/`https` only, no
+userinfo, and everything outside the set RFC 3986 permits unescaped gets percent-encoded. It
+returns `""` for anything it won't vouch for, the same refusal `dashboardUrl` uses, and the caller
+decides what to say — `Panel.openCurrent` falls back to the Forge link, `openInBrowser` declines.
+`dashboardUrl` ends by calling it, so a hand-edited `dashboardUrlTemplate` is held to the same
+rule as the API's own values.
+
+The notification path then *also* wraps the result in `Util.shellQuote`. That is deliberate
+belt-and-braces: validation without quoting would make the encoder's character class
+load-bearing, and quoting without validation would still hand the browser a `javascript:` URL or
+a leading `-` read as a flag. Neither layer should be the only thing standing between a remote
+string and a shell.
+
+`Model.sshCommand` is the same problem with a human in the loop — its output goes to the
+clipboard for the user to paste into a terminal — so it refuses an `ip` that isn't plain address
+characters.
+
 ## Rendering
 
 `Panel.qml` flattens organizations, servers and sites into one `rows` list, so the cursor is a

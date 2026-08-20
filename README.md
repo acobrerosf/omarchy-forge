@@ -169,7 +169,7 @@ Bar widget settings, editable in Setup → Plugins or directly in `~/.config/oma
 | `watchDeployments` | `true` | also fetch sites and deployment status |
 | `notifyDeployments` | `true` | notify when a deployment finishes or fails |
 | `organization` | `""` | which organizations this copy shows — empty for all of them |
-| `dashboardUrlTemplate` | `https://forge.laravel.com/{org}/{server}/{site}` | where `f` and right-click point — `{org}`/`{server}` are slugs, `{site}` an id, `{serverId}` also available |
+| `dashboardUrlTemplate` | `https://forge.laravel.com/{org}/{server}/{site}` | where `f` and right-click point — `{org}`/`{server}` are slugs, `{site}` an id, `{serverId}` also available; must be an `http`/`https` address |
 
 `organization` is a filter over what the helper is watching, not a second place to configure one.
 Empty shows everything; a slug narrows the widget to that organization; a comma-separated list

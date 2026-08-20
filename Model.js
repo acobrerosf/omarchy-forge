@@ -110,6 +110,11 @@ function serverMeta(server) {
 
 function sshCommand(server) {
   if (!server || !server.ip) return ""
+  // This ends up on the clipboard for the user to paste into a terminal, so an
+  // address from the API carrying anything but address characters is refused
+  // rather than handed over as a command that would run more than ssh. The
+  // class covers IPv4, IPv6 and hostnames; sshPort is already a Number.
+  if (!/^[A-Za-z0-9.\-:]+$/.test(server.ip)) return ""
   var port = server.sshPort && server.sshPort !== 22 ? " -p " + server.sshPort : ""
   return "ssh forge@" + server.ip + port
 }
@@ -523,5 +528,43 @@ function dashboardUrl(template, org, server, siteId) {
   // the API omitted, or a typo in the template. Returning nothing lets the
   // caller say so, rather than opening a link already known to 404. A
   // slug-less server still resolves a template written against {serverId}.
-  return /\{[^}]*\}/.test(url) ? "" : url
+  return /\{[^}]*\}/.test(url) ? "" : externalUrl(url)
+}
+
+// Every address that leaves this plugin passes through here first.
+//
+// A site's URL arrives from the API, and a deployment notification puts it
+// inside a command string that the shell hands to `bash -lc` when the toast is
+// clicked (see ARCHITECTURE.md). That makes it untrusted input crossing into a
+// shell, so it is checked rather than trusted: only an absolute http(s) URL
+// with a plain authority gets through, and every character outside the set RFC
+// 3986 permits unescaped is percent-encoded — so no space, quote, backtick or
+// newline survives even if the quoting downstream were ever lost. Refusing
+// returns "", like dashboardUrl, rather than a mangled link.
+function externalUrl(value) {
+  var parts = /^(https?:\/\/)([^\/?#]+)([\/?#][\s\S]*)?$/i.exec(String(value || "").trim())
+  // Userinfo is never part of a Forge address, and is the classic way to make
+  // a hostile host read as a familiar one.
+  if (!parts || parts[2].indexOf("@") !== -1) return ""
+  return parts[1].toLowerCase() + encodeUrlChars(parts[2]) + encodeUrlChars(parts[3] || "")
+}
+
+// What RFC 3986 allows unescaped, less the apostrophe: it is a legal
+// sub-delimiter but the one character that would close a single-quoted shell
+// literal, and no real address needs it. The other sub-delimiters stay — a
+// query string is built from them, and single-quoting already makes them
+// inert. A `%` not already starting an escape triplet is encoded rather than
+// left meaning two things, and surrogate pairs match whole so an astral
+// character encodes instead of splitting into two halves neither of which can.
+var urlSafe = /[\uD800-\uDBFF][\uDC00-\uDFFF]|%(?![0-9A-Fa-f]{2})|[^A-Za-z0-9\-._~:\/?#\[\]@!$&()*+,;=%]/g
+
+function encodeUrlChars(text) {
+  return String(text).replace(urlSafe, function (c) {
+    // encodeURIComponent leaves the apostrophe alone — it is a legal URL
+    // character — and that is precisely the one that has to go.
+    if (c === "'") return "%27"
+    // An unpaired surrogate can't be part of an address; drop it rather than
+    // let encodeURIComponent throw.
+    try { return encodeURIComponent(c) } catch (e) { return "" }
+  })
 }

@@ -67,10 +67,13 @@ ForgeIcon.qml           the bar mark + badge (Shape/CurveRenderer).
 **`ARCHITECTURE.md` is the design document of record** — the envelope contract, accounts vs
 organizations, the rate budget, the queue and pagination, subscriptions, and how a row is
 rendered. Read it before changing any of those, and update it rather than re-explaining a
-decision in a file header. Two couplings from it are worth repeating here because they break
-silently: `Model.parseEnvelope`/`envelopeError` expect the exact envelope shape, and
-`Service._isMissingToken` matches the literal prefix `"No API token"` produced by `api_request`.
-Don't reword that message without changing both.
+decision in a file header. Three couplings from it are worth repeating here because they break
+silently: `Model.parseEnvelope`/`envelopeError` expect the exact envelope shape;
+`Service._isMissingToken` matches the literal prefix `"No API token"` produced by `api_request`
+(don't reword that message without changing both); and `omarchy-notification-send --exec` takes a
+shell *string*, not an argv array — the shell runs it through `bash -lc` on click, so an address
+reaching it must pass `Model.externalUrl` **and** `Util.shellQuote`. Any new address that leaves
+this process — opened, copied, or handed to another program — goes through `Model.externalUrl`.
 
 ### Conventions that matter
 
