@@ -192,14 +192,17 @@ Item {
 
     var nextOrgs = ({})
     for (var slug in merged) {
-      var state = orgs[slug] || _blankState()
+      var state = orgs[slug] || Model.emptyState()
       var account = accountForOrg(slug)
       if (state.account !== account) {
         state = _shallowCopy(state)
         state.account = account
-        // The old account's verdict says nothing about the new one.
+        // The old account's verdict says nothing about the new one — and
+        // neither does a site walk started under its credential.
         state.accountError = ""
         state.nextDueMs = 0
+        state.siteCursor = ""
+        state.sweepSites = []
       }
       nextOrgs[slug] = state
     }
@@ -208,15 +211,6 @@ Item {
     queue.keepOrgs(merged)
 
     _tick()
-  }
-
-  function _blankState() {
-    var state = Model.emptyState()
-    state.nextDueMs = 0
-    state.pendingSites = ({})
-    state.lastStatus = ({})
-    state.seeded = false
-    return state
   }
 
   function _shallowCopy(source) {
@@ -463,6 +457,13 @@ Item {
     function keepOrgs(wanted) {
       drop(function (job) { return wanted[job.org] === undefined })
     }
+
+    // Whether anything queued matches — the on-demand fetch's dedupe reads it.
+    function contains(matches) {
+      for (var i = 0; i < _jobs.length; i++)
+        if (matches(_jobs[i])) return true
+      return false
+    }
   }
 
   // The request in flight, which pairs with fetchProcess and its watchdog
@@ -470,6 +471,10 @@ Item {
   property var _current: null
   property double _currentStartedMs: 0
   property bool _timedOut: false
+  // When each server's on-demand fetch last went out (org "/" serverId → ms):
+  // the debounce behind `fetchServerSites`. Reassigned, never mutated, since
+  // a guard reads it while a copy may be under way.
+  property var _serverSitesAskedAt: ({})
   // The helper gives curl 15 seconds of its own, so anything still running
   // well past that is stuck rather than slow.
   readonly property int requestTimeoutMs: 25000
@@ -481,20 +486,26 @@ Item {
     var job
     while ((job = queue.take()) !== null) {
       // A marker rather than a request: it runs the moment every site fetch
-      // ahead of it has landed, whichever organizations interleaved.
-      if (job.kind === "sweepDone") { _finishSweep(job.org); continue }
+      // ahead of it has landed, whichever organizations interleaved. Its one
+      // job is closing the refresh — including one whose sites request errored
+      // and answered nothing.
+      if (job.kind === "sweepDone") { _finishRefresh(job.org); continue }
       if (!orgs[job.org]) continue
 
       _current = job
       _currentStartedMs = Date.now()
       budget.charge(budget.bucketFor(job.account))
-      fetchProcess.command = [cliPath, "api", "--account", job.account, "GET",
-                              job.kind === "servers"
-                                ? Model.serversPath(job.org, job.cursor)
-                                : Model.sitesPath(job.org, job.serverId, job.cursor)]
+      fetchProcess.command = [cliPath, "api", "--account", job.account, "GET", _pathFor(job)]
       fetchProcess.running = true
       return
     }
+  }
+
+  function _pathFor(job) {
+    if (job.kind === "servers") return Model.serversPath(job.org, job.cursor)
+    if (job.kind === "serverSites")
+      return Model.serverSitesPath(job.org, job.serverId, job.cursor)
+    return Model.sitesPath(job.org, job.cursor)
   }
 
   // ------------------------------------------------------------- pagination
@@ -504,14 +515,17 @@ Item {
   // indistinguishable from a complete one. The ceiling applies to
   // continuations only, so the first page always lands. See ARCHITECTURE.md.
 
-  // 5 pages is 150 rows. Past that, an organization is being used in a way a
-  // bar widget is the wrong shape for, and the dashboard is the better tool.
+  // 5 pages is 150 rows — per chain, per tick. For the server list that is
+  // still the coverage limit: past it, an organization is being used in a way
+  // a bar widget is the wrong shape for. For the org site list it only sizes
+  // the window — the cursor persists in org state, so coverage is the whole
+  // organization, one rotation window per tick.
   readonly property int maxPages: 5
 
   // "next" when another page was queued, "" when the list is complete, and
-  // otherwise why it was cut short. The caller words the note, because "the
-  // first 150" means a different thing for an organization's servers than for
-  // one server's sites.
+  // otherwise why it was cut short. The caller words the note, because a cap
+  // is a hard stop for the server chain but merely "resumes next tick" for
+  // the rotating site chain.
   function _continuePage(job, envelope, rows) {
     var cursor = Model.nextCursor(envelope.body)
     if (cursor === "") return ""
@@ -631,7 +645,10 @@ Item {
       if (budget.bucketFor(state.account || accountForOrg(org)) !== bucket) continue
       // `lastError`, not `accountError`: an account-level verdict blanks the
       // server list further down, and the bar icon judges what it can see.
-      _patch(org, { lastError: message, accountError: "" })
+      // The site walk starts over after the hold — its dropped continuation
+      // was the only thing that could have advanced the cursor.
+      _patch(org, { lastError: message, accountError: "",
+                    siteCursor: "", sweepSites: [] })
       if (state.refreshing) _finishRefresh(org)
     }
   }
@@ -643,7 +660,10 @@ Item {
 
     if (!_applyEnvelope(org, job.account, envelope)) {
       if (orgs[org].accountError !== "")
-        _patch(org, { servers: [], sitesByServer: ({}) })
+        // An account that can no longer see the servers can't vouch for a
+        // half-walked rotation either, so that starts over with it.
+        _patch(org, { servers: [], sitesByServer: ({}),
+                      siteCursor: "", sweepSites: [] })
       _finishRefresh(org)
       return
     }
@@ -657,77 +677,157 @@ Item {
       _addNote(org, "Server list cut short to stay inside the rate limit")
 
     // Sites belonging to a server that has disappeared would linger forever.
-    var kept = ({})
-    var existing = orgs[org].sitesByServer
-    for (var i = 0; i < servers.length; i++)
-      if (existing[servers[i].id]) kept[servers[i].id] = existing[servers[i].id]
+    var kept = Model.mergeSitesByServer(orgs[org].sitesByServer, [], servers)
 
     _patch(org, { servers: servers, sitesByServer: kept, lastRefreshMs: Date.now() })
     _startSweep(org)
   }
 
+  // One request chain for the organization's whole site list, not one per
+  // server — and for a large organization, one *window* of that list per tick:
+  // `siteCursor` carries the walk across ticks and wraps around, so every site
+  // is reached without any single tick paying for more than a window. Sites
+  // arrive flat and are grouped when the chain ends, so a server that is not
+  // `ready` gets its sites too — a site on an unreachable server is exactly
+  // what is worth seeing.
   function _startSweep(org) {
     var config = _config[org]
     if (!config || !config.watchDeployments) { _finishRefresh(org); return }
 
-    var servers = orgs[org].servers
-    var ready = []
-    for (var i = 0; i < servers.length; i++)
-      if (servers[i].state === "ready") ready.push(servers[i].id)
-    if (ready.length === 0) { _finishRefresh(org); return }
+    // Nothing to group the answer under, so there is nothing to ask for.
+    if (orgs[org].servers.length === 0) { _finishRefresh(org); return }
 
     var account = orgs[org].account || accountForOrg(org)
-    if (budget.wouldExceed(account, ready.length)) {
+    if (budget.wouldExceed(account, 1)) {
       _addNote(org, "Deployment check skipped to stay inside the rate limit")
       _finishRefresh(org)
       return
     }
 
-    _patch(org, { pendingSites: ({}) })
-    for (var j = 0; j < ready.length; j++)
-      queue.push({ org: org, account: account, kind: "sites", serverId: ready[j],
-                   page: 1, rows: [] })
+    // `fresh` marks a walk starting over — it is what empties the previous
+    // rotation's accumulation, and it rides `_continuePage`'s copy onto every
+    // continuation of this chain.
+    queue.push({ org: org, account: account, kind: "sites", page: 1, rows: [],
+                 cursor: orgs[org].siteCursor, fresh: orgs[org].siteCursor === "" })
     queue.push({ org: org, account: account, kind: "sweepDone" })
   }
 
+  // The whole window lands in one patch — publishing pages as they arrive
+  // would make a panel's row list shuffle under the cursor — and how it lands
+  // depends on how the chain ended. A wrap (no next cursor) is the full
+  // picture and replaces everything, which is what lets a server that
+  // genuinely lost its last site go empty. A window cut short updates only
+  // the sites it observed and leaves every other server exactly as it was:
+  // the org list is not grouped by server, so anything more would delete
+  // sites the window simply never reached. See ARCHITECTURE.md.
   function _onSites(job, text) {
     var envelope = Model.parseEnvelope(text)
     if (!orgs[job.org]) return
+    if (!_applyEnvelope(job.org, job.account, envelope)) {
+      // The cursor may be the very thing that failed, so the walk restarts
+      // from page 1 next tick. What is on screen stays exactly as it was, and
+      // the sweepDone marker closes the refresh.
+      _patch(job.org, { siteCursor: "", sweepSites: [] })
+      return
+    }
+
+    var pageRows = Model.sitesFrom(envelope.body)
+    if (Model.sitesLinkageMissing(envelope.body, pageRows)) {
+      // Publishing this as-is would show an empty organization under a
+      // healthy icon — the exact silence the linkage check exists to break.
+      _patch(job.org, { lastError: "Site list arrived without server links — check the token's scopes",
+                        siteCursor: "", sweepSites: [] })
+      return
+    }
+
+    var sites = job.rows.concat(pageRows)
+    var more = _continuePage(job, envelope, sites)
+    if (more === "next") return
+
+    // `_applyEnvelope` patched, so the state in hand must be re-read.
+    var state = orgs[job.org]
+    var swept = Model.mergeSweepSites(job.fresh ? [] : state.sweepSites, sites)
+
+    if (more === "") {
+      var grouped = Model.groupSitesByServer(swept, state.servers)
+      _patch(job.org, { sitesByServer: grouped, siteCursor: "", sweepSites: [],
+                        lastStatus: _announce(job.org, sites, grouped, state, true),
+                        seeded: true })
+      return
+    }
+
+    // "cap" or "budget": the window ended mid-list, and the kept cursor
+    // carries the walk into the next tick.
+    var merged = Model.mergeSitesByServer(state.sitesByServer, sites, state.servers)
+    _patch(job.org, { sitesByServer: merged,
+                      siteCursor: Model.nextCursor(envelope.body),
+                      sweepSites: swept,
+                      lastStatus: _announce(job.org, sites, merged, state, false),
+                      seeded: true })
+    if (more === "budget")
+      _addNote(job.org, "Site check paused to stay inside the rate limit — it resumes next refresh")
+    else
+      _addNote(job.org, "Deployments checked in rotation — "
+               + Model.pluralize(Model.countSites(merged), "site") + " watched")
+  }
+
+  // The rotation keeps every row honest eventually; this makes an *opened* row
+  // honest now, through the per-server list that is complete for exactly that
+  // server. The guards are what keep a held key or the panel's auto-unfold
+  // from turning one gesture into a request per sweep — and `force` (the
+  // post-deploy look) bypasses only the debounce, never the budget or a hold.
+  function fetchServerSites(org, serverId, force) {
+    var key = String(org)
+    var state = orgs[key]
+    if (!state) return
+    var config = _config[key]
+    if (!config || !config.watchDeployments) return
+
+    var account = state.account || accountForOrg(key)
+    if (budget.blockedMs(account) > 0) return
+    if (budget.wouldExceed(account, 1)) return
+
+    var id = String(serverId)
+    var stamp = key + "/" + id
+    if (!force && Date.now() - (_serverSitesAskedAt[stamp] || 0) < 15000) return
+    var pending = function (job) {
+      return job.kind === "serverSites" && job.org === key && job.serverId === id
+    }
+    if (queue.contains(pending) || (_current !== null && pending(_current))) return
+
+    var asked = _shallowCopy(_serverSitesAskedAt)
+    asked[stamp] = Date.now()
+    _serverSitesAskedAt = asked
+    queue.push({ org: key, account: account, kind: "serverSites",
+                 serverId: id, page: 1, rows: [] })
+  }
+
+  function _onServerSites(job, text) {
+    var envelope = Model.parseEnvelope(text)
+    if (!orgs[job.org]) return
+    // Nothing to close on failure: this job carries no marker and set no
+    // `refreshing` flag — it belongs to a keypress, not to a tick.
     if (!_applyEnvelope(job.org, job.account, envelope)) return
 
-    var sites = job.rows.concat(Model.sitesFrom(envelope.body, job.serverId))
+    var sites = job.rows.concat(Model.sitesFrom(envelope.body))
     var more = _continuePage(job, envelope, sites)
     if (more === "next") return
     if (more === "cap")
-      _addNote(job.org, "Some servers show only their first "
-                        + Model.pluralize(sites.length, "site"))
+      _addNote(job.org, "Showing the first " + Model.pluralize(sites.length, "site"))
     else if (more === "budget")
-      _addNote(job.org, "Some site lists cut short to stay inside the rate limit")
+      _addNote(job.org, "Site list cut short to stay inside the rate limit")
 
-    var pending = _shallowCopy(orgs[job.org].pendingSites)
-    pending[job.serverId] = sites
-    _patch(job.org, { pendingSites: pending })
-  }
-
-  // The whole sweep lands at once. Publishing each server's sites as they
-  // arrive would make a panel's row list shuffle under the cursor.
-  function _finishSweep(org) {
-    var state = orgs[org]
-    if (!state) return
-
-    var merged = ({})
-    for (var i = 0; i < state.servers.length; i++) {
-      var id = state.servers[i].id
-      merged[id] = state.pendingSites[id] || state.sitesByServer[id] || []
-    }
-
-    _patch(org, {
+    var state = orgs[job.org]
+    var merged = Model.replaceServerSites(state.sitesByServer, job.serverId, sites, state.servers)
+    _patch(job.org, {
       sitesByServer: merged,
-      pendingSites: ({}),
-      lastStatus: _announce(org, merged, state),
+      // Feeding the accumulation is load-bearing, not tidiness: a site fetched
+      // here at a list position the rotation has already passed would
+      // otherwise vanish at the wrap and flap back a rotation later.
+      sweepSites: Model.mergeSweepSites(state.sweepSites, sites),
+      lastStatus: _announce(job.org, sites, merged, state, false),
       seeded: true
     })
-    _finishRefresh(org)
   }
 
   function _finishRefresh(org) {
@@ -744,22 +844,40 @@ Item {
 
   // ----------------------------------------------------------- notifications
 
-  // Deployment status per site key as of the previous sweep. Seeding on the
-  // first sweep matters: without it, every already-failed site would announce
-  // itself the moment the shell starts.
-  function _announce(org, merged, state) {
-    var next = ({})
-    var notify = _config[org] ? _config[org].notifyDeployments : false
-    for (var id in merged) {
-      var list = merged[id]
-      for (var i = 0; i < list.length; i++) {
-        var site = list[i]
-        next[site.key] = site.deploymentStatus
-        if (!state.seeded || !notify) continue
-        var before = state.lastStatus[site.key]
-        if (before === undefined || before === site.deploymentStatus) continue
-        _notifyDeployment(org, site)
+  // Deployment status per site key as of that site's *last observation* — a
+  // rotation sees one window per tick, so an unobserved site keeps its last
+  // word rather than losing it, and a key leaves the map only when `complete`
+  // says the whole organization was seen. That retention is what lets a site
+  // that briefly fell out of a window announce its next change exactly once
+  // instead of never. Seeding on the first sweep matters: without it, every
+  // already-failed site would announce itself the moment the shell starts.
+  function _announce(org, observed, published, state, complete) {
+    var next
+    if (complete) {
+      // The one place keys are pruned: a site absent from the full picture is
+      // genuinely gone. Earlier windows already recorded their observations,
+      // so nothing here re-announces.
+      next = ({})
+      for (var id in published) {
+        var list = published[id]
+        for (var i = 0; i < list.length; i++)
+          next[list[i].key] = list[i].deploymentStatus
       }
+    } else {
+      next = _shallowCopy(state.lastStatus)
+      for (var j = 0; j < observed.length; j++)
+        next[observed[j].key] = observed[j].deploymentStatus
+    }
+
+    var notify = _config[org] ? _config[org].notifyDeployments : false
+    if (!state.seeded || !notify) return next
+    for (var k = 0; k < observed.length; k++) {
+      var site = observed[k]
+      // Dropped at grouping — a site the panel does not draw should not speak.
+      if (!Model.hasKey(published, site.serverId)) continue
+      var before = state.lastStatus[site.key]
+      if (before === undefined || before === site.deploymentStatus) continue
+      _notifyDeployment(org, site)
     }
     return next
   }
@@ -808,6 +926,7 @@ Item {
 
   property string _deployOrg: ""
   property string _deployAccount: ""
+  property string _deployServerId: ""
 
   function deploy(org, site) {
     if (!site || actionProcess.running || String(org) === "") return
@@ -825,6 +944,7 @@ Item {
                      "Rate limited — try again in " + Math.ceil(held / 1000) + "s")
       return
     }
+    _deployServerId = String(site.serverId)
     deployingSiteKey = site.key
     budget.charge(budget.bucketFor(_deployAccount))
     actionProcess.command = [cliPath, "api", "--account", _deployAccount, "POST",
@@ -836,17 +956,24 @@ Item {
     var envelope = Model.parseEnvelope(text)
     var org = _deployOrg
     var account = _deployAccount
+    var serverId = _deployServerId
     var key = deployingSiteKey
     deployingSiteKey = ""
     _deployOrg = ""
     _deployAccount = ""
+    _deployServerId = ""
 
     if (_applyEnvelope(org, account, envelope)) {
       deployFinished(key, true, "Deployment queued")
       // Forge queues the deploy asynchronously, so the status only moves a
       // moment later. Look again shortly rather than making the user wait out
-      // a whole refresh interval to see it start.
-      if (orgs[org]) _patch(org, { nextDueMs: Date.now() + 6000 })
+      // a whole refresh interval — and look at the deployed server directly:
+      // under rotation the re-poll only advances the window, which for a
+      // large organization will usually be looking somewhere else entirely.
+      if (orgs[org]) {
+        _patch(org, { nextDueMs: Date.now() + 6000 })
+        fetchServerSites(org, serverId, true)
+      }
     } else {
       deployFinished(key, false, Model.envelopeError(envelope))
     }
@@ -943,6 +1070,7 @@ Item {
       root._current = null
       if (job) {
         if (job.kind === "servers") root._onServers(job, text)
+        else if (job.kind === "serverSites") root._onServerSites(job, text)
         else root._onSites(job, text)
       }
       root._pump()

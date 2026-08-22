@@ -73,9 +73,24 @@ the account name — two tokens from the same person share one budget.
 dropped for that tick and the panel says so; the **server list is never dropped**, because the bar
 icon depends on it. A request that never left the machine (no token) is refunded.
 
-Cost per tick per organization: 1 (server list) + 1 per ready server (sites, with
-`?include=latestDeployment` folding deployments in). Independent of monitor count — that is the
-whole reason polling lives in the service and not the widget.
+Cost per tick per organization: **2** — the server list, then one *window* of the organization's
+site list through `/orgs/{org}/sites?include=server,latestDeployment`. For an organization of 150
+sites or fewer the window is the whole list, so the cost is 2 flat, independent of the server
+count — which is what makes an on-demand fetch (one server's sites on unfold today; a deployment
+log, a command's output tomorrow) obviously affordable — and independent of the monitor count,
+which is the whole reason polling lives in the service and not the widget. Past 150 sites, a tick
+spends up to `maxPages` continuations walking the next window of the rotation described below.
+
+The server list is not redundant with the site list: the sites response only mentions servers that
+*have* sites, and the bar icon has to see every server, including a freshly provisioned empty one.
+Two couplings hold the site request together, and this paragraph is their single home.
+`include=server` is what puts a `server` relationship on a site at all — without it the site's
+`relationships` carries only `latestDeployment`, `Model.serverIdOf` reads nothing, and the panel
+would draw no sites; a page of rows that all lack the linkage is therefore treated as an error
+(`Model.sitesLinkageMissing` → `lastError`), never as an empty organization, because a token
+scoped to see sites but not servers or a quiet API change would otherwise publish zero sites
+under a healthy icon. And `sort` is accepted with a 200 and silently ignored, so the order is
+imposed locally by `Model.sortSites` (`localeCompare`, matching the API-sorted server level).
 
 The ledger lives in the `budget` object inside `Service.qml`. Nothing outside the service reads
 it, so unlike the state panels bind to it is mutated in place rather than copy-on-write.
@@ -97,10 +112,40 @@ One request at a time for the entire session. Two organizations coming due toget
 rather than racing, and the queue doubles as the place where work for a dropped organization is
 thrown away.
 
-A `sweepDone` marker job lets interleaved organizations publish their sites atomically —
-publishing per-server as they land would shuffle rows under the user's cursor. A continuation page
-belongs to a fetch already under way, so it jumps the queue; otherwise the marker would fire on a
-half-walked sweep and publish it.
+**The rotating site sweep.** The org site list arrives flat, 30 rows at a time, in no useful
+order — so a chain cut short does not hold "some servers' sites", it holds an arbitrary slice
+that can carry two of a server's ten. The sweep therefore never fills once; it *rotates*. Each
+tick walks one window (up to `maxPages` pages) from the cursor saved in the org's `siteCursor`,
+and the walk carries on next tick from where it stopped, wrapping around when the list ends.
+Forge's cursors are stateless keyset watermarks (verified live: one held for 95 seconds resumed
+correctly), so a cursor kept across ticks costs nothing and cannot expire; any failed sites page
+still resets it, because the cursor may be the very thing that failed.
+
+Publishing is never destructive, and `sitesByServer` is only ever built by three functions in
+`Model.js`, side by side so the key form cannot drift. `mergeSitesByServer` lands a cut-short
+window: sites the window observed update in place, every other site stays exactly as it was,
+because deleting on a partial view means deleting sites the window simply never reached.
+`groupSitesByServer` lands a wrap — the accumulated `sweepSites` is the whole organization, so
+this is the one publish allowed to delete, which is what lets a server that genuinely lost its
+last site go empty. `replaceServerSites` lands the on-demand per-server fetch
+(`fetchServerSites`, wired to unfolding a server row and to a just-queued deploy), whose endpoint
+is complete for exactly one server — the one replace that needs no wrap to be safe. Its rows also
+feed `sweepSites`, so a site fetched at a list position the rotation has already passed does not
+vanish at the wrap. The fetch is debounced (15s per server), deduped against the queue, and
+refused under a hold or past the ceiling; `force` — the post-deploy look — bypasses only the
+debounce.
+
+`lastStatus`, which deployment notifications diff against, follows the same rule: it holds each
+site's status *as of its last observation*, a partial publish only overwrites the keys it
+observed, and keys are pruned only at a wrap. An unobserved site therefore keeps its last word,
+and a site that briefly fell out of a window announces its next change exactly once instead of
+never.
+
+A `sweepDone` marker job still trails every sweep, with one remaining duty: closing the refresh
+(`_finishRefresh`) once every site fetch queued ahead of it has landed — including a refresh
+whose sites request errored and answered nothing. A continuation page belongs to a fetch already
+under way, so it jumps the queue; otherwise the marker would fire mid-window and close the
+refresh under it.
 
 A single 5s ticker schedules every org off `nextDueMs` rather than a Timer per org. A separate
 watchdog kills only a request that has actually overrun `requestTimeoutMs` (25s, against curl's
@@ -110,9 +155,12 @@ malformed one.
 
 **Pagination.** Forge hands out 30 rows at a time and points at the rest with a cursor, so one
 logical list is a chain of requests. The chain is unbounded by nature, so two things stop it: a
-page cap (5 pages, 150 rows) and the same budget ceiling that guards the sweep. Either way the
-list ends up short, and a short list that doesn't say so is indistinguishable from a complete one
-— so both stops leave a note.
+page cap (5 pages, 150 rows — per chain, per tick) and the same budget ceiling that guards the
+sweep. Either way the list ends up short, and a short list that doesn't say so is
+indistinguishable from a complete one — so both stops leave a note. What a stop *means* differs
+by chain: for the server list it is a hard coverage limit, while for the org site list it merely
+ends the tick's window — the rotation resumes from the kept cursor next tick, and the note says
+sites are being checked in rotation rather than pretending the list is complete.
 
 The ceiling applies to continuations only, which is not a hole in "the server list is never
 dropped": the first page is enqueued unconditionally, so the bar icon always has servers to judge.

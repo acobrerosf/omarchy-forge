@@ -142,13 +142,28 @@ function relatedResource(resource, name, index) {
   return index[String(identifier.type) + ":" + String(identifier.id)] || null
 }
 
-function sitesFrom(body, serverId) {
+// Which server a site belongs to, read off its relationship linkage rather
+// than from the path it was fetched through. The `include=server` that puts
+// the linkage there at all is ARCHITECTURE.md's to explain.
+function serverIdOf(resource) {
+  var relationships = resource ? resource.relationships : null
+  var relation = relationships ? relationships.server : null
+  var identifier = relation ? relation.data : null
+  return identifier && identifier.id ? String(identifier.id) : ""
+}
+
+function sitesFrom(body) {
   var out = []
   var data = body && Array.isArray(body.data) ? body.data : []
   var index = includedIndex(body)
 
   for (var i = 0; i < data.length; i++) {
     var resource = data[i]
+    // A site with no server to sit under is not a row this panel can draw —
+    // every key, every path and the whole tree are built from that id.
+    var serverId = serverIdOf(resource)
+    if (serverId === "") continue
+
     var a = resource.attributes || {}
     var repository = a.repository || {}
     var deployment = relatedResource(resource, "latestDeployment", index)
@@ -161,9 +176,9 @@ function sitesFrom(body, serverId) {
     var status = String(a.deployment_status || (d ? d.status : "") || "")
 
     out.push({
-      key: String(serverId) + ":" + String(resource.id),
+      key: serverId + ":" + String(resource.id),
       id: String(resource.id),
-      serverId: String(serverId),
+      serverId: serverId,
       name: String(a.name || "site"),
       url: a.url ? String(a.url) : "",
       https: a.https === true,
@@ -178,6 +193,129 @@ function sitesFrom(body, serverId) {
     })
   }
   return out
+}
+
+// Sites sort here because their endpoint accepts `sort` with a 200 and
+// ignores it. localeCompare, not `<`: the server level arrives API-sorted by
+// name, and two levels of one tree ordered by different collations read as
+// disorder — `Zeta` before `admin`.
+function sortSites(list) {
+  return (list || []).slice().sort(function (a, b) {
+    return a.name.localeCompare(b.name)
+  })
+}
+
+// Ids are API data, so a map keyed by them gets no prototype and its reads no
+// inherited fallbacks — an id spelled `constructor` has to be a key like any
+// other, not a function `push` blows up on.
+function idMap() {
+  return Object.create(null)
+}
+
+function hasKey(map, key) {
+  return map ? Object.prototype.hasOwnProperty.call(map, key) : false
+}
+
+// This and the two builders after it are the only ways `sitesByServer` is
+// ever built, so the key form — String(server.id) — cannot drift. Which one
+// runs is a statement about how much of the organization the caller has seen;
+// ARCHITECTURE.md lays out the split.
+//
+// Here the caller has the whole site list, so every server gets a key and an
+// empty one means "genuinely no sites" — this is the one publish allowed to
+// make a deleted site disappear.
+function groupSitesByServer(sites, servers) {
+  var out = idMap()
+  var list = servers || []
+  for (var i = 0; i < list.length; i++) out[String(list[i].id)] = []
+
+  var sorted = sortSites(sites)
+  for (var j = 0; j < sorted.length; j++) {
+    // A site whose server did not come back — the server list was cut short at
+    // the page cap, or the server went away between the two requests — has
+    // nowhere to sit, so it is dropped rather than given a home of its own.
+    if (hasKey(out, sorted[j].serverId)) out[sorted[j].serverId].push(sorted[j])
+  }
+  return out
+}
+
+// The window builder: `observed` is one rotation window's worth of an org
+// list that arrives in no useful order, so a window can hold two of a
+// server's ten sites — replacing a server's list from it would delete the
+// eight it never reached. Observed sites update in place (by site id,
+// observed wins), every other site is kept exactly as it was, and deletions
+// wait for the wrap. With `observed` empty this is the orphan prune: servers
+// still present keep their lists, servers gone lose them.
+function mergeSitesByServer(previous, observed, servers) {
+  var byServer = idMap()
+  var seen = observed || []
+  for (var i = 0; i < seen.length; i++) {
+    if (!hasKey(byServer, seen[i].serverId)) byServer[seen[i].serverId] = []
+    byServer[seen[i].serverId].push(seen[i])
+  }
+
+  var out = idMap()
+  var list = servers || []
+  for (var j = 0; j < list.length; j++) {
+    var id = String(list[j].id)
+    var kept = hasKey(previous, id) ? previous[id] : []
+    if (!hasKey(byServer, id)) { out[id] = kept; continue }
+
+    var byId = idMap()
+    for (var k = 0; k < kept.length; k++) byId[kept[k].id] = kept[k]
+    var fresh = byServer[id]
+    for (var l = 0; l < fresh.length; l++) byId[fresh[l].id] = fresh[l]
+    var merged = []
+    for (var key in byId) merged.push(byId[key])
+    out[id] = sortSites(merged)
+  }
+  return out
+}
+
+// The single-server builder: the per-server endpoint is complete for exactly
+// that server, so its list is replaced outright while every other server
+// keeps what it had — the one replace that needs no wrap to be safe.
+function replaceServerSites(previous, serverId, sites, servers) {
+  var target = String(serverId)
+  var out = idMap()
+  var list = servers || []
+  for (var i = 0; i < list.length; i++) {
+    var id = String(list[i].id)
+    out[id] = id === target ? sortSites(sites)
+      : hasKey(previous, id) ? previous[id] : []
+  }
+  return out
+}
+
+// The rotation's memory: everything observed since the walk last started, so
+// the wrap can rebuild the whole organization from it. Deduped by site key
+// with the later observation winning — a list shifting under the cursor can
+// serve one row to two windows, and an on-unfold fetch can outrun the walk.
+function mergeSweepSites(accumulated, observed) {
+  var byKey = idMap()
+  var all = (accumulated || []).concat(observed || [])
+  for (var i = 0; i < all.length; i++) byKey[all[i].key] = all[i]
+  var out = []
+  for (var key in byKey) out.push(byKey[key])
+  return out
+}
+
+// A page whose rows all lack the server linkage is not an empty organization —
+// it is the API no longer honouring `include=server`, or a token scoped to
+// see sites but not servers. Silence here would publish zero sites under a
+// healthy icon, so the caller turns it into an error instead. A page where
+// only some rows lack it keeps the rows that have one.
+function sitesLinkageMissing(body, sites) {
+  var data = body && Array.isArray(body.data) ? body.data : []
+  return data.length > 0 && (sites || []).length === 0
+}
+
+// Counts what the panel actually draws — the note quoting this is a promise
+// about the screen, so rows dropped at grouping must not be counted.
+function countSites(sitesByServer) {
+  var total = 0
+  for (var id in sitesByServer) total += sitesByServer[id].length
+  return total
 }
 
 // A site can be deployed to when it has a repository at all — a site with no
@@ -322,7 +460,19 @@ function emptyState() {
     // Which credential this organization is polled through, and why it can't
     // be — a missing token is a fact about the account, not about the org.
     account: "",
-    accountError: ""
+    accountError: "",
+    // When the ticker owes this organization its next look.
+    nextDueMs: 0,
+    // Where the site walk resumes next tick ("" = start over), and everything
+    // it has observed since it last started — the wrap rebuilds the whole
+    // organization from that accumulation.
+    siteCursor: "",
+    sweepSites: [],
+    // Deployment status per site key as of that site's last observation, and
+    // whether a first sweep has landed — the seeding that keeps an
+    // already-failed site from announcing itself at shell start.
+    lastStatus: {},
+    seeded: false
   }
 }
 
@@ -485,9 +635,20 @@ function serversPath(org, cursor) {
   return pagedPath("/orgs/" + encode(org) + "/servers?sort=name", cursor)
 }
 
-function sitesPath(org, serverId, cursor) {
+// One request for the whole organization rather than one per server. The
+// `include=server` is load-bearing and the walk over this list is a rotation;
+// both are ARCHITECTURE.md's to explain. `sort` is accepted here with a 200
+// and silently ignored, so the order is `sortSites`'s to impose.
+function sitesPath(org, cursor) {
+  return pagedPath("/orgs/" + encode(org) + "/sites?include=server,latestDeployment", cursor)
+}
+
+// The per-server list the sweep stopped using, kept for the fetch that wants
+// exactly one server fresh — unfolding a row. Same includes as `sitesPath` so
+// `sitesFrom` reads both alike.
+function serverSitesPath(org, serverId, cursor) {
   return pagedPath("/orgs/" + encode(org) + "/servers/" + encode(serverId)
-    + "/sites?include=latestDeployment&sort=name", cursor)
+    + "/sites?include=server,latestDeployment", cursor)
 }
 
 function deployPath(org, serverId, siteId) {

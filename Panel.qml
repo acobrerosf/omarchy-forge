@@ -263,7 +263,12 @@ Panel {
       return
     }
     if (row.kind === "server") {
-      setExpanded(row.org, row.serverId, !isExpanded(row.org, row.serverId))
+      var opening = !isExpanded(row.org, row.serverId)
+      setExpanded(row.org, row.serverId, opening)
+      // An opened row is worth a fresh look — the rotation will get to this
+      // server eventually, the unfold wants it now. The service debounces, so
+      // the auto-unfold path and a held key cost nothing extra.
+      if (opening && forge) forge.fetchServerSites(row.org, row.serverId)
       return
     }
     deployCurrent()

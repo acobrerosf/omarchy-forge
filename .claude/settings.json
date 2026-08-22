@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./omarchy-forge accounts *)",
+      "Bash(./omarchy-forge orgs *)",
+      "Bash(./omarchy-forge api *)",
+      "Bash(omarchy-shell acobrerosf.forge refresh)",
+      "Bash(omarchy-shell acobrerosf.forge open)",
+      "Bash(omarchy-shell acobrerosf.forge close)",
+      "Bash(omarchy-shell acobrerosf.forge status)"
+    ]
+  }
+}

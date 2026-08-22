@@ -91,7 +91,9 @@ this process — opened, copied, or handed to another program — goes through `
   deploying, relative time) directly on the delegate rather than through `rowView`, so a cursor
   move doesn't re-derive every row's text.
 - **Notification seeding.** `state.seeded` guards the first sweep so an already-failed site doesn't
-  announce itself at shell start. `lastStatus` is the previous sweep's per-site status.
+  announce itself at shell start. `lastStatus` is per-site status *as of its last observation* —
+  the site sweep rotates through large orgs one window per tick, so an unobserved site keeps its
+  entry, and keys are pruned only when a rotation wraps. See ARCHITECTURE.md.
 - **`manifest.json` is the source of truth for settings.** Its `barWidget.defaults` + `schema` feed
   Setup → Plugins; `Panel.setting(key, fallback)` reads them. Adding a setting means: manifest
   defaults, manifest schema entry, the `setting()` call, the README table, and — if the service
@@ -108,5 +110,6 @@ this process — opened, copied, or handed to another program — goes through `
 ## Known gaps (from README)
 
 The dashboard URL is a template because the API hands out no web link; server actions beyond
-deploy are deliberately absent; a cursor chain stops at 5 pages (150 rows) or when the account's
-minute is nearly spent, and says so.
+deploy are deliberately absent; the server list stops at 5 pages (150 rows) or when the account's
+minute is nearly spent, and says so — the site list instead rotates one 5-page window per tick,
+resuming from a kept cursor, so large orgs are fully covered over several refreshes.

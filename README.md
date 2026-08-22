@@ -108,7 +108,7 @@ it, because that is where the problem actually is.
 | Key | Action |
 |---|---|
 | `j` `k` or arrows | move the cursor |
-| enter / space | unfold an organization or a server, or arm a site for deploy |
+| enter / space | unfold an organization or a server, or arm a site for deploy — unfolding a server also refreshes its sites |
 | `d` | deploy the site under the cursor |
 | `o` | open the site's URL — or, on a server row, its page in Forge |
 | `f` | open the row's page in the Forge dashboard |
@@ -134,20 +134,27 @@ Each account therefore gets its own budget, and the widget keeps a separate ledg
 tokens issued by the *same* person share one budget and are tracked as one, which is why setup
 records who a token belongs to.
 
-One refresh costs one request per organization for its server list, plus one per ready server for
-its sites and their latest deployment (`?include=latestDeployment` folds those into a single call).
-So five servers in one organization cost six requests a minute at the default 60-second interval.
-A list longer than 30 rows costs one more request per extra page, since that is how Forge hands
-long lists out — see below.
+One refresh costs **two requests per organization**, whatever the server count: one for the server
+list, one for every site in the organization with its latest deployment folded in
+(`?include=server,latestDeployment`). Five servers or fifty, it is the same two a minute at the
+default 60-second interval. A list longer than 30 rows costs one more request per extra page, since
+that is how Forge hands long lists out, up to five pages a refresh. An organization with more than
+150 sites is walked **in rotation**: each refresh checks the next slice of the list and the panel
+says so, nothing already on screen is dropped meanwhile, and full coverage arrives over a few
+refreshes rather than in one. The trade is that a status change at the far end of the rotation is
+noticed up to one rotation late; unfolding a server fetches that server's sites fresh right then
+(one extra request, held back for 15 seconds between asks), and sites keep whatever status their
+last look saw until the walk comes around again.
 
 That figure does not change with the number of screens. Polling lives in a single service the
 shell loads once per session, not in the bar widget — which is created once per monitor. Two
 copies of the widget watching the same organization share one poll, and a deployment notifies
 once rather than once per screen.
 
-The site sweep for an organization is dropped for that tick if it would take its account's last
-minute over 40 requests; the panel says so when that happens. A server list is never dropped,
-because the bar icon depends on it.
+The site sweep for an organization is still dropped for that tick if it would take its account's
+last minute over 40 requests, and the panel says so — but at one request it takes a lot of
+organizations on one Forge account to get there. A server list is never dropped, because the bar
+icon depends on it.
 
 That ledger only counts what the widget itself spent, so Forge can still refuse a request — the
 dashboard in a browser tab is spending the same minute. When it does, the panel says "rate limited"
@@ -156,8 +163,9 @@ than sent, refreshes wait, and a deploy tells you how many seconds are left inst
 It resumes on its own. Forge says when the reset is due on the response that refuses; if it doesn't,
 the wait is a minute.
 
-If you have a lot of servers, either raise the interval or turn **Watch deployments** off — that
-drops the cost to one request per organization per tick, at the price of showing server health only.
+Turning **Watch deployments** off halves that again, to one request per organization per tick, at
+the price of showing server health only. With the cost no longer growing with your server count,
+there is rarely a reason to.
 
 ## Settings
 
@@ -237,11 +245,13 @@ one reaches, and which is the default. Tokens are never in there.
   rather than be derived from the name.
 - Server actions — reboot, restarting nginx or PHP — are deliberately not here yet. Deploying is
   the one write this version does.
-- **Long lists stop at 150 rows.** Forge returns 30 rows a page — whatever `page[size]` asks for —
-  and points at the rest with a cursor. The widget follows it, up to five pages, or until the
-  account's minute is nearly spent. Past that the panel says "showing the first 150 servers" rather
-  than quietly showing a prefix. `omarchy-forge` does the same on the command line and warns on
-  stderr; `FORGE_MAX_PAGES` raises the cap for a one-off run.
+- **The server list stops at 150 rows.** Forge returns 30 rows a page — whatever `page[size]` asks
+  for — and points at the rest with a cursor. The widget follows it, up to five pages per refresh,
+  or until the account's minute is nearly spent, and says "showing the first 150 servers" rather
+  than quietly showing a prefix. Sites are no longer capped this way: past 150 the list is checked
+  in rotation across refreshes (see the rate limit section), so every site is watched, just not all
+  in the same minute. `omarchy-forge` on the command line still stops at five pages and warns on
+  stderr; `FORGE_MAX_PAGES` raises its cap for a one-off run.
 - **Notification text is scrubbed harder than it should need to be.**
   `omarchy-notification-send` passes the headline and the description to `notify-send` as bare
   positionals with no `--` in front of them, so both its own option loop and notify-send's GLib

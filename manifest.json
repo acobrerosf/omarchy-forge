@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "acobrerosf.forge",
   "name": "Forge",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "author": "acobrerosf",
   "license": "MIT",
   "description": "Laravel Forge server health and deployment status in the Omarchy bar, across every organization you have a token for, with one-key deploys.",
@@ -38,7 +38,7 @@
         "key": "refreshIntervalSec",
         "type": "integer",
         "label": "Refresh interval (seconds)",
-        "description": "Forge allows 60 requests a minute per Forge account. One tick costs one request per organization, plus one per server when deployment watching is on.",
+        "description": "Forge allows 60 requests a minute per Forge account. One tick costs two requests per organization when deployment watching is on, one when it is off — whatever the server count. Organizations with more than 150 sites spend up to five more per tick, checking sites in rotation.",
         "min": 15,
         "max": 3600,
         "step": 15,
@@ -48,7 +48,7 @@
         "key": "watchDeployments",
         "type": "boolean",
         "label": "Watch deployments",
-        "description": "Also fetch each server's sites and their latest deployment. Off means server health only, at one request per tick.",
+        "description": "Also fetch the organization's sites and their latest deployments — one request for most organizations, a rotating slice per tick past 150 sites. Off means server health only, at one request per organization per tick.",
         "defaultValue": true
       },
       {
