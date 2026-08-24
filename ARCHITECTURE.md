@@ -81,6 +81,14 @@ log, a command's output tomorrow) obviously affordable — and independent of th
 which is the whole reason polling lives in the service and not the widget. Past 150 sites, a tick
 spends up to `maxPages` continuations walking the next window of the rotation described below.
 
+That endpoint is the organization's, not the global `GET /sites` that spans every organization a
+token can see. Folding a multi-org account's site requests into one sounds like the same trade the
+org-wide fetch already made, and isn't: there is no global *servers* endpoint to match, the payload
+attributes no organization to a site (no attribute, no relationship, no such include — only the
+slug buried in `links.self.href`), and it filters only by name, so one shared window could not be
+narrowed to the organizations actually watched, and one shared cursor would put every organization
+behind a token on the same rotation and the same failure. TODO.md carries the arithmetic.
+
 The server list is not redundant with the site list: the sites response only mentions servers that
 *have* sites, and the bar icon has to see every server, including a freshly provisioned empty one.
 Two couplings hold the site request together, and this paragraph is their single home.

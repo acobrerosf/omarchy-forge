@@ -7,19 +7,6 @@ Everything below was checked against the v2 OpenAPI spec
 
 ---
 
-## Groundwork
-
-### Unfinished business from the org-wide site fetch (done in 1.5.0)
-
-There is a global `GET /sites` covering every organization a token can see, which would collapse a
-multi-org *account* from two requests per organization to two in total. Unverified whether the
-response attributes an organization to each site; if it does, worth a look. Note it only helps
-where several organizations sit behind **one** account — orgs reached through different tokens
-cannot share a request, and per-org state, notes and budget buckets are all keyed the way they are
-for that reason.
-
----
-
 ## Features
 
 ### 2. Deployment log viewer
