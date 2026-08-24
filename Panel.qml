@@ -1,3 +1,9 @@
+// Delegates and Components bind their outer scope lexically here rather than
+// resolving it by walking the scope chain at every evaluation. The scope-chain
+// form works right up until a delegate gains a property named like one of
+// root's, at which point it quietly starts reading the wrong one.
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Controls
 import Quickshell
@@ -433,7 +439,7 @@ Panel {
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refresh(); return "ok" }
-    function status(): string { return summary }
+    function status(): string { return root.summary }
   }
 
   // ------------------------------------------------------------- bar button
@@ -449,18 +455,18 @@ Panel {
     // render what they are handed in a `Text` with no `textFormat` — which we
     // cannot set from out here. So the string is neutralised on the way in
     // instead. Same for the two PanelHero bindings below. See Model.plainText.
-    tooltipText: "Forge — " + Model.plainText(summary)
+    tooltipText: "Forge — " + Model.plainText(root.summary)
 
     iconComponent: Component {
       Item {
         ForgeIcon {
           anchors.centerIn: parent
           iconSize: Style.space(11)
-          color: health === "setup" ? Qt.darker(button.bar ? button.bar.barForeground : root.foreground, 1.6)
+          color: root.health === "setup" ? Qt.darker(button.bar ? button.bar.barForeground : root.foreground, 1.6)
                                           : (button.bar ? button.bar.barForeground : root.foreground)
-          badgeColor: health === "busy" ? Color.accent : root.urgent
+          badgeColor: root.health === "busy" ? Color.accent : root.urgent
           badge: {
-            switch (health) {
+            switch (root.health) {
             case "bad": return "bad"
             case "error": return "warn"
             case "setup": return "warn"
@@ -534,7 +540,7 @@ Panel {
             width: parent.width
             title: root.organizations.length === 1
               ? Model.plainText(root.orgLabel(root.organizations[0])) : "Forge"
-            meta: Model.plainText(summary)
+            meta: Model.plainText(root.summary)
             detail: root.refreshing ? "refreshing…"
                                     : Model.relativeMs(root.lastRefreshMs, root.nowMs)
             foreground: root.foreground
@@ -543,10 +549,10 @@ Panel {
               ForgeIcon {
                 iconSize: Style.font.display
                 color: root.foreground
-                badgeColor: health === "busy" ? root.busyColor : root.urgent
-                badge: health === "bad" ? "bad"
-                     : health === "busy" ? "busy"
-                     : (health === "setup" || health === "error") ? "warn" : "none"
+                badgeColor: root.health === "busy" ? root.busyColor : root.urgent
+                badge: root.health === "bad" ? "bad"
+                     : root.health === "busy" ? "busy"
+                     : (root.health === "setup" || root.health === "error") ? "warn" : "none"
               }
             }
           }
@@ -558,7 +564,7 @@ Panel {
             spacing: Style.space(10)
             // What is missing is only known once the helper's state file has
             // been read, so say nothing until then rather than guess.
-            visible: tokenKnown && (needsSetup || root.organizations.length === 0)
+            visible: root.tokenKnown && (root.needsSetup || root.organizations.length === 0)
 
             Text {
               width: parent.width
@@ -568,14 +574,14 @@ Panel {
               opacity: 0.7
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
-              text: needsSetup
+              text: root.needsSetup
                 ? "No Forge API token on this machine yet. Setup stores one in your keyring."
                 : "No organizations are being watched yet."
             }
 
             Button {
               width: parent.width
-              text: needsSetup ? "Set up Forge" : "Add an organization"
+              text: root.needsSetup ? "Set up Forge" : "Add an organization"
               iconText: "󰅂"
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -663,7 +669,7 @@ Panel {
 
           Text {
             width: parent.width
-            visible: root.rows.length === 0 && root.organizations.length > 0 && !needsSetup
+            visible: root.rows.length === 0 && root.organizations.length > 0 && !root.needsSetup
             wrapMode: Text.WordWrap
             textFormat: Text.PlainText
             color: root.foreground

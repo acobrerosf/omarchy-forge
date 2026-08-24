@@ -22,12 +22,18 @@ omarchy restart shell                  # full shell restart (drops all service s
                                        #   the panels but keeps the running service instance
 journalctl -t omarchy-shell -f         # QML console.warn/errors and load failures land here
 omarchy plugin validate "$PWD"         # manifest.json against the plugin schema (silent = ok)
-# Qt 6's qmllint, by full path. Plain `qmllint` on Arch is qt5-declarative's, whose parser
-# predates typed function signatures — the `function open(): void` form IpcHandler requires —
-# so it dies on Panel.qml with a silent exit 255 and lints nothing.
-/usr/lib/qt6/bin/qmllint -I /usr/share/omarchy/shell Panel.qml Service.qml ForgeRow.qml ForgeIcon.qml
-bash -n omarchy-forge
+./lint                                 # qmllint over all four QML files (silent = ok)
+./lint Panel.qml                       # or just the one you touched
+bash -n lint omarchy-forge
 ```
+
+`lint` is a script rather than a bare command because two parts of the invocation are not
+guessable: Qt 6's qmllint by full path (Arch's plain `qmllint` is qt5-declarative's, and Qt 5's
+parser predates the typed function signatures `IpcHandler` requires, so it dies on `Panel.qml`
+with a silent exit 255 and lints *nothing*), and a `qs -> /usr/share/omarchy/shell` symlink shim
+it builds per run, because Quickshell maps that root onto the `qs` namespace internally and there
+is no `qs/` directory to point `-I` at. `.qmllint.ini` turns off the two categories that are
+upstream noise; its comments say what that costs.
 
 Drive the panel without the mouse:
 
@@ -90,6 +96,11 @@ this process — opened, copied, or handed to another program — goes through `
   and takes no service reference. `Panel.qml` binds volatile per-screen state (cursor, armed,
   deploying, relative time) directly on the delegate rather than through `rowView`, so a cursor
   move doesn't re-derive every row's text.
+- **`Panel.qml` is `pragma ComponentBehavior: Bound`.** Delegates and Components there bind their
+  outer scope lexically, so `root.` is required inside them and a new `Repeater` delegate must
+  declare `required property var modelData` / `required property int index` rather than picking
+  them up from the context. Without that the delegate does not build at all. `./lint` catches
+  the missing qualifiers; only a shell reload catches the missing `required`.
 - **Notification seeding.** `state.seeded` guards the first sweep so an already-failed site doesn't
   announce itself at shell start. `lastStatus` is per-site status *as of its last observation* —
   the site sweep rotates through large orgs one window per tick, so an unobserved site keeps its

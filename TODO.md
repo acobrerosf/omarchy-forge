@@ -9,38 +9,6 @@ Everything below was checked against the v2 OpenAPI spec
 
 ## Groundwork
 
-### 1. Triage what the linter was never able to tell us
-
-`CLAUDE.md` documented plain `qmllint`, which on Arch is **qt5-declarative's** — Quickshell is
-Qt 6. Qt 5's parser predates typed function signatures, so the `function open(): void` form
-that `IpcHandler` requires killed it on `Panel.qml` with **exit 255 and no output at all**:
-no message, no line number, nothing to suggest it hadn't linted. Verified by bisection —
-`function f(): void {}` alone reproduces it, `function f() {}` does not, and every other file
-passed only because none of them declare IPC handlers. The command is now fixed in
-`CLAUDE.md` to `/usr/lib/qt6/bin/qmllint`, which exits 0 on all four files.
-
-So nothing here has ever been linted, and there is a backlog to work through:
-
-- **`qs.*` doesn't resolve** with `-I /usr/share/omarchy/shell`, because Quickshell maps the
-  shell root onto the `qs` namespace internally rather than on disk — `Commons/qmldir` says
-  `module qs.Commons` but there is no `qs/` directory. Every `Style`/`Color`/`Util` reference
-  then reads as unqualified access, and `BarIconButton`/`PanelHero`/`PanelSectionHeader` as
-  missing types, which buries the real findings. A `qs -> /usr/share/omarchy/shell` symlink in
-  a scratch directory passed as a second `-I` fixes it: `ForgeIcon.qml` drops to **0**
-  warnings and `Service.qml` to 2. Worth deciding whether that shim belongs in the repo as a
-  committed lint helper, or whether Quickshell offers a supported way to say this.
-- **42 unqualified accesses in `Panel.qml`**, and 7 in `ForgeRow.qml`, once the shim is in
-  place. Sampling them, they are genuine: `health`, `summary`, `needsSetup`, `tokenKnown` and
-  friends read from inside delegates without a `root.` qualifier. They work, but QML resolves
-  them by walking the scope chain at every evaluation, and they are the class of thing that
-  breaks quietly when a delegate later gains a property of the same name.
-- **Noise to leave alone**: `Member "caption"/"foreground" not found on type "QObject"` is
-  qmllint failing to type Quickshell's singletons even when the import resolves, and
-  `Service.qml`'s two `QProcess::ExitStatus … signal called exited` warnings are the same
-  interop gap on `Process.exited`. Neither is actionable from this side.
-
-Cheap, and it clears the ground before any of the features below add more QML.
-
 ### Unfinished business from the org-wide site fetch (done in 1.5.0)
 
 There is a global `GET /sites` covering every organization a token can see, which would collapse a

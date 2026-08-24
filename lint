@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# qmllint over the plugin's QML. Exists because two things about the invocation
+# are not guessable:
+#
+#   - Qt 6's qmllint by full path. Plain `qmllint` on Arch is qt5-declarative's,
+#     and Qt 5's parser predates typed function signatures — the
+#     `function open(): void` form IpcHandler requires — so it dies on Panel.qml
+#     with a silent exit 255 and lints nothing at all.
+#   - A `qs` shim. Quickshell maps the shell root onto the `qs` namespace
+#     internally rather than on disk: Commons/qmldir says `module qs.Commons`
+#     but there is no `qs/` directory to point -I at. Without the symlink below
+#     every Style/Color/Util reference reads as unqualified access and the shell's
+#     own types read as missing, which buries every real finding.
+#
+# Warning categories that are noise from this side are turned off in
+# .qmllint.ini, so a clean run prints nothing.
+#
+# No arguments lints all four files; naming files lints those.
+
+set -euo pipefail
+
+shell_dir=${OMARCHY_SHELL_DIR:-/usr/share/omarchy/shell}
+qmllint=${QMLLINT:-/usr/lib/qt6/bin/qmllint}
+
+[[ -d $shell_dir ]] || { echo "lint: no omarchy shell at $shell_dir" >&2; exit 1; }
+[[ -x $qmllint ]] || { echo "lint: no Qt 6 qmllint at $qmllint" >&2; exit 1; }
+
+cd "$(dirname "$0")"
+
+files=("$@")
+((${#files[@]})) || files=(Panel.qml Service.qml ForgeRow.qml ForgeIcon.qml)
+
+shim=$(mktemp -d)
+trap 'rm -rf "$shim"' EXIT
+ln -s "$shell_dir" "$shim/qs"
+
+status=0
+"$qmllint" -I "$shell_dir" -I "$shim" "${files[@]}" || status=$?
+exit $status
