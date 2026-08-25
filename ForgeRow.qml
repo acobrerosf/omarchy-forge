@@ -1,7 +1,8 @@
 import QtQuick
 import qs.Commons
 
-// One row of the panel: an organization, a server or a site.
+// One row of the panel: an organization, a server, a site, or one of the
+// actions the site view offers.
 //
 // Pure presentational — no service reference, no Model import, no reach back
 // into the panel. Everything it draws arrives as a declared property, and
@@ -11,9 +12,13 @@ import qs.Commons
 Rectangle {
   id: root
 
-  // "org" | "server" | "site". Drives weight, size and the chevron, which are
-  // the only things that differ structurally between the three.
+  // "org" | "server" | "site" | "action". Drives weight, size and the chevron,
+  // which are the only things that differ structurally between them.
   property string kind: "server"
+
+  // An action row has no dot: the dot reports remote state, and an action has
+  // none to report until it is run.
+  property bool showDot: true
 
   property string label: ""
   property string detail: ""
@@ -48,6 +53,9 @@ Rectangle {
   signal entered()
 
   readonly property bool isSite: kind === "site"
+  // Sites and actions both sit one level in from a heading and read better a
+  // size down from it.
+  readonly property bool isCompact: isSite || kind === "action"
 
   readonly property color toneColor: {
     switch (root.tone) {
@@ -89,9 +97,11 @@ Rectangle {
     spacing: Style.space(8)
 
     Rectangle {
+      id: dot
       anchors.verticalCenter: parent.verticalCenter
-      width: Style.space(6)
-      height: width
+      visible: root.showDot
+      width: root.showDot ? Style.space(6) : 0
+      height: Style.space(6)
       radius: width / 2
       color: root.toneColor
       opacity: root.tone === "idle" ? 0.4 : 1.0
@@ -107,8 +117,10 @@ Rectangle {
 
     Column {
       anchors.verticalCenter: parent.verticalCenter
-      width: Math.max(0, parent.width - Style.space(6) - trailing.implicitWidth
-        - parent.spacing * 2 - chevron.width)
+      // A Row puts a gap only between children it actually lays out, so both
+      // the widths and the count of gaps follow what is visible.
+      width: Math.max(0, parent.width - dot.width - trailing.implicitWidth - chevron.width
+        - parent.spacing * ((root.showDot ? 1 : 0) + 1 + (root.showChevron ? 1 : 0)))
       spacing: Style.space(2)
 
       Text {
@@ -117,7 +129,7 @@ Rectangle {
         textFormat: Text.PlainText
         color: root.foreground
         font.family: root.fontFamily
-        font.pixelSize: root.isSite ? Style.font.bodySmall : Style.font.body
+        font.pixelSize: root.isCompact ? Style.font.bodySmall : Style.font.body
         font.bold: root.kind === "org"
         text: root.label
       }

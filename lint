@@ -16,7 +16,7 @@
 # Warning categories that are noise from this side are turned off in
 # .qmllint.ini, so a clean run prints nothing.
 #
-# No arguments lints all four files; naming files lints those.
+# No arguments lints every QML file here; naming files lints those.
 
 set -euo pipefail
 
@@ -29,7 +29,7 @@ qmllint=${QMLLINT:-/usr/lib/qt6/bin/qmllint}
 cd "$(dirname "$0")"
 
 files=("$@")
-((${#files[@]})) || files=(Panel.qml Service.qml ForgeRow.qml ForgeIcon.qml)
+((${#files[@]})) || files=(Panel.qml Service.qml ForgeRow.qml ForgeLogView.qml ForgeIcon.qml)
 
 shim=$(mktemp -d)
 trap 'rm -rf "$shim"' EXIT

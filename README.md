@@ -28,10 +28,13 @@ Create the token at <https://forge.laravel.com/profile/api>. The scopes it needs
 | `user:view` | confirm the token works during setup |
 | `organization:view` | find the organizations to watch |
 | `server:view` | read servers, sites, and deployment status |
-| `site:manage-deploys` | **only** if you want to deploy from the bar |
+| `site:manage-deploys` | deploy from the bar, **and** read deployment logs |
 
-Leave `site:manage-deploys` off and the widget is strictly read-only — the deploy key does nothing
-but report that the token isn't allowed to.
+Leave `site:manage-deploys` off and the widget is strictly read-only. Two things stop working, and
+both say so rather than failing quietly: the deploy key reports that the token isn't allowed to,
+and the deployment log reports that reading it needs that scope. The log is genuinely gated behind
+the *write* scope — that is Forge's choice, not this plugin's — so a token deliberately kept
+read-only can watch every deployment fail and not be told why.
 
 Tokens go into the login keyring via `secret-tool`, not into a config file. The widget never
 handles them: every request is made by the bundled `omarchy-forge` helper, which reads the token
@@ -97,6 +100,28 @@ Each organization unfolds into its servers, and each server into its sites with 
 latest deployment, the branch, and the commit. A server whose site starts failing unfolds itself,
 once — collapse it again and it stays collapsed.
 
+A site opens into a view of its own: what you can do to it, and what the API already said about it.
+
+| | |
+|---|---|
+| **Actions** | deploy, read the deployment log, open the site, open it in Forge, copy its ssh command. One that can't run says why rather than going missing — a site with no repository, or one that has never deployed |
+| **Details** | PHP version, app type, status, maintenance mode, isolation, zero-downtime, how many releases it keeps, aliases, healthcheck. All of it arrives in the refresh the panel already pays for, so the view costs no request |
+
+**Deployment log** opens the output of the latest deploy, ANSI stripped, scrolled to the bottom —
+which is where the answer is when something failed. It is fetched when asked for and never
+otherwise, so it costs nothing at rest, and it is one request when it does.
+
+| Key | In the log |
+|---|---|
+| `j` `k` or ↑ ↓ | scroll |
+| `g` / `G` | jump to the top or the bottom |
+| `c` | copy the whole log to the clipboard |
+| `w` | write it to `~/Downloads/forge-<site>-<deployment>.log` — the panel says where it landed |
+| `h` or esc | back |
+
+Copying and saving both use the log already on screen, so neither costs a second request, and both
+give you the ANSI-stripped text rather than the escape-laden original.
+
 Deployments that finish or fail between refreshes raise a desktop notification, which names the
 organization when more than one is being watched. Clicking it opens the site.
 
@@ -107,23 +132,26 @@ it, because that is where the problem actually is.
 
 | Key | Action |
 |---|---|
-| `j` `k` or arrows | move the cursor |
-| enter / space | unfold an organization or a server, or arm a site for deploy — unfolding a server also refreshes its sites |
+| `j` `k` or ↑ ↓ | move the cursor |
+| enter / space | open what the row is about — unfold an organization or a server, or open a site's actions. Unfolding a server also refreshes its sites |
+| `l` or → | the same, but never closes something already open |
+| `h` or ← | back: out of a view, or fold up the row the cursor is in |
 | `d` | deploy the site under the cursor |
 | `o` | open the site's URL — or, on a server row, its page in Forge |
 | `f` | open the row's page in the Forge dashboard |
 | `s` | copy an `ssh forge@…` command for the server |
 | `r` | refresh now |
 | `a` | add an organization |
-| esc | close |
+| esc | back one level, or close from the list |
 
 Deploying takes two presses. The first arms the row and says so; the second sends it. The arm
-expires after four seconds.
+expires after four seconds. `d` works from the list and from a site's own view, so nothing got
+slower when sites stopped being the last level.
 
 <img src="screenshots/deploy.png" alt="A site row armed, reading 'press again to deploy'" width="420">
 
-Mouse: left click a row to unfold or arm it, right click to open it in Forge. Middle click the bar
-icon to refresh.
+Mouse: left click a row to unfold it, or to open a site's actions; right click to open it in Forge.
+Inside a view, the trail at the top left is the way back. Middle click the bar icon to refresh.
 
 ## The rate limit
 
@@ -144,7 +172,9 @@ says so, nothing already on screen is dropped meanwhile, and full coverage arriv
 refreshes rather than in one. The trade is that a status change at the far end of the rotation is
 noticed up to one rotation late; unfolding a server fetches that server's sites fresh right then
 (one extra request, held back for 15 seconds between asks), and sites keep whatever status their
-last look saw until the walk comes around again.
+last look saw until the walk comes around again. Opening a deployment log is one more request,
+charged the same way and refused the same way — under a hold it says how long is left rather than
+asking.
 
 That figure does not change with the number of screens. Polling lives in a single service the
 shell loads once per session, not in the bar widget — which is created once per monitor. Two

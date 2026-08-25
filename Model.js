@@ -175,6 +175,8 @@ function sitesFrom(body) {
     // because a running deploy has not produced a record yet.
     var status = String(a.deployment_status || (d ? d.status : "") || "")
 
+    var maintenance = a.maintenance_mode || {}
+
     out.push({
       key: serverId + ":" + String(resource.id),
       id: String(resource.id),
@@ -184,12 +186,30 @@ function sitesFrom(body) {
       https: a.https === true,
       siteStatus: String(a.status || ""),
       deploymentStatus: status,
+      // The log endpoint addresses a deployment by id, and this is the only
+      // place that id is ever in reach — it costs nothing to keep, because
+      // `include=latestDeployment` has already paid for it.
+      deploymentId: deployment ? String(deployment.id) : "",
       branch: repository.branch ? String(repository.branch) : "",
       repoUrl: repository.url ? String(repository.url) : "",
       quickDeploy: a.quick_deploy === true,
       deployedAt: d ? String(d.ended_at || d.started_at || "") : "",
       commitHash: commit.hash ? String(commit.hash).substring(0, 7) : "",
-      commitMessage: commit.message ? String(commit.message).split("\n")[0] : ""
+      commitMessage: commit.message ? String(commit.message).split("\n")[0] : "",
+      // The rest of what the site payload already carries, for the detail
+      // view. `aliases` comes back null rather than empty when there are none.
+      // Deliberately absent: `deployment_url`, which carries a live deploy
+      // token in a query parameter and has no business on a screen.
+      phpVersion: a.php_version ? String(a.php_version) : "",
+      appType: a.app_type ? String(a.app_type) : "",
+      isolated: a.isolated === true,
+      zeroDowntime: a.zero_downtime_deployments === true,
+      usesEnvoyer: a.uses_envoyer === true,
+      wildcards: a.wildcards === true,
+      deploymentRetention: Number(a.deployment_retention || 0),
+      healthcheckUrl: a.healthcheck_url ? String(a.healthcheck_url) : "",
+      aliases: Array.isArray(a.aliases) ? a.aliases.map(String) : [],
+      maintenance: maintenance.enabled === true
     })
   }
   return out
@@ -324,6 +344,54 @@ function canDeploy(site) {
   return !!(site && site.repoUrl)
 }
 
+// ------------------------------------------------------------- site actions
+
+// What the site view offers, in the order it offers it. Pure: the panel turns
+// these into rows and decides what a keypress does with one, and the labels
+// and the reasons live here beside the predicates that disable them.
+//
+// `hint` is the key that reaches the same action straight from the list, so
+// the view teaches the accelerator rather than hiding it. An unavailable
+// action is still listed — a missing "Deployment log" would read as a bug,
+// where one that says "never deployed" answers the question.
+function siteActions(site) {
+  var deployable = canDeploy(site)
+  var deployed = !!(site && site.deploymentId)
+  var url = site ? externalUrl(site.url) : ""
+  return [
+    { id: "deploy", label: "Deploy", hint: "d",
+      available: deployable, reason: deployable ? "" : "no repository" },
+    { id: "log", label: "Deployment log", hint: "",
+      available: deployed, reason: deployed ? "" : "never deployed" },
+    { id: "open", label: "Open site", hint: "o",
+      available: url !== "", reason: url !== "" ? "" : "no address" },
+    { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
+    { id: "ssh", label: "Copy ssh command", hint: "s", available: true, reason: "" }
+  ]
+}
+
+// The rest of the site payload, which `sitesFrom` keeps and nothing showed
+// until now. Every one of these arrived in the same response the panel already
+// pays for, so the detail block costs no request at all. Empty values are
+// dropped rather than shown blank, so a site says only what is true of it.
+function siteDetails(site) {
+  if (!site) return []
+  var out = []
+  var add = function (label, value) { if (value !== "" && value !== null) out.push({ label: label, value: String(value) }) }
+
+  add("PHP", site.phpVersion)
+  add("Type", site.appType)
+  add("Status", site.siteStatus)
+  if (site.maintenance) add("Maintenance", "on")
+  if (site.isolated) add("Isolation", "isolated user")
+  if (site.zeroDowntime) add("Deploys", "zero downtime")
+  if (site.usesEnvoyer) add("Deploys", "via Envoyer")
+  if (site.deploymentRetention > 0) add("Keeps", pluralize(site.deploymentRetention, "release"))
+  if (site.aliases && site.aliases.length > 0) add("Aliases", site.aliases.join(" · "))
+  add("Healthcheck", site.healthcheckUrl)
+  return out
+}
+
 // -------------------------------------------------------------------- status
 
 // Three tones is all the panel needs: something is wrong, something is
@@ -371,11 +439,12 @@ function deploymentLabel(status) {
 
 // One panel row's text and tone, whatever the row stands for. The panel
 // resolves a row into its facts and hands them over as `ctx`; the branching on
-// which of the three kinds it is lives here, in one readable place, rather
-// than repeated inside four separate bindings in the delegate.
+// which kind it is lives here, in one readable place, rather than repeated
+// inside four separate bindings in the delegate. The site view's action rows
+// come through here too, so every view draws with the same delegate.
 //
 // ctx: { server, site, orgLabel, orgHealth, orgSummary, siteCount,
-//        showOrgHeaders }
+//        showOrgHeaders, action }
 //
 // Nothing here may touch a QML type, so the result carries `depth` rather than
 // a pixel indent and `tone` rather than a colour — ForgeRow owns the metrics
@@ -403,6 +472,30 @@ function rowView(row, ctx) {
       depth: 0,
       showChevron: true,
       siteKey: "",
+      deployedAt: ""
+    }
+  }
+
+  // An action row belongs to the site view rather than to the tree, so it has
+  // no depth and no dot: there is no hierarchy to place it in and no remote
+  // state for a tone to report. What it does carry is its accelerator, in the
+  // slot a site row uses for its deployment state, and — when it can't be run
+  // — the reason, where a site row puts its branch.
+  if (kind === "action") {
+    var action = c.action || {}
+    return {
+      kind: kind,
+      label: String(action.label || ""),
+      detail: action.available === false ? String(action.reason || "") : "",
+      status: action.hint ? "[" + String(action.hint) + "]" : "",
+      tone: "idle",
+      depth: 0,
+      showChevron: false,
+      // Only the deploy action answers to the site's key, and it has to: the
+      // arm and the send are reported on whichever row offers the deploy, and
+      // in this view that is this one. Every other action leaves it empty so a
+      // pending deploy doesn't light up the whole list.
+      siteKey: action.id === "deploy" ? String(c.siteKey || "") : "",
       deployedAt: ""
     }
   }
@@ -656,6 +749,14 @@ function deployPath(org, serverId, siteId) {
     + "/sites/" + encode(siteId) + "/deployments"
 }
 
+// The deploy log, fetched only when someone asks for it. Note the scope: this
+// is gated behind `site:manage-deploys`, the *write* scope, so a token that can
+// read every server and site can still be refused here — which is why the
+// service reports this one's 403 inline instead of as an organization error.
+function deploymentLogPath(org, serverId, siteId, deploymentId) {
+  return deployPath(org, serverId, siteId) + "/" + encode(deploymentId) + "/log"
+}
+
 // The API never hands out a web link, so the dashboard address is a template
 // the user can correct rather than something derived. A server row has no site
 // to point at, so `{site}` and the separator in front of it drop out together.
@@ -734,6 +835,86 @@ function plainText(value) {
   return String(value === undefined || value === null ? "" : value)
     .replace(/[\u0000-\u001F\u007F]/g, " ")
     .replace(/</g, "")
+}
+
+// The fourth member of the family, for the one string that arrives as a whole
+// document rather than a name: a deployment log. It is remote text, written by
+// whatever the deploy script echoed, so it is scrubbed like the rest — but the
+// scrub differs in two ways.
+//
+// It keeps `<`, because unlike the three sinks `plainText` guards, the log
+// lands in a `Text` this repo owns and gives `Text.PlainText`, and a build that
+// printed a generic type or an XML tag should show it. And it keeps `\n` and
+// `\t`, which are the log's own structure — dropping those would leave one
+// unreadable line. Everything else in C0 goes.
+//
+// A bare `\r` is resolved rather than dropped or turned into a line break: it
+// means "overwrite what I just wrote", so a progress bar that printed thirty
+// frames is one line, the last one, the way a terminal would have shown it.
+// Turning each frame into its own line would be thirty lines of noise, and
+// deleting the `\r` outright would run them together as `10%20%30%`.
+//
+// ANSI goes too. Forge colours its output, and the escapes are the noisiest
+// thing in the file when rendered literally. Three forms cover what a deploy
+// script can emit: CSI (the colours), OSC (title sets, terminated by BEL or
+// ST), and everything else — the two-character sequences and the nF ones like
+// `ESC ( B`, which share the shape "ESC, any intermediates, one final byte".
+// Stripping beats interpreting: the tone a row needs is already known from the
+// deployment's status, and re-deriving colour here would buy nothing.
+var ansiPattern = /\u001B(?:\[[0-?]*[ -\/]*[@-~]|\][\s\S]*?(?:\u0007|\u001B\\)|[ -\/]*[0-~])/g
+
+// A log saved to disk is named after the site it came from, which makes the
+// file findable and the name API data. That is a path component, so the guard
+// is a different one again: `externalUrl` refuses what isn't an address and
+// `notifyText` strips what an option parser would read, but here the danger is
+// a separator. A site called `../../.bashrc` — or one with a newline, or a
+// leading dot — must not be able to steer where the write lands or hide the
+// file once it does. So this keeps the small set that is unambiguously a name
+// and turns everything else into a hyphen, rather than trying to enumerate
+// what is dangerous.
+var fileNameCap = 80
+
+function safeFileName(value) {
+  var name = String(value === undefined || value === null ? "" : value)
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^[.-]+/, "")
+    .replace(/[.-]+$/, "")
+  if (name.length > fileNameCap) name = name.substring(0, fileNameCap)
+  return name === "" ? "site" : name
+}
+
+function logFileName(siteName, deploymentId) {
+  return "forge-" + safeFileName(siteName) + "-" + safeFileName(deploymentId) + ".log"
+}
+
+// A cap on what is kept in memory and laid out. Forge's own logs run to tens
+// of kilobytes; a runaway deploy script could print without limit, and the
+// pane would try to lay out every line of it.
+var logCharCap = 512 * 1024
+var logLineCap = 5000
+
+function logText(value) {
+  var text = String(value === undefined || value === null ? "" : value)
+  if (text.length > logCharCap) text = text.substring(text.length - logCharCap)
+  return text
+    .replace(ansiPattern, "")
+    .replace(/\r\n/g, "\n")
+    // `.` stops at a newline under /m, so this keeps only what follows the
+    // last carriage return on each line.
+    .replace(/^.*\r/gm, "")
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "")
+}
+
+// The log as lines, which is what the pane's ListView takes as a model. Kept
+// beside the guard so nothing is tempted to split a string the guard has not
+// seen. Truncation happens at the *front*: the answer is always in the tail.
+function logLines(value) {
+  var lines = logText(value).split("\n")
+  // A log almost always ends with a newline, which splits into one empty
+  // trailing line. Dropping it stops the pane opening on a blank row.
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop()
+  if (lines.length > logLineCap) lines = lines.slice(lines.length - logLineCap)
+  return lines
 }
 
 // Every address that leaves this plugin passes through here first.

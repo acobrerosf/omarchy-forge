@@ -12,6 +12,7 @@ Service.qml             one instance per session (plugin kind "service"). Pollin
                         the rate ledger, the request queue, deploys, notifications.
 Panel.qml               one instance per monitor (bar widget). Cursor, folding, arm-to-deploy,
                         rendering. Owns nothing that outlives a screen.
+ForgeLogView.qml        the deploy log pane, pure presentational.
 ForgeRow.qml            one panel row, pure presentational. Declared properties in, signals out;
                         no service reference, no Model import.
 Model.js                pure functions: JSON:API → flat rows, state derivation, path building.
@@ -174,6 +175,27 @@ The ceiling applies to continuations only, which is not a hole in "the server li
 dropped": the first page is enqueued unconditionally, so the bar icon always has servers to judge.
 It is pages 2-onward that are discretionary.
 
+**The deploy log.** One request, only when someone asks, so it costs nothing at rest — the case the
+budget's margin was left for. It goes through the queue rather than the deploy path's own process,
+because the queue already charges the budget, honours a hold and throws work away for an
+organization that stopped being watched, while `actionProcess` is single-flight for writes and
+answers into `_onAction`. It is pushed to the *front*: a sweep behind it can afford to land a
+second later, and someone staring at an empty pane cannot.
+
+Two things about it differ from every other job. It answers through a signal
+(`deploymentLogFetched`) rather than into `orgs`, for the reason `deployFinished` does — the answer
+belongs to the one screen that asked, and tens of kilobytes have no business in a property every
+panel re-reads. And it passes `quiet` to `_applyEnvelope`, which suppresses the per-organization
+error writes and nothing else. Forge gates deploy output behind `site:manage-deploys`, the scope
+that *writes*, so a deliberately read-only token is refused here and nowhere else; left loud, one
+keypress would paint "Token is missing a scope for this" across rows that are perfectly healthy.
+The account-level bookkeeping still runs either way — whether there is a token, what the rate
+headers said, the hold a 429 imposes — because those are true whichever request found them.
+
+A refusal is always reported. `fetchServerSites` can return silently because the rotation reaches
+that server anyway; nothing comes along later to fill this pane in, so a hold, a ceiling, and the
+jobs a 429 drops out of the queue each answer the signal instead of vanishing.
+
 **What `queue` is and isn't.** The `queue` object holds the pending list and nothing else — push,
 push-front, take, drop-by-org. The dispatch policy (`_pump`) stays on the service root, because it
 reads `orgs`, charges the budget, builds paths through `Model` and drives `fetchProcess`; moving
@@ -251,6 +273,29 @@ volatile state (cursor, armed, deploying, relative time) is bound directly on th
 than folded into `rowView`, so moving the cursor — or the clock ticking — doesn't re-derive every
 row's text.
 
+### Views
+
+The panel is one surface — an `Ui/KeyboardPanel`, layer-shell, and only one surface at a time can
+hold keyboard focus — so a site's actions are not a second window and could not be one. They are a
+different `rows`.
+
+`navStack` holds what has been pushed over the tree; `route` is its top. `rows` switches on it:
+nothing pushed is the tree, a `site` route is that site's actions, a `log` route is empty because
+the log is a pane and not a list. Everything downstream is untouched — one cursor, one delegate,
+one key handler, one clamp in `onRowsChanged` — which is the point. Adding the next view (server
+actions, a command's output) is a `rows` branch and a `runAction` case, not a new navigation model.
+
+Two keys had to come from somewhere, and the horizontal axis is where. `PanelKeyCatcher` reads
+`h j k l` as movement before `onTextKey` ever sees them, so a letter for "open the log" was never
+available; and until sites had anything inside them, right and `l` were a second way to press `j`.
+So right drills in, left goes back, and Escape goes back before it closes. `d` still deploys from
+anywhere with its two presses, because an accelerator that survives the reorganisation is the
+thing that makes the reorganisation cost nothing.
+
+The site view's rows go through `Model.rowView` like every other row, as `kind: "action"`. Only the
+deploy action carries a `siteKey` — that is what `armedSiteKey` and `deployingSiteKey` compare
+against, and handing it to all five would light up the whole list on one pending deploy.
+
 ### Text is never left to guess
 
 Almost everything drawn here is API data — server and site names, provider and region, the
@@ -278,3 +323,33 @@ and the toast is persisted under `~/.local/state/omarchy/notifications/`, so it 
 restart. `_notify` therefore applies both guards, and the order is load-bearing: `plainText`
 runs first because dropping a `<` can turn `<--exec…` into `--exec…`, which is exactly what
 `notifyText` is there to strip.
+
+A deployment log is the one string that arrives as a whole document rather than as a name, so it
+gets a guard of its own — `Model.logText`, beside `externalUrl`, `notifyText` and `plainText`. It
+differs from `plainText` twice, both deliberately: it keeps `<`, because a log lands in a `Text`
+this repo owns and gives `Text.PlainText`, and a build that printed a generic type should show it;
+and it keeps `\n` and `\t`, which are the log's own structure rather than noise in a name. It also
+strips ANSI, since Forge colours its output, and resolves a bare `\r` to the last frame of its line
+the way a terminal would — dropping it would run progress frames together as `10%20%30%`, and
+turning it into a newline would be thirty lines of one progress bar.
+
+Saving one adds a fifth guard for a fourth kind of sink. The file is named after the site, which
+puts API data in a *path*, where the danger is neither markup nor an option parser but a separator:
+a site called `../../.bashrc` must not be able to steer where the write lands, and one with a
+leading dot must not be able to hide the file once it does. `Model.safeFileName` therefore keeps
+the small set that is unambiguously a name — letters, digits, dot, underscore, hyphen — and turns
+everything else into a hyphen, rather than trying to enumerate what is dangerous. The path then
+reaches `bash -c` as a positional argument, never as part of the script, so it is data the shell
+holds rather than something it can be talked into running.
+
+Both the copy and the save hand the text to another program on **stdin**, not in an argv. Linux
+caps one argument at 128KB (`MAX_ARG_STRLEN`) and a verbose deploy log can pass that, so
+`execDetached` would fail with `E2BIG` on exactly the logs worth keeping. `pipeProcess` writes on
+`started` and then sets `stdinEnabled: false`, which is what closes the pipe — `wl-copy` and `cat`
+both read to EOF, and without the close neither would ever exit. Its little job list is unrelated
+to `queue`: nothing here is an API request, so nothing here is charged, held or dropped.
+
+That guard runs in `Panel.qml`, not in the service, and `Model.logLines` splits the log in the same
+place. The rule is the one above: a guard belongs where the string crosses the boundary it guards
+against, and that boundary is the `Text` — splitting a log the guard has not seen yet is how an
+escape sequence gets to survive one.

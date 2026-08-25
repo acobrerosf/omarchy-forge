@@ -41,6 +41,18 @@ Item {
 
   signal deployFinished(string siteKey, bool ok, string message)
 
+  // The deploy log is a one-shot read whose answer belongs to the one panel
+  // that asked — the same reason `deployFinished` is a signal and not state.
+  // It is also tens of kilobytes, which is no business of a property every
+  // panel re-reads. `requestKey` is organization-qualified so two panels, or
+  // two organizations holding the same numeric ids, cannot cross-answer.
+  signal deploymentLogFetched(string requestKey, bool ok, string text, string message)
+
+  function logRequestKey(org, serverId, siteId, deploymentId) {
+    return String(org) + "/" + String(serverId) + ":" + String(siteId)
+      + "/" + String(deploymentId)
+  }
+
   readonly property string pluginDir: String(Qt.resolvedUrl("."))
     .replace(/^file:\/\//, "")
     .replace(/\/$/, "")
@@ -501,10 +513,14 @@ Item {
     }
   }
 
+  // Named rather than defaulted: a kind this doesn't know would otherwise be
+  // sent to the org site list, which answers plausibly and wrongly.
   function _pathFor(job) {
     if (job.kind === "servers") return Model.serversPath(job.org, job.cursor)
     if (job.kind === "serverSites")
       return Model.serverSitesPath(job.org, job.serverId, job.cursor)
+    if (job.kind === "log")
+      return Model.deploymentLogPath(job.org, job.serverId, job.siteId, job.deploymentId)
     return Model.sitesPath(job.org, job.cursor)
   }
 
@@ -577,7 +593,16 @@ Item {
       && String(envelope.error || "").indexOf("No API token") !== -1
   }
 
-  function _applyEnvelope(org, account, envelope) {
+  // `quiet` suppresses every per-organization write and nothing else. One
+  // request belongs to a keypress rather than to the watch — the deploy log,
+  // which Forge gates behind the *write* scope — and a read-only token's 403
+  // there is a fact about that one request, not about the organization. Left
+  // loud it would paint an error across rows that are perfectly healthy. The
+  // account-level bookkeeping still runs either way: whether there is a token,
+  // what the rate headers said, the hold a 429 imposes and the refund a
+  // request that never left the machine is owed are all true regardless of
+  // which request happened to discover them.
+  function _applyEnvelope(org, account, envelope, quiet) {
     tokenKnown = true
 
     var changes = ({})
@@ -588,7 +613,7 @@ Item {
       changes.hasToken = true
       changes.error = ""
       _patchAccount(account, changes)
-      if (org) _patch(org, { lastError: "", accountError: "" })
+      if (org && !quiet) _patch(org, { lastError: "", accountError: "" })
       return true
     }
 
@@ -597,7 +622,7 @@ Item {
       changes.error = ""
       _patchAccount(account, changes)
       budget.refund(budget.bucketFor(account))
-      if (org)
+      if (org && !quiet)
         _patch(org, { lastError: "",
                       accountError: "No token for " + accountLabel(account) })
       return false
@@ -625,7 +650,7 @@ Item {
     // whether there is a token. Leaving a stale "no token" in place would
     // outrank the real error and keep saying it long after the token was
     // restored, for as long as anything else kept going wrong.
-    if (org) _patch(org, { lastError: Model.envelopeError(envelope), accountError: "" })
+    if (org && !quiet) _patch(org, { lastError: Model.envelopeError(envelope), accountError: "" })
     return false
   }
 
@@ -636,7 +661,16 @@ Item {
   function _holdAccount(account, envelope) {
     var bucket = budget.bucketFor(account)
     budget.block(bucket, Model.backoffUntilMs(envelope, Date.now()))
-    queue.drop(function (job) { return budget.bucketFor(job.account) === bucket })
+    queue.drop(function (job) {
+      if (budget.bucketFor(job.account) !== bucket) return false
+      // A dropped sweep is picked up by the next tick and needs no farewell.
+      // A dropped log job has someone watching an empty pane for an answer
+      // that is no longer coming, so it gets told.
+      if (job.kind === "log")
+        deploymentLogFetched(logRequestKey(job.org, job.serverId, job.siteId, job.deploymentId),
+                             false, "", "Rate limited — try again shortly")
+      return true
+    })
 
     var message = Model.envelopeError(envelope)
     for (var org in _config) {
@@ -830,6 +864,93 @@ Item {
     })
   }
 
+  // ------------------------------------------------------------ deploy log
+
+  // One request, only when someone asks for it, so it costs nothing at rest.
+  // It goes through the queue rather than the deploy path's own process: the
+  // queue already charges the budget, honours a hold and throws work away for
+  // an organization that stopped being watched, and `actionProcess` is
+  // single-flight for writes — a log fetch waiting behind a deploy, or
+  // answering into `_onAction`, is not what either wants.
+  //
+  // It jumps the queue because it belongs to a keypress. A sweep behind it can
+  // afford to arrive a second later; someone staring at a blank pane cannot.
+  // No debounce, either: pressing it again on a deploy still running is a
+  // reasonable thing to want, and the dedupe below already covers the only
+  // case that would waste a request.
+  function fetchDeploymentLog(org, serverId, siteId, deploymentId) {
+    var key = String(org)
+    var id = String(deploymentId)
+    var site = String(siteId)
+    var requestKey = logRequestKey(key, serverId, site, id)
+    if (id === "") {
+      deploymentLogFetched(requestKey, false, "", "This site has never deployed")
+      return
+    }
+
+    var state = orgs[key]
+    if (!state) {
+      deploymentLogFetched(requestKey, false, "", "That organization is no longer being watched")
+      return
+    }
+
+    // Refusals are reported rather than swallowed. `fetchServerSites` can
+    // return silently because the rotation will get there anyway; nothing
+    // comes along later to fill this pane in.
+    var account = state.account || accountForOrg(key)
+    var held = budget.blockedMs(account)
+    if (held > 0) {
+      deploymentLogFetched(requestKey, false, "",
+                           "Rate limited — try again in " + Math.ceil(held / 1000) + "s")
+      return
+    }
+    if (budget.wouldExceed(account, 1)) {
+      deploymentLogFetched(requestKey, false, "", "Too close to the rate limit — try again shortly")
+      return
+    }
+
+    var pending = function (job) {
+      return job.kind === "log" && job.org === key && job.siteId === site
+        && job.deploymentId === id
+    }
+    if (queue.contains(pending) || (_current !== null && pending(_current))) return
+
+    queue.pushFront({ org: key, account: account, kind: "log",
+                      serverId: String(serverId), siteId: site, deploymentId: id,
+                      page: 1, rows: [] })
+  }
+
+  function _onLog(job, text) {
+    var envelope = Model.parseEnvelope(text)
+    var requestKey = logRequestKey(job.org, job.serverId, job.siteId, job.deploymentId)
+
+    // Quiet: see `_applyEnvelope`. Whatever went wrong is this pane's to say.
+    if (!_applyEnvelope(job.org, job.account, envelope, true)) {
+      // Forge gates deploy output behind `site:manage-deploys` — the scope that
+      // *writes* — so a token deliberately kept read-only reads every server
+      // and site and is still refused here. "Token is missing a scope for this"
+      // is true but leaves the reader guessing which, on the one request where
+      // the answer is surprising enough to be worth spelling out.
+      var message = envelope.status === 403
+        ? "Your token can't read deploy logs — that needs the site:manage-deploys scope"
+        : Model.envelopeError(envelope)
+      deploymentLogFetched(requestKey, false, "", message)
+      return
+    }
+
+    var data = envelope.body ? envelope.body.data : null
+    var attributes = data ? data.attributes : null
+    // A deploy that printed nothing is a real answer and shows as an empty
+    // pane; an `output` that isn't there at all is a malformed one.
+    if (!attributes || typeof attributes.output !== "string") {
+      deploymentLogFetched(requestKey, false, "", "Forge returned no output for this deployment")
+      return
+    }
+    // Handed on unguarded: `Model.logLines` is applied where the string enters
+    // a `Text`, which is the boundary the guard is about.
+    deploymentLogFetched(requestKey, true, attributes.output, "")
+  }
+
   function _finishRefresh(org) {
     var state = orgs[org]
     var config = _config[org]
@@ -990,10 +1111,54 @@ Item {
     Quickshell.execDetached(["omarchy-launch-browser", safe])
   }
 
+  // ---------------------------------------------------------- text out
+
+  // Handing a whole document to another program, which is a different problem
+  // from handing it a name. Linux caps one argv element at 128KB
+  // (`MAX_ARG_STRLEN`), and a verbose deploy log can pass that — so the text
+  // goes in on stdin, the same reason the token does in `api_request`. Nothing
+  // here is an API request: no budget, no hold, no relation to `queue`.
+  //
+  // One process, so a second copy arriving mid-write waits rather than
+  // clobbering the command of the one in flight.
+  signal textSaved(bool ok, string path, string message)
+
+  property var _pipeJobs: []
+
+  function _pipe(job) {
+    _pipeJobs = _pipeJobs.concat([job])
+    _pumpPipe()
+  }
+
+  function _pumpPipe() {
+    if (pipeProcess.running || _pipeJobs.length === 0) return
+    var job = _pipeJobs[0]
+    _pipeJobs = _pipeJobs.slice(1)
+    pipeProcess.job = job
+    pipeProcess.command = job.command
+    pipeProcess.running = true
+  }
+
   function copyToClipboard(text) {
     if (!text) return
-    Quickshell.execDetached(["bash", "-c",
-      "printf %s \"$1\" | wl-copy", "wl-copy-helper", String(text)])
+    _pipe({ kind: "copy", text: String(text), path: "", command: ["wl-copy"] })
+  }
+
+  // `mkdir -p` because the download directory is a guess and may not exist yet.
+  // The path is a positional argument, never part of the script, so it is data
+  // to the shell rather than something it can be talked into running — and it
+  // has already been through `Model.safeFileName` on the way here, so it cannot
+  // have picked up a separator from a site name.
+  function saveText(text, path) {
+    _pipe({ kind: "save", text: String(text || ""), path: String(path),
+            command: ["bash", "-c",
+                      "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"",
+                      "forge-save", String(path)] })
+  }
+
+  function downloadDir() {
+    return Quickshell.env("XDG_DOWNLOAD_DIR")
+      || (Quickshell.env("HOME") + "/Downloads")
   }
 
   // ------------------------------------------------------------------ wiring
@@ -1071,9 +1236,38 @@ Item {
       if (job) {
         if (job.kind === "servers") root._onServers(job, text)
         else if (job.kind === "serverSites") root._onServerSites(job, text)
+        else if (job.kind === "log") root._onLog(job, text)
         else root._onSites(job, text)
       }
       root._pump()
+    }
+  }
+
+  Process {
+    id: pipeProcess
+    property var job: null
+    stdinEnabled: true
+    // Written on `started` rather than before it, because there is no stdin to
+    // write to until the child exists. Disabling stdin is what closes it, and
+    // `wl-copy` and `cat` both read until EOF — without it neither would ever
+    // finish.
+    onStarted: {
+      write(job ? job.text : "")
+      stdinEnabled = false
+    }
+    onExited: function(exitCode) {
+      var finished = pipeProcess.job
+      pipeProcess.job = null
+      // Back on for whatever is next in the queue: `onStarted` turns it off
+      // again once it has written, and a process started without it would have
+      // no stdin to write to at all.
+      pipeProcess.stdinEnabled = true
+
+      if (finished && finished.kind === "save")
+        root.textSaved(exitCode === 0, finished.path,
+                       exitCode === 0 ? "Saved to " + finished.path
+                                      : "Could not write " + finished.path)
+      root._pumpPipe()
     }
   }
 

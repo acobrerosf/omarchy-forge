@@ -9,25 +9,6 @@ Everything below was checked against the v2 OpenAPI spec
 
 ## Features
 
-### 2. Deployment log viewer
-
-`GET /orgs/{org}/servers/{server}/sites/{site}/deployments/{deployment}/log` —
-verified: 42KB, 369 lines, ANSI-coloured, and the answer is always in the tail.
-
-Today the panel tells you a deploy failed and then makes you open a browser to
-learn why, which is exactly the trip this plugin exists to avoid. This closes
-the loop.
-
-Shape: `l` on a site row fetches on demand — one request, only when asked, so it
-costs nothing at rest — and opens a scrollable pane showing the tail with ANSI
-stripped. A failed deploy offers it in the row. The deployment id we need is
-already in `include=latestDeployment`.
-
-Wrinkle worth deciding early: the log is gated behind `site:manage-deploys`, the
-*write* scope. A deliberately read-only token cannot read deployment output, so
-the scope table in the README needs a line saying so, and the panel needs to
-report a 403 here as "your token can't read this" rather than as an error.
-
 ### 3. Server and service actions
 
 `POST .../servers/{server}/actions` — `reboot`, `power-cycle`.
@@ -35,7 +16,7 @@ report a 403 here as "your token can't read this" rather than as an error.
 — `reboot`/`stop`, plus `reload` for php. Scope `server:manage-services`.
 The php endpoint additionally requires a `version` in the body.
 
-[README.md](README.md#L240-L241) defers these deliberately. The arm-to-confirm
+[README.md](README.md) defers these deliberately under *Known gaps*. The arm-to-confirm
 pattern deploying already uses is the right precedent, but rebooting a server is
 a different order of destructive from redeploying a site — a stronger
 confirmation, and never on a bare keypress that a mistyped `j` could reach.
@@ -45,21 +26,13 @@ behind something more deliberate, `stop` and `power-cycle` not at all.
 
 ### 4. Maintenance mode
 
-The site payload we already fetch carries `maintenance_mode: {enabled, status}`
-and `Model.sitesFrom` in [Model.js](Model.js) throws it away. Showing it costs **nothing** — a
-site in maintenance should say so in its row, and arguably reach the bar badge.
+`Model.sitesFrom` now keeps `maintenance_mode.enabled` and the site view's
+DETAILS block says so when it is on. What is left is the row and the bar badge —
+a site in maintenance is worth seeing without opening it — and the toggle.
 
 Toggling is `POST`/`DELETE .../sites/{site}/integrations/laravel-maintenance`,
 scope `site:manage-integrations`. Splitting this in two is reasonable: show it
 now (free), toggle it later.
-
-### 5. More of the site payload
-
-Also already in the response and discarded by `Model.sitesFrom`: `php_version`, `isolated`,
-`healthcheck_url`, `deployment_retention`, `aliases`, `app_type`, `uses_envoyer`,
-`zero_downtime_deployments`. A site detail view — enter on an already-unfolded
-site row, say — could show these without a single extra request. Cheap, and it
-gives the log viewer (#2) somewhere natural to live.
 
 ### 6. Run a site command
 
@@ -69,8 +42,9 @@ useful thing to have during a deploy that half-failed.
 
 This is arbitrary remote code execution, so it wants deliberate friction: a
 prompt rather than a keystroke, no history of one-key repeats, and a clear
-statement of which site and server it will run on. Worth doing after #2, which
-builds the output-viewing pane it would reuse.
+statement of which site and server it will run on. The pane it would show the
+output in already exists — `ForgeLogView.qml` — and so does the place to put the
+action, which is the site view's ACTIONS list.
 
 ### 7. Server events feed
 
@@ -83,9 +57,11 @@ demand only.
 ### 8. Site logs
 
 `GET .../sites/{site}/logs/{application,nginx-error,nginx-access}`, scope
-`server:view` — note it is the *read* scope, unlike deployment output. The
-nginx error log is the natural companion to a site that is up but returning 500s.
-Same viewer as #2.
+`server:view` — note it is the *read* scope, unlike deployment output, so this
+one works on a read-only token where the deploy log does not. The nginx error
+log is the natural companion to a site that is up but returning 500s. It reuses
+`ForgeLogView.qml` and adds three entries to the site view's ACTIONS list; the
+service already has the shape of the request in `fetchDeploymentLog`.
 
 ### 9. Recipes
 

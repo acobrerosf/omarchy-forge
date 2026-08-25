@@ -22,7 +22,7 @@ omarchy restart shell                  # full shell restart (drops all service s
                                        #   the panels but keeps the running service instance
 journalctl -t omarchy-shell -f         # QML console.warn/errors and load failures land here
 omarchy plugin validate "$PWD"         # manifest.json against the plugin schema (silent = ok)
-./lint                                 # qmllint over all four QML files (silent = ok)
+./lint                                 # qmllint over every QML file here (silent = ok)
 ./lint Panel.qml                       # or just the one you touched
 bash -n lint omarchy-forge
 ```
@@ -56,7 +56,7 @@ Tokens are in the login keyring under service `omarchy-forge`, never in that fil
 
 ## Architecture
 
-Five QML/JS files and a bash helper, three layers, one rule that shapes all of them: **the QML
+Six QML/JS files and a bash helper, three layers, one rule that shapes all of them: **the QML
 process never touches a token**.
 
 ```
@@ -64,10 +64,11 @@ omarchy-forge  (bash)   credentials + HTTP. Reads the keyring, hands the token t
                         prints one JSON envelope per request. Also the whole setup/admin CLI.
 Service.qml             one instance per session (plugin kind "service"). Polling, scheduling,
                         the rate ledger, the request queue, deploys, notifications.
-Panel.qml               one instance per monitor (bar widget). Cursor, folding, arm-to-deploy,
-                        row assembly. Owns nothing that outlives a screen.
+Panel.qml               one instance per monitor (bar widget). Cursor, folding, the view stack,
+                        arm-to-deploy, row assembly. Owns nothing that outlives a screen.
 ForgeRow.qml            one panel row, pure presentational. Declared properties in, signals out;
                         no service reference, no Model import.
+ForgeLogView.qml        the deploy log pane, on the same terms as ForgeRow.
 Model.js                pure functions: JSON:API → flat rows, state derivation, path building.
                         `.pragma library`, no QML types, no I/O.
 ForgeIcon.qml           the bar mark + badge (Shape/CurveRenderer).
@@ -79,7 +80,11 @@ rendered. Read it before changing any of those, and update it rather than re-exp
 decision in a file header. Three couplings from it are worth repeating here because they break
 silently: `Model.parseEnvelope`/`envelopeError` expect the exact envelope shape;
 `Service._isMissingToken` matches the literal prefix `"No API token"` produced by `api_request`
-(don't reword that message without changing both); and `omarchy-notification-send --exec` takes a
+(don't reword that message without changing both); `_applyEnvelope`'s `quiet` flag exists so the
+deploy log's 403 — Forge gates it behind the *write* scope — is reported on the pane instead of
+across the organization's rows; a site name reaching a *path* (the saved log's filename) goes
+through `Model.safeFileName`, which is the separator guard the other three don't cover; and
+`omarchy-notification-send --exec` takes a
 shell *string*, not an argv array — the shell runs it through `bash -lc` on click, so an address
 reaching it must pass `Model.externalUrl` **and** `Util.shellQuote`. Any new address that leaves
 this process — opened, copied, or handed to another program — goes through `Model.externalUrl`.
@@ -91,6 +96,11 @@ this process — opened, copied, or handed to another program — goes through `
   `orgs[key].servers` in place silently fails to update any binding. The one deliberate exception
   is the `budget` and `queue` objects inside `Service.qml`: nothing binds to their internals, so
   they mutate in place. Anything a panel can reach follows the rule.
+- **A view is a different `rows`, not a second window.** The panel is one layer-shell surface and
+  only one surface can hold keyboard focus, so a site's actions are a branch in `rows` keyed off
+  `navStack`/`route` — same cursor, same delegate, same key handler. `PanelKeyCatcher` eats
+  `h j k l x X` before `onTextKey`, which is why drill-in and back are the horizontal axis rather
+  than new letters. See ARCHITECTURE.md's *Views*.
 - **Rendering splits three ways.** `Model.rowView` derives a row's text and tone and may return no
   QML type — `depth` not pixels, `tone` not a colour. `ForgeRow.qml` owns the metrics and palette
   and takes no service reference. `Panel.qml` binds volatile per-screen state (cursor, armed,

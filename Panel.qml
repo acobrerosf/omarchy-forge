@@ -32,6 +32,34 @@ Panel {
   property var collapsedOrgs: ({})
   property int cursorIndex: 0
   property bool cursorActive: false
+
+  // Where in the panel we are. Empty is the tree; each entry is a view pushed
+  // over it, and `route` is the one on screen. Reassigned rather than mutated,
+  // like every other `var` here — `rows` binds to it.
+  //
+  // A stack rather than a pair of booleans because the views nest: a site is
+  // reached from the tree and a log from that site, and backing out has to
+  // land where it came from. Sites stopped being leaves when they grew
+  // actions; this is what they grew into.
+  property var navStack: []
+  readonly property var route: navStack.length > 0 ? navStack[navStack.length - 1] : null
+  readonly property string routeKind: route ? String(route.kind) : ""
+
+  // The site the current view is about, re-resolved from the service on every
+  // refresh rather than captured when the view was pushed — a deploy finishing
+  // while its log is open should update the header behind it.
+  readonly property var routeSite: route ? siteFor(route) : null
+
+  // The log this panel asked for, and what came back. Keyed the same way the
+  // service keys its answer, so two screens with two logs open don't cross.
+  property string logRequestKey: ""
+  // The file this screen asked for. `textSaved` is session-wide like every
+  // other service signal, and two monitors both showing a log should not both
+  // announce one of them saving it.
+  property string saveRequestedPath: ""
+  property var logLines: []
+  property string logError: ""
+  property bool logLoading: false
   // Deploying is the one action here that changes something on a real server,
   // so it takes two presses: the first arms the row, the second sends it.
   property string armedSiteKey: ""
@@ -161,8 +189,13 @@ Panel {
   // ----------------------------------------------------------------- rows
 
   // One flat list, so the cursor is a single index and j/k walks organizations,
-  // servers and sites without caring which is which.
+  // servers and sites without caring which is which. A view is nothing more
+  // than a different list: the same cursor, the same delegate, the same key
+  // handler, so nothing about moving around has to be learned twice.
   readonly property var rows: {
+    if (routeKind === "log") return []
+    if (routeKind === "site") return actionRows
+
     var out = []
     for (var o = 0; o < organizations.length; o++) {
       var org = organizations[o]
@@ -183,6 +216,37 @@ Panel {
       }
     }
     return out
+  }
+
+  // The site view's rows. Split out of `rows` so the tree's loop stays legible,
+  // and so the actions are derived once per site rather than once per keypress.
+  readonly property var actionRows: {
+    var out = []
+    if (routeKind !== "site") return out
+    var actions = Model.siteActions(routeSite)
+    for (var i = 0; i < actions.length; i++)
+      out.push({ kind: "action", org: route.org, serverId: route.serverId,
+                 siteId: route.siteId, action: actions[i],
+                 siteKey: routeSite ? routeSite.key : "",
+                 key: route.org + "/" + route.siteId + "/" + actions[i].id })
+    return out
+  }
+
+  function pushView(view) {
+    navStack = navStack.concat([view])
+    cursorIndex = 0
+    cursorActive = false
+    disarm()
+  }
+
+  function popView() {
+    if (navStack.length === 0) return false
+    navStack = navStack.slice(0, navStack.length - 1)
+    cursorIndex = 0
+    cursorActive = false
+    disarm()
+    clearLog()
+    return true
   }
 
   function serverKey(org, serverId) {
@@ -216,8 +280,11 @@ Panel {
     return rows[index]
   }
 
+  // Anything carrying a site id — a tree row, or the route of a view opened
+  // from one — resolves through here, and always against the service's current
+  // list rather than a copy taken when the view was pushed.
   function siteFor(row) {
-    if (!row || row.kind !== "site") return null
+    if (!row || !row.siteId) return null
     var sites = sitesFor(row.org, row.serverId)
     for (var i = 0; i < sites.length; i++)
       if (sites[i].id === row.siteId) return sites[i]
@@ -230,6 +297,8 @@ Panel {
   // the cursor or the clock ticking doesn't re-derive every row's text.
   function rowView(row) {
     if (!row) return Model.rowView(null, {})
+    if (row.kind === "action")
+      return Model.rowView(row, { action: row.action, siteKey: row.siteKey })
     var isOrg = row.kind === "org"
     return Model.rowView(row, {
       server: isOrg ? null : serverById(row.org, row.serverId),
@@ -242,12 +311,17 @@ Panel {
     })
   }
 
+  // The log view has no rows at all, so "the row under the cursor" is not what
+  // these can be about there. Falling back to the route keeps `d`, `o`, `f`
+  // and `s` meaning the same thing in every view rather than silently doing
+  // nothing in one of them.
   function currentRow() { return rowAt(cursorIndex) }
   function currentServer() {
     var row = currentRow()
-    return row && row.kind !== "org" ? serverById(row.org, row.serverId) : null
+    if (row) return row.kind !== "org" ? serverById(row.org, row.serverId) : null
+    return route ? serverById(route.org, route.serverId) : null
   }
-  function currentSite() { return siteFor(currentRow()) }
+  function currentSite() { return siteFor(currentRow()) || routeSite }
 
   // ------------------------------------------------------------- behaviour
 
@@ -261,6 +335,12 @@ Panel {
     disarm()
   }
 
+  // Enter and Space. Every kind of row answers it the same way — go to what
+  // this row is about — which is why a site opens its actions here rather than
+  // arming a deploy: on an organization and a server the key already meant
+  // "show me what is inside this", and a site having been the exception was an
+  // accident of sites having had nothing inside them. `d` still deploys from
+  // anywhere, two presses, unchanged.
   function activate() {
     var row = currentRow()
     if (!row) return
@@ -277,7 +357,100 @@ Panel {
       if (opening && forge) forge.fetchServerSites(row.org, row.serverId)
       return
     }
-    deployCurrent()
+    if (row.kind === "action") { runAction(row.action); return }
+    if (!siteFor(row)) { say("That site is no longer listed"); return }
+    pushView({ kind: "site", org: row.org, serverId: row.serverId, siteId: row.siteId })
+  }
+
+  // Right, and `l`. Distinct from `activate` because a tree key that toggles
+  // is wrong in one direction: on an already-open server, "go deeper" must not
+  // mean "close this".
+  function drillIn() {
+    var row = currentRow()
+    if (!row) return
+    if (row.kind === "org" && isOrgExpanded(row.org)) return
+    if (row.kind === "server" && isExpanded(row.org, row.serverId)) return
+    activate()
+  }
+
+  // Left, `h`, and Escape. Leaves a view before it leaves the panel, and in
+  // the tree walks back out the way the cursor walked in.
+  function back() {
+    if (popView()) return true
+    var row = currentRow()
+    if (!row) return false
+    if (row.kind === "site") {
+      // Collapsing the server the cursor is inside would strand it on whatever
+      // row slid into the index, so it moves to the parent first.
+      setExpanded(row.org, row.serverId, false)
+      cursorIndex = indexOfRow(serverKey(row.org, row.serverId))
+      return true
+    }
+    if (row.kind === "server" && isExpanded(row.org, row.serverId)) {
+      setExpanded(row.org, row.serverId, false)
+      return true
+    }
+    if (row.kind === "server" && showOrgHeaders) {
+      cursorIndex = indexOfRow("org/" + row.org)
+      return true
+    }
+    if (row.kind === "org" && isOrgExpanded(row.org)) {
+      setOrgExpanded(row.org, false)
+      return true
+    }
+    return false
+  }
+
+  // What the hero says about a site: the same two facts its row shows, since
+  // the row it came from is no longer on screen to show them.
+  function siteMeta(site) {
+    var parts = []
+    if (site.branch) parts.push(site.branch)
+    if (site.commitHash) parts.push(site.commitHash)
+    return parts.join(" · ")
+  }
+
+  function siteDetailLine(site) {
+    var label = Model.deploymentLabel(site.deploymentStatus)
+    var when = site.deployedAt ? Model.relativeTime(site.deployedAt, nowMs) : ""
+    return when === "" ? label : label + " · " + when
+  }
+
+  // The badge follows whatever the hero is about, so in a site view it reports
+  // that site rather than the health of everything being watched.
+  readonly property string heroTone: {
+    if (routeSite) {
+      var tone = Model.deploymentTone(routeSite.deploymentStatus)
+      return tone === "bad" ? "bad" : tone === "busy" ? "busy" : "none"
+    }
+    return health === "bad" ? "bad"
+      : health === "busy" ? "busy"
+      : (health === "setup" || health === "error") ? "warn" : "none"
+  }
+
+  readonly property var routeDetails: routeKind === "site" ? Model.siteDetails(routeSite) : []
+
+  function indexOfRow(key) {
+    for (var i = 0; i < rows.length; i++)
+      if (rows[i].key === key) return i
+    return cursorIndex
+  }
+
+  // One action from the site view. An unavailable one says why rather than
+  // doing nothing — a key that appears to have missed is worse than a refusal.
+  function runAction(action) {
+    if (!action) return
+    if (action.available === false) {
+      say(String(action.label) + " — " + String(action.reason))
+      return
+    }
+    switch (String(action.id)) {
+    case "deploy": deployCurrent(); break
+    case "log": openLog(); break
+    case "open": openCurrent(); break
+    case "forge": openCurrentInForge(); break
+    case "ssh": copyCurrentSsh(); break
+    }
   }
 
   function deployCurrent() {
@@ -297,6 +470,50 @@ Panel {
     if (!forge) return
     deployRequestedKey = site.key
     forge.deploy(row.org, site)
+  }
+
+  // ------------------------------------------------------------- deploy log
+
+  function clearLog() {
+    logRequestKey = ""
+    saveRequestedPath = ""
+    logLines = []
+    logError = ""
+    logLoading = false
+  }
+
+  function openLog() {
+    var row = currentRow()
+    var site = currentSite()
+    if (!site) { say("That site is no longer listed"); return }
+    if (!site.deploymentId) { say(site.name + " has never deployed"); return }
+    if (!forge) return
+
+    clearLog()
+    logRequestKey = forge.logRequestKey(row.org, row.serverId, site.id, site.deploymentId)
+    logLoading = true
+    pushView({ kind: "log", org: row.org, serverId: row.serverId,
+               siteId: site.id, deploymentId: site.deploymentId })
+    forge.fetchDeploymentLog(row.org, row.serverId, site.id, site.deploymentId)
+  }
+
+  // The two ways a log leaves this pane. Both take the text already on screen,
+  // so neither costs a request — and both go out on stdin rather than in an
+  // argv, because a verbose deploy can outgrow what an argument may hold.
+  function copyLog() {
+    if (logLines.length === 0 || !forge) return
+    forge.copyToClipboard(logLines.join("\n") + "\n")
+    say("Copied " + Model.pluralize(logLines.length, "line"))
+  }
+
+  function saveLog() {
+    if (logLines.length === 0 || !forge || !route) return
+    var site = routeSite
+    // The file is named after the site, which is API data reaching a path.
+    // `Model.logFileName` is what stops a site name being a separator.
+    var name = Model.logFileName(site ? site.name : "", route.deploymentId)
+    saveRequestedPath = forge.downloadDir() + "/" + name
+    forge.saveText(logLines.join("\n") + "\n", saveRequestedPath)
   }
 
   function disarm() {
@@ -371,7 +588,10 @@ Panel {
 
   onOpenedChanged: {
     if (opened) root.refresh()
-    else { disarm(); cursorActive = false }
+    // Reopening lands on the tree. A view is where a train of thought was, and
+    // resuming one from an hour ago mid-way is disorienting — the log behind
+    // it is stale by then anyway.
+    else { disarm(); cursorActive = false; navStack = []; clearLog() }
   }
 
   // A server that has just started failing is worth unfolding on its own — the
@@ -407,6 +627,26 @@ Panel {
     function onDeployFinished(siteKey, ok, message) {
       if (root.deployRequestedKey !== siteKey) return
       root.deployRequestedKey = ""
+      root.say(message)
+    }
+
+    // Filtered the same way and for the same reason: the service answers the
+    // session, and only the screen that asked has a pane waiting for it.
+    function onDeploymentLogFetched(requestKey, ok, text, message) {
+      if (root.logRequestKey !== requestKey) return
+      root.logLoading = false
+      // The guard runs here, where the string is about to enter a Text — the
+      // boundary it exists for. It also splits, because splitting a log the
+      // guard has not seen is how an escape sequence gets to survive one.
+      root.logLines = ok ? Model.logLines(text) : []
+      root.logError = ok ? "" : String(message || "Could not read the log")
+    }
+
+    // Saving is the one thing here that touches the filesystem, so where it
+    // landed — or why it didn't — is worth saying rather than assuming.
+    function onTextSaved(ok, path, message) {
+      if (root.saveRequestedPath !== path) return
+      root.saveRequestedPath = ""
       root.say(message)
     }
   }
@@ -493,8 +733,13 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
+    // A log is wide and long where a tree is neither, and both of these are
+    // plain bindings, so the card follows the view onto the screen. Both
+    // helpers clamp to what the screen actually has, so asking for more than
+    // fits is safe.
+    contentWidth: panel.fittedContentWidth(Style.space(root.routeKind === "log" ? 620 : 420))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight,
+                                             Style.space(root.routeKind === "log" ? 760 : 560))
     popoutSwitching: root.popoutSwitching
     popoutSwitchClosing: root.popoutSwitchClosing
 
@@ -502,14 +747,35 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
 
-      onMoveRequested: function(dx, dy) { root.moveCursor(dy !== 0 ? dy : dx) }
+      // `h j k l` never reach onTextKey — the catcher reads them as movement
+      // before that — so the horizontal axis is where a tree key has to come
+      // from. It cost nothing to take: until the site view existed, right and
+      // `l` were a second way to press `j`.
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0) {
+          if (root.routeKind === "log") logView.scrollBy(dy)
+          else root.moveCursor(dy)
+          return
+        }
+        if (dx > 0) root.drillIn()
+        else if (dx < 0) root.back()
+      }
       // Enter raises returnRequested AND activateRequested; space raises only
       // activateRequested. Handling both would run the action twice — which
       // would arm a deploy and immediately send it, skipping the confirm.
-      onActivateRequested: root.activate()
-      onCloseRequested: root.close()
+      onActivateRequested: if (root.routeKind !== "log") root.activate()
+      // Out of the view first, out of the panel only from the tree.
+      onCloseRequested: if (!root.back()) root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
+        // Before the fold to lower case, because these two are a pair that
+        // only means anything while their case is intact.
+        if (root.routeKind === "log") {
+          if (text === "g") { logView.toTop(); return }
+          if (text === "G") { logView.toEnd(); return }
+          if (text === "c" || text === "C") { root.copyLog(); return }
+          if (text === "w" || text === "W") { root.saveLog(); return }
+        }
         switch (String(text).toLowerCase()) {
         case "r": root.refresh(); break
         case "o": root.openCurrent(); break
@@ -536,23 +802,62 @@ Panel {
           width: flick.width
           spacing: Style.space(12)
 
+          // The way back, and where "back" goes. A view reached with a keypress
+          // still needs to be leavable with the mouse, and the trail says which
+          // server's site this is — which the site view otherwise never states.
+          Text {
+            id: crumb
+            width: parent.width
+            visible: root.routeKind !== ""
+            elide: Text.ElideRight
+            textFormat: Text.PlainText
+            color: root.foreground
+            opacity: crumbArea.containsMouse ? 0.9 : 0.55
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            text: {
+              if (root.routeKind === "") return ""
+              var parts = []
+              if (root.showOrgHeaders && root.route) parts.push(root.orgLabel(root.route.org))
+              var server = root.route ? root.serverById(root.route.org, root.route.serverId) : null
+              if (server) parts.push(server.name)
+              if (root.routeKind === "log" && root.routeSite) parts.push(root.routeSite.name)
+              return "‹ " + Model.plainText(parts.join(" / "))
+            }
+
+            MouseArea {
+              id: crumbArea
+              anchors.fill: parent
+              hoverEnabled: true
+              onClicked: root.back()
+            }
+          }
+
           PanelHero {
             width: parent.width
-            title: root.organizations.length === 1
-              ? Model.plainText(root.orgLabel(root.organizations[0])) : "Forge"
-            meta: Model.plainText(root.summary)
-            detail: root.refreshing ? "refreshing…"
-                                    : Model.relativeMs(root.lastRefreshMs, root.nowMs)
+            // In a view the hero is about the thing the view is about. Same
+            // three slots, so nothing below has to move.
+            title: root.routeSite
+              ? Model.plainText(root.routeSite.name)
+              : root.organizations.length === 1
+                ? Model.plainText(root.orgLabel(root.organizations[0])) : "Forge"
+            meta: root.routeSite
+              ? Model.plainText(root.siteMeta(root.routeSite))
+              : Model.plainText(root.summary)
+            detail: root.routeSite
+              ? root.siteDetailLine(root.routeSite)
+              : root.refreshing ? "refreshing…"
+                                : Model.relativeMs(root.lastRefreshMs, root.nowMs)
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
               ForgeIcon {
                 iconSize: Style.font.display
                 color: root.foreground
-                badgeColor: root.health === "busy" ? root.busyColor : root.urgent
-                badge: root.health === "bad" ? "bad"
-                     : root.health === "busy" ? "busy"
-                     : (root.health === "setup" || root.health === "error") ? "warn" : "none"
+                badgeColor: root.heroTone === "busy" ? root.busyColor : root.urgent
+                badge: root.heroTone === "bad" ? "bad"
+                     : root.heroTone === "busy" ? "busy"
+                     : root.heroTone === "warn" ? "warn" : "none"
               }
             }
           }
@@ -564,7 +869,8 @@ Panel {
             spacing: Style.space(10)
             // What is missing is only known once the helper's state file has
             // been read, so say nothing until then rather than guess.
-            visible: root.tokenKnown && (root.needsSetup || root.organizations.length === 0)
+            visible: root.routeKind === "" && root.tokenKnown
+              && (root.needsSetup || root.organizations.length === 0)
 
             Text {
               width: parent.width
@@ -598,7 +904,8 @@ Panel {
             visible: root.rows.length > 0
 
             PanelSectionHeader {
-              text: root.showOrgHeaders ? "ORGANIZATIONS" : "SERVERS"
+              text: root.routeKind === "site" ? "ACTIONS"
+                : root.showOrgHeaders ? "ORGANIZATIONS" : "SERVERS"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
@@ -623,6 +930,7 @@ Panel {
                 tone: rowItem.view.tone
                 depth: rowItem.view.depth
                 showChevron: rowItem.view.showChevron
+                showDot: rowItem.modelData.kind !== "action"
                 expanded: rowItem.modelData.kind === "org"
                   ? root.isOrgExpanded(rowItem.modelData.org)
                   : root.isExpanded(rowItem.modelData.org, rowItem.modelData.serverId)
@@ -665,11 +973,84 @@ Panel {
             }
           }
 
+          // ------------------------------------------------------- details
+
+          // Every one of these arrived in the sites response the panel already
+          // pays for, so the block costs no request. Not rows: the cursor
+          // should only ever land on something a keypress can do.
+          Column {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: root.routeDetails.length > 0
+
+            PanelSectionHeader {
+              text: "DETAILS"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Repeater {
+              model: root.routeDetails
+
+              Row {
+                id: detailRow
+                required property var modelData
+
+                width: parent.width
+                spacing: Style.space(8)
+
+                Text {
+                  width: Style.space(92)
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  color: root.foreground
+                  opacity: 0.45
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  text: detailRow.modelData.label
+                }
+
+                Text {
+                  width: Math.max(0, parent.width - Style.space(92) - parent.spacing)
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  color: root.foreground
+                  opacity: 0.75
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  text: detailRow.modelData.value
+                }
+              }
+            }
+          }
+
+          // ----------------------------------------------------------- log
+
+          ForgeLogView {
+            id: logView
+            width: parent.width
+            visible: root.routeKind === "log"
+            // An Item has no implicit height, and the card's height is this
+            // column's. Asking for a screenful rather than measuring one:
+            // `fittedContentHeight` clamps whatever it cannot fit, so this is
+            // a request for as much as the screen will give.
+            height: visible ? Style.space(460) : 0
+
+            lines: root.logLines
+            loading: root.logLoading
+            error: root.logError
+
+            foreground: root.foreground
+            badColor: root.badColor
+            fontFamily: root.fontFamily
+          }
+
           // -------------------------------------------------------- empty
 
           Text {
             width: parent.width
-            visible: root.rows.length === 0 && root.organizations.length > 0 && !root.needsSetup
+            visible: root.routeKind === "" && root.rows.length === 0
+              && root.organizations.length > 0 && !root.needsSetup
             wrapMode: Text.WordWrap
             textFormat: Text.PlainText
             color: root.foreground
@@ -712,14 +1093,20 @@ Panel {
           Text {
             id: hints
             width: parent.width
-            visible: root.rows.length > 0
+            visible: root.rows.length > 0 || root.routeKind === "log"
             wrapMode: Text.WordWrap
             textFormat: Text.PlainText
             color: root.foreground
             opacity: 0.4
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
-            text: "[enter] expand · [d] deploy · [o] open · [f] forge · [s] copy ssh · [r] refresh · [a] add org"
+            // Per view, because a list of every key in the plugin is a list
+            // nobody reads. Each one names only what works where you are.
+            text: root.routeKind === "log"
+              ? "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [h] back"
+              : root.routeKind === "site"
+                ? "[enter] run · [h] back · [r] refresh"
+                : "[enter] open · [d] deploy · [o] open · [f] forge · [s] copy ssh · [r] refresh · [a] add org"
           }
         }
       }
