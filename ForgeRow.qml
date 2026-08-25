@@ -35,9 +35,20 @@ Rectangle {
   property bool expanded: false
   property bool showChevron: true
   property bool hasCursor: false
-  // Deploying takes two presses, and the row is where both are reported.
+  // A server has somewhere to go that the tree cannot show — what can be done
+  // to it — so the row carries the way there rather than leaving it to a key
+  // nothing on screen mentions. Dim at rest so a list of servers still reads
+  // as a list, and lit when the pointer is on it, which is what says it can be
+  // clicked at all.
+  property bool showActions: false
+  // Nothing that changes a real server goes on one press, and the row is where
+  // both are reported: the arm as `armedText`, the request on its way as
+  // `sending`. The wording belongs to the action — "press again to deploy",
+  // "press Y to reboot" — so it arrives with the rest of the row's text rather
+  // than being decided here.
   property bool armed: false
-  property bool deploying: false
+  property string armedText: "press again to deploy"
+  property bool sending: false
 
   property color foreground: Color.foreground
   property color dimColor: Qt.darker(foreground, 1.55)
@@ -49,6 +60,9 @@ Rectangle {
   property string fontFamily: Style.font.family
 
   signal activated()
+  // Distinct from `activated`: clicking the row unfolds it, clicking this one
+  // glyph inside the row goes to the actions instead.
+  signal actionsRequested()
   signal contextRequested()
   signal entered()
 
@@ -67,8 +81,8 @@ Rectangle {
   }
 
   // The two states that outrank whatever the row would otherwise report.
-  readonly property string statusText: root.deploying ? "sending…"
-    : root.armed ? "press again to deploy"
+  readonly property string statusText: root.sending ? "sending…"
+    : root.armed ? root.armedText
     : root.status
 
   implicitHeight: rowContent.implicitHeight + Style.space(10)
@@ -119,8 +133,10 @@ Rectangle {
       anchors.verticalCenter: parent.verticalCenter
       // A Row puts a gap only between children it actually lays out, so both
       // the widths and the count of gaps follow what is visible.
-      width: Math.max(0, parent.width - dot.width - trailing.implicitWidth - chevron.width
-        - parent.spacing * ((root.showDot ? 1 : 0) + 1 + (root.showChevron ? 1 : 0)))
+      width: Math.max(0, parent.width - dot.width - trailing.implicitWidth
+        - actionsIcon.width - chevron.width
+        - parent.spacing * ((root.showDot ? 1 : 0) + 1
+                            + (root.showActions ? 1 : 0) + (root.showChevron ? 1 : 0)))
       spacing: Style.space(2)
 
       Text {
@@ -179,6 +195,33 @@ Rectangle {
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         text: root.timeText
+      }
+    }
+
+    Text {
+      id: actionsIcon
+      anchors.verticalCenter: parent.verticalCenter
+      width: root.showActions ? implicitWidth : 0
+      visible: root.showActions
+      textFormat: Text.PlainText
+      color: root.foreground
+      opacity: actionsArea.containsMouse ? 0.95 : 0.4
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      text: "󰒓"
+
+      MouseArea {
+        id: actionsArea
+        anchors.fill: parent
+        // A caption-sized glyph is a target the pointer has to be aimed at, so
+        // the area it answers to is bigger than the mark it draws. It sits over
+        // the row's own MouseArea — a later sibling, so it wins the click — and
+        // still reports the hover, or the cursor would jump off this row while
+        // the pointer was on it.
+        anchors.margins: -Style.space(4)
+        hoverEnabled: true
+        onEntered: root.entered()
+        onClicked: root.actionsRequested()
       }
     }
 

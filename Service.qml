@@ -37,12 +37,16 @@ Item {
     return true
   }
 
-  property string deployingSiteKey: ""
+  // Which write is in flight, under the key the row that asked for it knows
+  // itself by. One key for the whole session rather than a map, because
+  // `actionProcess` is single-flight: a deploy and a reboot cannot both be on
+  // their way.
+  property string busyActionKey: ""
 
-  signal deployFinished(string siteKey, bool ok, string message)
+  signal actionFinished(string key, bool ok, string message)
 
   // The deploy log is a one-shot read whose answer belongs to the one panel
-  // that asked — the same reason `deployFinished` is a signal and not state.
+  // that asked — the same reason `actionFinished` is a signal and not state.
   // It is also tens of kilobytes, which is no business of a property every
   // panel re-reads. `requestKey` is organization-qualified so two panels, or
   // two organizations holding the same numeric ids, cannot cross-answer.
@@ -870,8 +874,8 @@ Item {
   // It goes through the queue rather than the deploy path's own process: the
   // queue already charges the budget, honours a hold and throws work away for
   // an organization that stopped being watched, and `actionProcess` is
-  // single-flight for writes — a log fetch waiting behind a deploy, or
-  // answering into `_onAction`, is not what either wants.
+  // single-flight for every write — a log fetch waiting behind a deploy or a
+  // reboot, or answering into `_onAction`, is not what either wants.
   //
   // It jumps the queue because it belongs to a keypress. A sweep behind it can
   // afford to arrive a second later; someone staring at a blank pane cannot.
@@ -1043,60 +1047,107 @@ Item {
     Quickshell.execDetached(command.concat([scrub(headline) || "Forge", scrub(description)]))
   }
 
-  // --------------------------------------------------------------- deploying
+  // ------------------------------------------------------------------ writes
 
-  property string _deployOrg: ""
-  property string _deployAccount: ""
-  property string _deployServerId: ""
+  // Every write — a deploy, a service restart, a reboot — goes out on
+  // `actionProcess` rather than through the queue. It is single-flight, so one
+  // press cannot become two requests, and it answers into `_onAction` rather
+  // than into a sweep. What the queue would have done for it, the budget hold
+  // and the charge, it therefore has to do here by hand.
+  property var _action: null
 
-  function deploy(org, site) {
-    if (!site || actionProcess.running || String(org) === "") return
-    if (!Model.canDeploy(site)) return
-    _deployOrg = String(org)
-    _deployAccount = (orgs[_deployOrg] && orgs[_deployOrg].account)
-      || accountForOrg(_deployOrg)
+  function _startAction(job) {
+    // A refusal is reported rather than swallowed: a keypress that looks like
+    // it missed is worse than one that says why. Same reasoning as the guards
+    // in `fetchDeploymentLog` — nothing comes along later to explain this one.
+    if (actionProcess.running) {
+      actionFinished(job.key, false, "Still sending the last one")
+      return
+    }
+    var account = (orgs[job.org] && orgs[job.org].account) || accountForOrg(job.org)
     // Sending it anyway would only earn another refusal and push the hold out
     // further, so say when it can be pressed again rather than spending it.
-    var held = budget.blockedMs(_deployAccount)
+    var held = budget.blockedMs(account)
     if (held > 0) {
-      _deployOrg = ""
-      _deployAccount = ""
-      deployFinished(site.key, false,
+      actionFinished(job.key, false,
                      "Rate limited — try again in " + Math.ceil(held / 1000) + "s")
       return
     }
-    _deployServerId = String(site.serverId)
-    deployingSiteKey = site.key
-    budget.charge(budget.bucketFor(_deployAccount))
-    actionProcess.command = [cliPath, "api", "--account", _deployAccount, "POST",
-                             Model.deployPath(_deployOrg, site.serverId, site.id)]
+    job.account = account
+    _action = job
+    busyActionKey = job.key
+    budget.charge(budget.bucketFor(account))
+    // The body reaches the helper in argv, unlike the token: it is a fixed
+    // action word built in `Model`, not a credential, and the rule the stdin
+    // config exists for is about the one thing that must never appear in a
+    // command line. The helper moves it onto that config for curl's sake.
+    actionProcess.command = [cliPath, "api", "--account", account, "POST", job.path]
+      .concat(job.body ? [JSON.stringify(job.body)] : [])
     actionProcess.running = true
+  }
+
+  function deploy(org, site) {
+    if (!site || String(org) === "") return
+    if (!Model.canDeploy(site)) return
+    _startAction({ kind: "deploy", org: String(org), serverId: String(site.serverId),
+                   key: String(site.key), body: null,
+                   path: Model.deployPath(org, site.serverId, site.id),
+                   done: "Deployment queued" })
+  }
+
+  // `action` is a `Model.serverActions` entry, so the path and the body were
+  // built beside the label that describes them rather than assembled here out
+  // of whatever the panel happened to pass. `key` is the row's, not the
+  // server's: two of those rows send to the same endpoint, and only the one
+  // that was pressed should say so.
+  function serverAction(org, serverId, action, key) {
+    if (!action || !action.path || String(org) === "") return
+    _startAction({ kind: "server", org: String(org), serverId: String(serverId),
+                   key: String(key), path: String(action.path),
+                   body: action.body || null,
+                   done: String(action.done || "Sent"),
+                   reboot: String(action.id) === "reboot" })
   }
 
   function _onAction(text) {
     var envelope = Model.parseEnvelope(text)
-    var org = _deployOrg
-    var account = _deployAccount
-    var serverId = _deployServerId
-    var key = deployingSiteKey
-    deployingSiteKey = ""
-    _deployOrg = ""
-    _deployAccount = ""
-    _deployServerId = ""
+    var job = _action
+    _action = null
+    busyActionKey = ""
+    if (!job) return
 
-    if (_applyEnvelope(org, account, envelope)) {
-      deployFinished(key, true, "Deployment queued")
-      // Forge queues the deploy asynchronously, so the status only moves a
-      // moment later. Look again shortly rather than making the user wait out
-      // a whole refresh interval — and look at the deployed server directly:
-      // under rotation the re-poll only advances the window, which for a
-      // large organization will usually be looking somewhere else entirely.
-      if (orgs[org]) {
-        _patch(org, { nextDueMs: Date.now() + 6000 })
-        fetchServerSites(org, serverId, true)
-      }
-    } else {
-      deployFinished(key, false, Model.envelopeError(envelope))
+    var deploying = job.kind === "deploy"
+    // A deploy's refusal is the organization's business: it is the same token
+    // and the same scope every sweep already uses. A server action's is not.
+    // Forge gates those behind `server:manage-services`, which a deliberately
+    // read-only token does not have, so left loud one keypress would paint a
+    // scope error across rows that are perfectly healthy — the reason `_onLog`
+    // is quiet, for the same kind of request.
+    if (!_applyEnvelope(job.org, job.account, envelope, !deploying)) {
+      var message = !deploying && envelope.status === 403
+        ? "Your token can't manage servers — that needs the server:manage-services scope"
+        : Model.envelopeError(envelope)
+      actionFinished(job.key, false, message)
+      return
+    }
+
+    actionFinished(job.key, true, job.done)
+
+    // Forge does all of this asynchronously — every one of these endpoints
+    // answers 202 — so what changed only shows a moment later. Look again
+    // shortly rather than making the user wait out a whole refresh interval.
+    if (!orgs[job.org]) return
+    if (deploying) {
+      // And look at the deployed server directly: under rotation the re-poll
+      // only advances the window, which for a large organization will usually
+      // be looking somewhere else entirely.
+      _patch(job.org, { nextDueMs: Date.now() + 6000 })
+      fetchServerSites(job.org, job.serverId, true)
+    } else if (job.reboot) {
+      // A restarted service changes nothing this widget draws. A rebooting
+      // server changes its own state, and that arrives with the server list,
+      // so the org's own refresh is the one worth pulling forward.
+      _patch(job.org, { nextDueMs: Date.now() + 6000 })
     }
   }
 

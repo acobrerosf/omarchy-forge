@@ -9,21 +9,6 @@ Everything below was checked against the v2 OpenAPI spec
 
 ## Features
 
-### 3. Server and service actions
-
-`POST .../servers/{server}/actions` — `reboot`, `power-cycle`.
-`POST .../servers/{server}/services/{nginx,php,mysql,postgres,redis,supervisor}/actions`
-— `reboot`/`stop`, plus `reload` for php. Scope `server:manage-services`.
-The php endpoint additionally requires a `version` in the body.
-
-[README.md](README.md) defers these deliberately under *Known gaps*. The arm-to-confirm
-pattern deploying already uses is the right precedent, but rebooting a server is
-a different order of destructive from redeploying a site — a stronger
-confirmation, and never on a bare keypress that a mistyped `j` could reach.
-
-Probably: nginx/php reload and restart first (the everyday ones), server reboot
-behind something more deliberate, `stop` and `power-cycle` not at all.
-
 ### 4. Maintenance mode
 
 `Model.sitesFrom` now keeps `maintenance_mode.enabled` and the site view's
@@ -76,6 +61,25 @@ don't, which is why it sits below the rest.
 `heartbeats` endpoints. Forge's own alerting, surfaced in the bar. Would need
 its own idea of what "unhealthy" means on top of the three tones we have, so
 it is a bigger design question than it looks.
+
+### 11. The rest of the services
+
+Done: nginx restart, PHP-FPM reload and restart, and server reboot behind a
+`Y` confirm, in a server view reached with `l`. What that left out, in the order
+it might be worth having:
+
+- **supervisor and redis restarts.** Same endpoint shape, one row each, and
+  "the queue workers are wedged" is as everyday as "PHP is wedged". The reason
+  they are not in already is that four rows is a view and eight is a list.
+- **mysql/postgres restart.** Needs `database_type` off the server payload —
+  `Model.serversFrom` doesn't keep it — to know which of the two endpoints a
+  server even has.
+- **A site's own PHP version.** The server view acts on the server default,
+  which is right for it; an isolated site on another version wants a row in the
+  *site* view, sending to the same endpoint with a different `version`.
+
+`stop` and `power-cycle` stay out. Both are listed under *Known gaps* in
+[README.md](README.md) with the reasoning.
 
 ---
 

@@ -196,6 +196,23 @@ A refusal is always reported. `fetchServerSites` can return silently because the
 that server anyway; nothing comes along later to fill this pane in, so a hold, a ceiling, and the
 jobs a 429 drops out of the queue each answer the signal instead of vanishing.
 
+**Writes don't go through it.** A deploy, a service restart and a reboot all go out on
+`actionProcess`, which is single-flight: one press cannot become two requests, and the answer
+arrives at `_onAction` rather than in the middle of a sweep. What the queue would have done for
+them they do by hand — consult the hold, charge the budget — and `_startAction` is the one place
+that does it, so a second kind of write was a job object and a path, not a second code path.
+
+Two of them differ from a deploy. The request carries a **body** (`{"action":"reboot"}`, and for
+PHP the pool's version, which the endpoint takes rather than infers). It reaches the helper as an
+argument — it is not a credential — and the helper hands it to curl down the same stdin config the
+token rides, not because it is a secret but because stdin is already spoken for there and a temp
+file would be a second thing to clean up. And the envelope is applied `quiet`, for the reason
+the deploy log's is: Forge gates these behind `server:manage-services`, so a deliberately
+read-only token is refused here, and left loud one keypress would paint a scope error across rows
+that are perfectly healthy. Forge answers all of them 202 — the work is asynchronous — so the flash
+says "requested", and a reboot pulls the organization's next refresh forward to where the changed
+state will show.
+
 **What `queue` is and isn't.** The `queue` object holds the pending list and nothing else — push,
 push-front, take, drop-by-org. The dispatch policy (`_pump`) stays on the service root, because it
 reads `orgs`, charges the budget, builds paths through `Model` and drives `fetchProcess`; moving
@@ -280,10 +297,11 @@ hold keyboard focus — so a site's actions are not a second window and could no
 different `rows`.
 
 `navStack` holds what has been pushed over the tree; `route` is its top. `rows` switches on it:
-nothing pushed is the tree, a `site` route is that site's actions, a `log` route is empty because
-the log is a pane and not a list. Everything downstream is untouched — one cursor, one delegate,
-one key handler, one clamp in `onRowsChanged` — which is the point. Adding the next view (server
-actions, a command's output) is a `rows` branch and a `runAction` case, not a new navigation model.
+nothing pushed is the tree, a `site` or `server` route is that subject's actions, a `log` route is
+empty because the log is a pane and not a list. Everything downstream is untouched — one cursor,
+one delegate, one key handler, one clamp in `onRowsChanged` — which is the point. The server view
+cost exactly what that predicted: a branch in `actionRows`, a `runAction` case, and no new
+navigation model.
 
 Two keys had to come from somewhere, and the horizontal axis is where. `PanelKeyCatcher` reads
 `h j k l` as movement before `onTextKey` ever sees them, so a letter for "open the log" was never
@@ -292,9 +310,51 @@ So right drills in, left goes back, and Escape goes back before it closes. `d` s
 anywhere with its two presses, because an accelerator that survives the reorganisation is the
 thing that makes the reorganisation cost nothing.
 
-The site view's rows go through `Model.rowView` like every other row, as `kind: "action"`. Only the
-deploy action carries a `siteKey` — that is what `armedSiteKey` and `deployingSiteKey` compare
-against, and handing it to all five would light up the whole list on one pending deploy.
+The server view came out of the same axis, and cost nothing for the same reason: on a server that
+is *already* unfolded, right had nothing left to do — `drillIn` refused to re-toggle it, precisely
+so that "deeper" could never mean "close this". That refusal is now the door.
+
+It also cost the footer, twice, which is where that door had to be advertised. The hint line used
+to name one set of keys per view; a key that only works on one *row* has nowhere to appear in that,
+and `l` into a server duly stayed invisible until someone was told about it. So `hintText` reads
+the row under the cursor, not just the route — which is what the line always claimed to be doing,
+and is now a better line for it: four short lines instead of one wrapped list of everything. Two
+rules keep it from being a nuisance. Every variant is short enough to stay one line, so moving the
+cursor changes the words and not the height of the panel under them; and until the cursor is
+*active* nothing is highlighted, so the line claims nothing about a particular row. The same rule
+retires `[Y] confirm` from the server view's footer onto the reboot row alone, where it stops being
+a puzzle.
+
+The second cost was structural, and was a bug the whole time: the footer was the last thing inside
+the scrolling `Column`, so a server with enough sites pushed it out of the viewport — the line that
+says what you can do here disappeared exactly when the list got long enough to need it, under the
+scroll bar. It is now a sibling of the `Flickable`, anchored to the bottom, and the `Flickable`
+ends at its top. The panel's `contentHeight` adds both, and the scroll bar stops above the footer
+rather than running over it.
+
+And a key is not an affordance. `l` is invisible to anyone who navigates with a pointer, so a
+server row carries a cog that opens the same view — `ForgeRow` draws it and raises
+`actionsRequested`, a signal distinct from `activated` because clicking the row still folds it. It
+shows on *every* server row, folded or not, where the key means this on unfolded ones only: `l` has
+a second job on a folded server and the pointer does not, so making the icon match the key would
+have been consistency bought with a worse mouse. It is dim at rest and lit under the pointer, and
+its mouse area is larger than the glyph — a caption-sized mark is not a target.
+
+A view's rows go through `Model.rowView` like every other row, as `kind: "action"`. Only an action
+that writes carries an `actionKey` — that is what `armedKey` and `busyActionKey` compare against,
+and handing it to `Open in Forge` as well would light up the whole list on one pending action. Its
+value differs by view, and has to: the site view arms on the *site's* key, because the tree's row
+for that site reports the same deploy and must light up with it; the server view arms on the
+*row's*, because two of its four rows post to the same endpoint and only the one that was pressed
+should say so.
+
+**Two confirms, not one.** A deploy and a service restart take the same two presses. A reboot takes
+enter to arm and a capital `Y` to send, and every other key — a second enter, a lower-case `y` —
+disarms and spends itself saying so. The letter matters less than where it isn't: `h j k l` are
+movement, so nothing a mistyped navigation keypress can land on is ever the last press before a
+server goes down. It follows that the mouse can arm a reboot but not confirm one, which is a cost
+worth paying. `Model.serverActions` carries the `confirm` each row wants, so the rule is data
+rather than a branch in the key handler.
 
 ### Text is never left to guess
 

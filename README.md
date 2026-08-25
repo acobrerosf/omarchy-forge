@@ -29,12 +29,14 @@ Create the token at <https://forge.laravel.com/profile/api>. The scopes it needs
 | `organization:view` | find the organizations to watch |
 | `server:view` | read servers, sites, and deployment status |
 | `site:manage-deploys` | deploy from the bar, **and** read deployment logs |
+| `server:manage-services` | restart nginx or PHP-FPM, reboot a server |
 
-Leave `site:manage-deploys` off and the widget is strictly read-only. Two things stop working, and
-both say so rather than failing quietly: the deploy key reports that the token isn't allowed to,
-and the deployment log reports that reading it needs that scope. The log is genuinely gated behind
-the *write* scope — that is Forge's choice, not this plugin's — so a token deliberately kept
-read-only can watch every deployment fail and not be told why.
+Leave both write scopes off and the widget is strictly read-only. Everything that would change
+something says so rather than failing quietly: the deploy key reports that the token isn't allowed
+to, a server action names the scope it wanted, and the deployment log reports that reading it needs
+one too. The log is genuinely gated behind the *write* scope — that is Forge's choice, not this
+plugin's — so a token deliberately kept read-only can watch every deployment fail and not be told
+why.
 
 Tokens go into the login keyring via `secret-tool`, not into a config file. The widget never
 handles them: every request is made by the bundled `omarchy-forge` helper, which reads the token
@@ -134,7 +136,7 @@ it, because that is where the problem actually is.
 |---|---|
 | `j` `k` or ↑ ↓ | move the cursor |
 | enter / space | open what the row is about — unfold an organization or a server, or open a site's actions. Unfolding a server also refreshes its sites |
-| `l` or → | the same, but never closes something already open |
+| `l` or → | the same, but never closes something already open — on a server already unfolded, opens its actions |
 | `h` or ← | back: out of a view, or fold up the row the cursor is in |
 | `d` | deploy the site under the cursor |
 | `o` | open the site's URL — or, on a server row, its page in Forge |
@@ -142,7 +144,12 @@ it, because that is where the problem actually is.
 | `s` | copy an `ssh forge@…` command for the server |
 | `r` | refresh now |
 | `a` | add an organization |
+| `Y` | confirm a reboot that enter has armed |
 | esc | back one level, or close from the list |
+
+The line at the bottom of the panel names what the row under the cursor can do, rather than every
+key at once — which is where the keys that only work in one place say so: `l` into a server's
+actions, `Y` to confirm a reboot.
 
 Deploying takes two presses. The first arms the row and says so; the second sends it. The arm
 expires after four seconds. `d` works from the list and from a site's own view, so nothing got
@@ -150,8 +157,38 @@ slower when sites stopped being the last level.
 
 <img src="screenshots/deploy.png" alt="A site row armed, reading 'press again to deploy'" width="420">
 
-Mouse: left click a row to unfold it, or to open a site's actions; right click to open it in Forge.
-Inside a view, the trail at the top left is the way back. Middle click the bar icon to refresh.
+Mouse: left click a row to unfold it, or to open a site's actions; click the ⚙ on a server row for
+that server's actions; right click to open it in Forge. Inside a view, the trail at the top left is
+the way back. Middle click the bar icon to refresh.
+
+## The server view
+
+A server opens into a view of its own, the way a site does. Two ways in: press `l` (or →) on a
+server that is already unfolded, where the key had nothing left to do, or click the ⚙ at the right
+of any server row — folded or not, since the pointer has no double duty to work around. Enter
+still folds and unfolds.
+
+| | |
+|---|---|
+| **Restart nginx** | two presses, like a deploy |
+| **Reload PHP-FPM** | a graceful FPM reload of the server's PHP version, which the row names |
+| **Restart PHP-FPM** | the harder version of the same |
+| **Reboot server** | arms on enter, and sends only on a capital `Y` |
+
+Everything here needs `server:manage-services`; without it the action still sends, and Forge's
+refusal comes back naming the scope. One Forge would refuse for another reason — a server still
+provisioning, or one that reported no PHP version — says so on the row instead of being sent.
+Forge does all of this asynchronously, so the answer is "requested", not "done"; what changed shows
+up in the next refresh, which a reboot pulls forward.
+
+**Rebooting is confirmed differently on purpose.** Enter arms it, and then only `Y` sends —
+lower-case `y` does not, a second enter does not, and neither does anything else: the next key
+disarms and says so. The arm expires after eight seconds. `j` and `k` cannot reach `Y` by a
+mistype, which is the point; it also means a reboot needs the keyboard, since the mouse can arm
+the row but not confirm it.
+
+Stopping a service, power-cycling a server, and the four other services Forge exposes are
+deliberately absent — see *Known gaps*.
 
 ## The rate limit
 
@@ -234,6 +271,7 @@ omarchy-forge logout [account]             # remove an account's token
 omarchy-forge status [--org SLUG]          # server health as a table
 omarchy-forge doctor          # every account: token, auth, rate limit left
 omarchy-forge api --account default GET /orgs/acme/servers   # raw request, JSON envelope
+omarchy-forge api --org acme POST /orgs/acme/servers/1/actions '{"action":"reboot"}'
 ```
 
 To have it on your `PATH`:
@@ -250,6 +288,9 @@ ln -sf ~/.config/omarchy/plugins/acobrerosf.forge/omarchy-forge ~/.local/bin/oma
 
 `rateReset` is how many seconds are left before the limit resets, or `null` — Forge only says when
 it is the response refusing you.
+
+A third argument is a JSON request body, checked for being JSON before anything is sent. It reaches
+curl the way the token does — down the config on stdin — rather than through a command line.
 
 `--account` names the credential to use and `--org` picks it by which organization owns it; with
 neither, the account behind the default organization is used. `$FORGE_TOKEN` overrides the keyring
@@ -273,8 +314,12 @@ one reaches, and which is the default. Tokens are never in there.
   `{serverId}` is available if you need the numeric server id instead. Note that a server's
   slug is fixed at creation and does not follow a rename, which is why it has to come from the API
   rather than be derived from the name.
-- Server actions — reboot, restarting nginx or PHP — are deliberately not here yet. Deploying is
-  the one write this version does.
+- **The server view stops at four actions.** Forge can also `stop` a service and `power-cycle` a
+  server; neither is here, because a service stopped from the bar is one nothing in this widget
+  could start again, and a power cycle is not something to reach by keypress. mysql, postgres,
+  redis and supervisor take the same endpoint and are not listed either — only the two services a
+  bad deploy actually leaves you wanting. PHP acts on the server's own version; a site isolated
+  onto a different one would need the site view, not this one.
 - **The server list stops at 150 rows.** Forge returns 30 rows a page — whatever `page[size]` asks
   for — and points at the rest with a cursor. The widget follows it, up to five pages per refresh,
   or until the account's minute is nearly spent, and says "showing the first 150 servers" rather

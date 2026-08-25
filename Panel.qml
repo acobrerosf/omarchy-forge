@@ -47,8 +47,10 @@ Panel {
 
   // The site the current view is about, re-resolved from the service on every
   // refresh rather than captured when the view was pushed — a deploy finishing
-  // while its log is open should update the header behind it.
+  // while its log is open should update the header behind it. Same for the
+  // server: a reboot that lands should be visible in the view that asked for it.
   readonly property var routeSite: route ? siteFor(route) : null
+  readonly property var routeServer: route ? serverById(route.org, route.serverId) : null
 
   // The log this panel asked for, and what came back. Keyed the same way the
   // service keys its answer, so two screens with two logs open don't cross.
@@ -60,12 +62,15 @@ Panel {
   property var logLines: []
   property string logError: ""
   property bool logLoading: false
-  // Deploying is the one action here that changes something on a real server,
-  // so it takes two presses: the first arms the row, the second sends it.
-  property string armedSiteKey: ""
-  // The site this widget asked the service to deploy. The service's result is
+  // Nothing here that changes a real server goes on one press: the first arms
+  // the row, the second sends it. `armedConfirm` is what the second press has
+  // to be — "again" for a deploy or a service restart, "Y" for a reboot, which
+  // is a different order of destructive and gets a key of its own.
+  property string armedKey: ""
+  property string armedConfirm: ""
+  // What this widget asked the service to send. The service's result is
   // session-wide, so without this every screen would flash the same message.
-  property string deployRequestedKey: ""
+  property string actionRequestedKey: ""
   property string flash: ""
 
   readonly property color badColor: urgent
@@ -95,7 +100,7 @@ Panel {
   readonly property string summary: forge ? forge.summaryForList(organizations) : "Loading…"
   readonly property bool needsSetup: forge ? forge.needsSetup === true : false
   readonly property bool tokenKnown: forge ? forge.tokenKnown === true : false
-  readonly property string deployingKey: forge ? String(forge.deployingSiteKey) : ""
+  readonly property string busyKey: forge ? String(forge.busyActionKey) : ""
 
   // Every organization's state, so the auto-unfold below re-runs whenever any
   // of them lands rather than only the first.
@@ -194,7 +199,7 @@ Panel {
   // handler, so nothing about moving around has to be learned twice.
   readonly property var rows: {
     if (routeKind === "log") return []
-    if (routeKind === "site") return actionRows
+    if (routeKind === "site" || routeKind === "server") return actionRows
 
     var out = []
     for (var o = 0; o < organizations.length; o++) {
@@ -218,17 +223,30 @@ Panel {
     return out
   }
 
-  // The site view's rows. Split out of `rows` so the tree's loop stays legible,
-  // and so the actions are derived once per site rather than once per keypress.
+  // A view's rows: what can be done to the site or the server it is about.
+  // Split out of `rows` so the tree's loop stays legible, and so the list is
+  // derived once per route rather than once per keypress. A subject that has
+  // gone from the API is not an empty view — `Model` answers for a missing one
+  // with every row unavailable, which says what happened where a blank pane
+  // would read as a bug.
   readonly property var actionRows: {
     var out = []
-    if (routeKind !== "site") return out
-    var actions = Model.siteActions(routeSite)
+    var forSite = routeKind === "site"
+    if (!forSite && routeKind !== "server") return out
+    var actions = forSite ? Model.siteActions(routeSite)
+                          : Model.serverActions(route.org, routeServer)
+    var prefix = route.org + "/" + (forSite ? route.siteId : route.serverId) + "/"
     for (var i = 0; i < actions.length; i++)
       out.push({ kind: "action", org: route.org, serverId: route.serverId,
-                 siteId: route.siteId, action: actions[i],
-                 siteKey: routeSite ? routeSite.key : "",
-                 key: route.org + "/" + route.siteId + "/" + actions[i].id })
+                 siteId: forSite ? route.siteId : "", action: actions[i],
+                 // What the arm and the send are reported on. A site's is the
+                 // site's own key, because the tree's row for it has to light
+                 // up with the deploy; a server's is the row's, because two of
+                 // its rows send to the same endpoint and only the one that was
+                 // pressed should say so.
+                 armKey: forSite ? (routeSite ? String(routeSite.key) : "")
+                                 : prefix + actions[i].id,
+                 key: prefix + actions[i].id })
     return out
   }
 
@@ -298,7 +316,7 @@ Panel {
   function rowView(row) {
     if (!row) return Model.rowView(null, {})
     if (row.kind === "action")
-      return Model.rowView(row, { action: row.action, siteKey: row.siteKey })
+      return Model.rowView(row, { action: row.action, armKey: row.armKey })
     var isOrg = row.kind === "org"
     return Model.rowView(row, {
       server: isOrg ? null : serverById(row.org, row.serverId),
@@ -316,6 +334,12 @@ Panel {
   // and `s` meaning the same thing in every view rather than silently doing
   // nothing in one of them.
   function currentRow() { return rowAt(cursorIndex) }
+  // The log view has no rows, so which organization is being looked at has to
+  // come from the route there — the same fallback, for the same reason.
+  function currentOrg() {
+    var row = currentRow()
+    return row ? String(row.org) : route ? String(route.org) : ""
+  }
   function currentServer() {
     var row = currentRow()
     if (row) return row.kind !== "org" ? serverById(row.org, row.serverId) : null
@@ -357,7 +381,7 @@ Panel {
       if (opening && forge) forge.fetchServerSites(row.org, row.serverId)
       return
     }
-    if (row.kind === "action") { runAction(row.action); return }
+    if (row.kind === "action") { runAction(row); return }
     if (!siteFor(row)) { say("That site is no longer listed"); return }
     pushView({ kind: "site", org: row.org, serverId: row.serverId, siteId: row.siteId })
   }
@@ -369,8 +393,23 @@ Panel {
     var row = currentRow()
     if (!row) return
     if (row.kind === "org" && isOrgExpanded(row.org)) return
-    if (row.kind === "server" && isExpanded(row.org, row.serverId)) return
+    // An unfolded server has nothing left to unfold, so right goes where the
+    // tree cannot: into what can be done to it. A folded one still unfolds —
+    // deeper means its sites first, and its actions once those are showing.
+    if (row.kind === "server" && isExpanded(row.org, row.serverId)) {
+      openServerActions(row)
+      return
+    }
     activate()
+  }
+
+  // Both ways into a server's actions. `l` only means this on a server that is
+  // already unfolded, because on a folded one it still has unfolding to do; the
+  // icon has no such double duty, so it means the same thing on every server
+  // row and the pointer never has to know which state the row is in.
+  function openServerActions(row) {
+    if (!row || row.kind !== "server") return
+    pushView({ kind: "server", org: row.org, serverId: row.serverId })
   }
 
   // Left, `h`, and Escape. Leaves a view before it leaves the panel, and in
@@ -401,6 +440,15 @@ Panel {
     return false
   }
 
+  // What the hero says about a server: the two facts its row showed, since the
+  // row it came from is no longer on screen to show them.
+  function serverDetailLine(server) {
+    if (!server) return "not listed"
+    var label = Model.serverStateLabel(server.state)
+    var count = route ? sitesFor(route.org, server.id).length : 0
+    return count > 0 ? label + " · " + Model.pluralize(count, "site") : label
+  }
+
   // What the hero says about a site: the same two facts its row shows, since
   // the row it came from is no longer on screen to show them.
   function siteMeta(site) {
@@ -423,6 +471,10 @@ Panel {
       var tone = Model.deploymentTone(routeSite.deploymentStatus)
       return tone === "bad" ? "bad" : tone === "busy" ? "busy" : "none"
     }
+    if (routeKind === "server") {
+      var serverTone = routeServer ? Model.serverTone(routeServer.state) : "idle"
+      return serverTone === "bad" ? "bad" : serverTone === "busy" ? "busy" : "none"
+    }
     return health === "bad" ? "bad"
       : health === "busy" ? "busy"
       : (health === "setup" || health === "error") ? "warn" : "none"
@@ -430,16 +482,49 @@ Panel {
 
   readonly property var routeDetails: routeKind === "site" ? Model.siteDetails(routeSite) : []
 
+  // What the footer says. Per *row* in the tree, not per view: `l` on a server
+  // means something different depending on whether it is already unfolded, and
+  // a footer that lists every key in the plugin is a list nobody reads — which
+  // is how the one key with nowhere else to announce itself, the server view,
+  // stayed invisible. Every line is short enough to stay a single line, so
+  // moving the cursor changes the words without moving the panel underneath
+  // them. Until the cursor is active nothing is highlighted, so nothing is
+  // claimed about a particular row.
+  readonly property string hintText: {
+    if (routeKind === "log")
+      return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [h] back"
+    var row = cursorActive ? currentRow() : null
+    if (routeKind === "site" || routeKind === "server") {
+      // The confirm key is worth naming on the one row that wants it, and
+      // nowhere else — on `Restart nginx` it would only be a puzzle.
+      if (row && row.action && String(row.action.confirm) === "Y")
+        return "[enter] arm · [Y] confirm · [h] back"
+      return "[enter] run · [h] back · [r] refresh"
+    }
+    if (!row) return "[j/k] move · [enter] open · [r] refresh · [a] add org"
+    if (row.kind === "org")
+      return (isOrgExpanded(row.org) ? "[enter] fold" : "[enter] unfold")
+        + " · [f] forge · [r] refresh · [a] add org"
+    if (row.kind === "server")
+      return isExpanded(row.org, row.serverId)
+        ? "[l] actions · [h] fold · [f] forge · [s] copy ssh"
+        : "[enter] unfold · [f] forge · [s] copy ssh · [r] refresh"
+    return "[enter] actions · [d] deploy · [o] open · [f] forge"
+  }
+
   function indexOfRow(key) {
     for (var i = 0; i < rows.length; i++)
       if (rows[i].key === key) return i
     return cursorIndex
   }
 
-  // One action from the site view. An unavailable one says why rather than
-  // doing nothing — a key that appears to have missed is worse than a refusal.
-  function runAction(action) {
-    if (!action) return
+  // One row from a view. An unavailable action says why rather than doing
+  // nothing — a key that appears to have missed is worse than a refusal. The
+  // row rather than the action, because a server action needs to know which
+  // server, and which row of the four is arming.
+  function runAction(row) {
+    if (!row || !row.action) return
+    var action = row.action
     if (action.available === false) {
       say(String(action.label) + " — " + String(action.reason))
       return
@@ -450,26 +535,65 @@ Panel {
     case "open": openCurrent(); break
     case "forge": openCurrentInForge(); break
     case "ssh": copyCurrentSsh(); break
+    case "nginx-restart":
+    case "php-reload":
+    case "php-restart":
+    case "reboot": runServerAction(row); break
     }
   }
 
   function deployCurrent() {
-    var row = currentRow()
     var site = currentSite()
     if (!site) return
     if (!Model.canDeploy(site)) {
       say(site.name + " has no repository to deploy")
       return
     }
-    if (armedSiteKey !== site.key) {
-      armedSiteKey = site.key
-      disarmTimer.restart()
-      return
-    }
+    if (armedKey !== site.key) { arm(site.key, "again"); return }
     disarm()
     if (!forge) return
-    deployRequestedKey = site.key
-    forge.deploy(row.org, site)
+    actionRequestedKey = site.key
+    forge.deploy(currentOrg(), site)
+  }
+
+  // The two confirms. A service restart takes the deploy's two presses. A
+  // reboot takes a key of its own: enter is one row away from enter on
+  // something harmless, and no key a mistyped movement could land on should
+  // ever be the last press before a server goes down.
+  function runServerAction(row) {
+    if (armedKey !== row.armKey) {
+      arm(row.armKey, String(row.action.confirm || "again"))
+      return
+    }
+    // A second enter on a Y-confirm disarms rather than sends: pressing the
+    // same key twice is exactly the mistake the extra key is there to catch.
+    if (armedConfirm === "Y") { disarm(); return }
+    sendServerAction(row)
+  }
+
+  // `Y`, and only for the row that asked for it. The cursor cannot have moved
+  // since the arm — every move disarms — so the armed row is the one under it.
+  function confirmArmed() {
+    var row = currentRow()
+    if (!row || armedConfirm !== "Y" || armedKey === "") return
+    if (row.armKey !== armedKey) return
+    sendServerAction(row)
+  }
+
+  function sendServerAction(row) {
+    disarm()
+    if (!forge) return
+    actionRequestedKey = row.armKey
+    forge.serverAction(row.org, row.serverId, row.action, row.armKey)
+  }
+
+  function arm(key, confirm) {
+    armedKey = key
+    armedConfirm = confirm
+    // The stronger confirm gets longer: it asks for a key that is not already
+    // under the hand, and timing out mid-reach is its own kind of annoying.
+    disarmTimer.interval = confirm === "Y" ? 8000 : 4000
+    disarmTimer.restart()
   }
 
   // ------------------------------------------------------------- deploy log
@@ -517,7 +641,8 @@ Panel {
   }
 
   function disarm() {
-    armedSiteKey = ""
+    armedKey = ""
+    armedConfirm = ""
     disarmTimer.stop()
   }
 
@@ -619,14 +744,14 @@ Panel {
     }
   }
 
-  // The deploy result is a session-wide signal, so only the widget that armed
+  // A write's result is a session-wide signal, so only the widget that armed
   // it should speak up — otherwise every screen flashes the same message.
   Connections {
     target: root.forge
     enabled: root.forge !== null
-    function onDeployFinished(siteKey, ok, message) {
-      if (root.deployRequestedKey !== siteKey) return
-      root.deployRequestedKey = ""
+    function onActionFinished(key, ok, message) {
+      if (root.actionRequestedKey !== key) return
+      root.actionRequestedKey = ""
       root.say(message)
     }
 
@@ -651,10 +776,11 @@ Panel {
     }
   }
 
+  // The interval is set per arm — see `arm()` — so this is only the default.
   Timer {
     id: disarmTimer
     interval: 4000
-    onTriggered: root.armedSiteKey = ""
+    onTriggered: root.disarm()
   }
 
   Timer {
@@ -738,7 +864,8 @@ Panel {
     // helpers clamp to what the screen actually has, so asking for more than
     // fits is safe.
     contentWidth: panel.fittedContentWidth(Style.space(root.routeKind === "log" ? 620 : 420))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight,
+    contentHeight: panel.fittedContentHeight(column.implicitHeight + footer.implicitHeight
+                                             + Style.space(12),
                                              Style.space(root.routeKind === "log" ? 760 : 560))
     popoutSwitching: root.popoutSwitching
     popoutSwitchClosing: root.popoutSwitchClosing
@@ -768,6 +895,21 @@ Panel {
       onCloseRequested: if (!root.back()) root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
+        // Before everything, and before the fold to lower case: a row waiting
+        // for `Y` must not have one keypress mean two things, and `Y` is a
+        // different key from `y` here — which is the whole point of it.
+        if (root.armedConfirm === "Y") {
+          if (text === "Y") { root.confirmArmed(); return }
+          // Anything else was not the confirmation, lower-case `y` included.
+          // The press is spent disarming and says so, rather than disarming
+          // and then also doing whatever it usually does.
+          var armedRow = root.currentRow()
+          root.disarm()
+          root.say(armedRow && armedRow.action
+                   ? String(armedRow.action.label) + " — not confirmed"
+                   : "Not confirmed")
+          return
+        }
         // Before the fold to lower case, because these two are a pair that
         // only means anything while their case is intact.
         if (root.routeKind === "log") {
@@ -788,7 +930,12 @@ Panel {
 
       Flickable {
         id: flick
-        anchors.fill: parent
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: footer.top
+        // The gap the scrolling Column used to get from its own spacing.
+        anchors.bottomMargin: footer.height > 0 ? Style.space(12) : 0
         contentWidth: width
         contentHeight: column.implicitHeight
         clip: true
@@ -818,8 +965,14 @@ Panel {
             text: {
               if (root.routeKind === "") return ""
               var parts = []
-              if (root.showOrgHeaders && root.route) parts.push(root.orgLabel(root.route.org))
-              var server = root.route ? root.serverById(root.route.org, root.route.serverId) : null
+              // The trail names what is above this view. For a server view that
+              // is the organization whether or not the tree shows headers for
+              // it — and not the server, which the hero right below already
+              // names.
+              if (root.route && (root.showOrgHeaders || root.routeKind === "server"))
+                parts.push(root.orgLabel(root.route.org))
+              var server = root.routeKind === "server" ? null
+                : root.route ? root.serverById(root.route.org, root.route.serverId) : null
               if (server) parts.push(server.name)
               if (root.routeKind === "log" && root.routeSite) parts.push(root.routeSite.name)
               return "‹ " + Model.plainText(parts.join(" / "))
@@ -839,15 +992,21 @@ Panel {
             // three slots, so nothing below has to move.
             title: root.routeSite
               ? Model.plainText(root.routeSite.name)
-              : root.organizations.length === 1
-                ? Model.plainText(root.orgLabel(root.organizations[0])) : "Forge"
+              : root.routeKind === "server"
+                ? Model.plainText(root.routeServer ? root.routeServer.name : "Server")
+                : root.organizations.length === 1
+                  ? Model.plainText(root.orgLabel(root.organizations[0])) : "Forge"
             meta: root.routeSite
               ? Model.plainText(root.siteMeta(root.routeSite))
-              : Model.plainText(root.summary)
+              : root.routeKind === "server"
+                ? Model.plainText(root.routeServer ? Model.serverMeta(root.routeServer) : "")
+                : Model.plainText(root.summary)
             detail: root.routeSite
               ? root.siteDetailLine(root.routeSite)
-              : root.refreshing ? "refreshing…"
-                                : Model.relativeMs(root.lastRefreshMs, root.nowMs)
+              : root.routeKind === "server"
+                ? root.serverDetailLine(root.routeServer)
+                : root.refreshing ? "refreshing…"
+                                  : Model.relativeMs(root.lastRefreshMs, root.nowMs)
             foreground: root.foreground
             fontFamily: root.fontFamily
             iconComponent: Component {
@@ -904,7 +1063,7 @@ Panel {
             visible: root.rows.length > 0
 
             PanelSectionHeader {
-              text: root.routeKind === "site" ? "ACTIONS"
+              text: root.routeKind === "site" || root.routeKind === "server" ? "ACTIONS"
                 : root.showOrgHeaders ? "ORGANIZATIONS" : "SERVERS"
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -931,6 +1090,7 @@ Panel {
                 depth: rowItem.view.depth
                 showChevron: rowItem.view.showChevron
                 showDot: rowItem.modelData.kind !== "action"
+                showActions: rowItem.modelData.kind === "server"
                 expanded: rowItem.modelData.kind === "org"
                   ? root.isOrgExpanded(rowItem.modelData.org)
                   : root.isExpanded(rowItem.modelData.org, rowItem.modelData.serverId)
@@ -939,10 +1099,11 @@ Panel {
                 // on their own clock, and re-deriving every row's text on a
                 // cursor move or a tick would be wasted work.
                 hasCursor: root.cursorActive && root.cursorIndex === rowItem.index
-                armed: rowItem.view.siteKey !== ""
-                  && root.armedSiteKey === rowItem.view.siteKey
-                deploying: rowItem.view.siteKey !== ""
-                  && root.deployingKey === rowItem.view.siteKey
+                armed: rowItem.view.actionKey !== ""
+                  && root.armedKey === rowItem.view.actionKey
+                armedText: rowItem.view.armedText
+                sending: rowItem.view.actionKey !== ""
+                  && root.busyKey === rowItem.view.actionKey
                 timeText: rowItem.view.deployedAt
                   ? Model.relativeTime(rowItem.view.deployedAt, root.nowMs) : ""
 
@@ -968,6 +1129,11 @@ Panel {
                   root.cursorIndex = rowItem.index
                   root.cursorActive = true
                   root.openCurrentInForge()
+                }
+                onActionsRequested: {
+                  root.cursorIndex = rowItem.index
+                  root.cursorActive = true
+                  root.openServerActions(rowItem.modelData)
                 }
               }
             }
@@ -1061,53 +1227,59 @@ Panel {
               ? "Loading servers…"
               : "No servers in " + root.organizations.join(", ") + "."
           }
+        }
+      }
 
-          // ------------------------------------------------------- footer
+      // Outside the Flickable, and pinned. It used to be the last thing in the
+      // scrolling Column, which meant a server with a lot of sites pushed it
+      // off the bottom — so the one line that says what the row under the
+      // cursor can do was hidden exactly when the list was long enough to need
+      // it. The scroll bar stops at its top now too.
+      Column {
+        id: footer
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        spacing: Style.space(12)
 
-          PanelSeparator {
-            foreground: root.foreground
-            visible: statusLine.visible || hints.visible
-          }
+        PanelSeparator {
+          foreground: root.foreground
+          visible: statusLine.visible || hints.visible
+        }
 
-          Text {
-            id: statusLine
-            width: parent.width
-            visible: text !== ""
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            color: root.problems.length > 0 && root.flash === "" ? root.urgent : root.foreground
-            opacity: root.problems.length > 0 && root.flash === "" ? 0.9 : 0.6
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            text: {
-              if (root.flash !== "") return root.flash
-              if (root.problems.length > 0) return root.problems.join(" · ")
-              for (var i = 0; i < root.organizations.length; i++) {
-                var note = root.stateFor(root.organizations[i]).note
-                if (note !== "") return note
-              }
-              return ""
+        Text {
+          id: statusLine
+          width: parent.width
+          visible: text !== ""
+          wrapMode: Text.WordWrap
+          textFormat: Text.PlainText
+          color: root.problems.length > 0 && root.flash === "" ? root.urgent : root.foreground
+          opacity: root.problems.length > 0 && root.flash === "" ? 0.9 : 0.6
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          text: {
+            if (root.flash !== "") return root.flash
+            if (root.problems.length > 0) return root.problems.join(" · ")
+            for (var i = 0; i < root.organizations.length; i++) {
+              var note = root.stateFor(root.organizations[i]).note
+              if (note !== "") return note
             }
+            return ""
           }
+        }
 
-          Text {
-            id: hints
-            width: parent.width
-            visible: root.rows.length > 0 || root.routeKind === "log"
-            wrapMode: Text.WordWrap
-            textFormat: Text.PlainText
-            color: root.foreground
-            opacity: 0.4
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            // Per view, because a list of every key in the plugin is a list
-            // nobody reads. Each one names only what works where you are.
-            text: root.routeKind === "log"
-              ? "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [h] back"
-              : root.routeKind === "site"
-                ? "[enter] run · [h] back · [r] refresh"
-                : "[enter] open · [d] deploy · [o] open · [f] forge · [s] copy ssh · [r] refresh · [a] add org"
-          }
+        Text {
+          id: hints
+          width: parent.width
+          visible: root.rows.length > 0 || root.routeKind === "log"
+          wrapMode: Text.WordWrap
+          textFormat: Text.PlainText
+          color: root.foreground
+          opacity: 0.4
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          // Derived on the root, where the cursor is — see `hintText`.
+          text: root.hintText
         }
       }
     }

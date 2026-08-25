@@ -285,9 +285,24 @@ rate_reset_seconds() {
   return 0
 }
 
+# curl config files take a double-quoted string, so a backslash or a quote
+# inside a value has to survive the round trip. A line terminator has to as
+# well, and for a different reason: the config format is line-based, so a raw
+# newline would end the directive and let whatever followed it be read as
+# another one. curl understands \n and \r inside the quotes. Backslash first,
+# or the escapes below would be escaped again.
+curl_config_escape() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\n'/\\n}
+  printf '%s' "$value"
+}
+
 api_request() {
-  local method=$1 path=$2 account=${3:-}
-  local token escaped url tmp status remaining reset ok=false
+  local method=$1 path=$2 account=${3:-} body=${4:-}
+  local token config url tmp status remaining reset ok=false
 
   [[ -n $account ]] || account=$(default_account)
 
@@ -307,22 +322,17 @@ api_request() {
 
   tmp=$(mktemp -d)
 
-  # curl config files take a double-quoted string, so a backslash or a quote
-  # inside the token has to survive the round trip. A line terminator has to as
-  # well, and for a different reason: the config format is line-based, so a raw
-  # newline would end the header directive and let whatever followed it be read
-  # as another one. curl understands \n and \r inside the quotes. Backslash
-  # first, or the escapes below would be escaped again.
-  escaped=${token//\\/\\\\}
-  escaped=${escaped//\"/\\\"}
-  escaped=${escaped//$'\r'/\\r}
-  escaped=${escaped//$'\n'/\\n}
-
   # The credential reaches curl on stdin rather than through argv, which is
-  # world-readable in /proc/<pid>/cmdline. `--fail` is deliberately absent: a
-  # 4xx body carries the error detail worth showing.
+  # world-readable in /proc/<pid>/cmdline. A request body rides the same config
+  # for a weaker reason — it is not a secret — but stdin is already spoken for,
+  # and a temp file would be a second thing to clean up. `Content-Type` is sent
+  # on every request either way. `--fail` is deliberately absent: a 4xx body
+  # carries the error detail worth showing.
+  config="header = \"Authorization: Bearer $(curl_config_escape "$token")\""
+  [[ -z $body ]] || config+=$'\n'"data = \"$(curl_config_escape "$body")\""
+
   if status=$(
-    printf 'header = "Authorization: Bearer %s"\n' "$escaped" |
+    printf '%s\n' "$config" |
       curl --silent --show-error --location \
         --config - \
         --request "$method" \
@@ -941,6 +951,7 @@ Laravel Forge for the Omarchy bar.
   omarchy-forge status [--org SLUG]       server health as a table
   omarchy-forge doctor                    every account: token, auth, rate limit
   omarchy-forge api [--account NAME|--org SLUG] GET /orgs/...
+  omarchy-forge api ... POST /orgs/.../actions '{"action":"reboot"}'
                                           raw authenticated request (JSON envelope)
 
 One token per account; an account can watch several organizations. An account
@@ -1009,8 +1020,11 @@ api)
     *) break ;;
     esac
   done
-  [[ $# -ge 2 ]] || die "usage: omarchy-forge api [--account NAME] <METHOD> <path>"
-  api_request "$1" "$2" "$account"
+  [[ $# -ge 2 ]] || die "usage: omarchy-forge api [--account NAME] <METHOD> <path> [json-body]"
+  if [[ $# -ge 3 && -n $3 ]]; then
+    jq -e . <<<"$3" >/dev/null 2>&1 || die "the body is not valid JSON"
+  fi
+  api_request "$1" "$2" "$account" "${3:-}"
   ;;
 doctor) cmd_doctor ;;
 -h | --help | help | "") usage ;;

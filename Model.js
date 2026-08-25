@@ -353,13 +353,15 @@ function canDeploy(site) {
 // `hint` is the key that reaches the same action straight from the list, so
 // the view teaches the accelerator rather than hiding it. An unavailable
 // action is still listed — a missing "Deployment log" would read as a bug,
-// where one that says "never deployed" answers the question.
+// where one that says "never deployed" answers the question. `armable` marks
+// the one that writes: it is what `rowView` hangs the arm key on, and four of
+// these five change nothing on a server.
 function siteActions(site) {
   var deployable = canDeploy(site)
   var deployed = !!(site && site.deploymentId)
   var url = site ? externalUrl(site.url) : ""
   return [
-    { id: "deploy", label: "Deploy", hint: "d",
+    { id: "deploy", label: "Deploy", hint: "d", armable: true,
       available: deployable, reason: deployable ? "" : "no repository" },
     { id: "log", label: "Deployment log", hint: "",
       available: deployed, reason: deployed ? "" : "never deployed" },
@@ -367,6 +369,83 @@ function siteActions(site) {
       available: url !== "", reason: url !== "" ? "" : "no address" },
     { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
     { id: "ssh", label: "Copy ssh command", hint: "s", available: true, reason: "" }
+  ]
+}
+
+// ----------------------------------------------------------- server actions
+
+// Which PHP pool a PHP action would act on. Forge runs one FPM pool per version
+// and the endpoint takes the version rather than inferring it, so a server that
+// reported none has nothing to send. The class is the same idea as
+// `sshCommand`'s: Forge's enum runs `php5` through `php85` with one `-old`
+// variant, and a value outside it would earn a 422 — a worse answer than a row
+// that says it doesn't know which pool it would restart. It also makes the
+// version safe to put in a label.
+function phpPoolVersion(server) {
+  var value = server ? String(server.phpVersion || "") : ""
+  return /^php[0-9]{1,3}(-old)?$/.test(value) ? value : ""
+}
+
+// What the server view offers. Shaped like `siteActions` — the same
+// {id,label,hint,available,reason} the panel turns into rows — plus what a
+// write needs: the path and body to send, what the row says while it is armed,
+// what to flash when Forge takes it, and how it has to be confirmed.
+//
+// Only the everyday restarts are here. The API also offers `stop` on every
+// service and `power-cycle` on the server; neither belongs on a keypress from a
+// bar, and a service stopped from here is one nothing in this widget could
+// start again.
+//
+// A server that is provisioning or revoked answers 4xx to all of this, so the
+// row says the state instead of spending a request to be told it. Rebooting is
+// the exception that stays available when the server is unreachable: it is the
+// one action that might fix that, and Forge refusing it is a better answer than
+// a row that won't try.
+function serverActions(org, server) {
+  var state = server ? String(server.state) : "unknown"
+  var ready = state === "ready"
+  var stateReason = server ? serverStateLabel(state) : "not listed"
+  var php = phpPoolVersion(server)
+  var hasPhp = ready && php !== ""
+  var rebootable = ready || state === "unreachable"
+  var ssh = sshCommand(server)
+  var id = server ? server.id : ""
+  var suffix = php ? " (" + php + ")" : ""
+  return [
+    { id: "nginx-restart", label: "Restart nginx", hint: "",
+      available: ready, reason: ready ? "" : stateReason,
+      armable: true, confirm: "again",
+      armedText: "press again to restart nginx",
+      done: "nginx restart requested",
+      path: serviceActionPath(org, id, "nginx"),
+      body: { action: "reboot" } },
+    { id: "php-reload", label: "Reload PHP-FPM" + suffix, hint: "",
+      available: hasPhp, reason: hasPhp ? "" : !ready ? stateReason : "no PHP version reported",
+      armable: true, confirm: "again",
+      armedText: "press again to reload PHP-FPM",
+      done: "PHP-FPM reload requested",
+      path: serviceActionPath(org, id, "php"),
+      body: { action: "reload", version: php } },
+    { id: "php-restart", label: "Restart PHP-FPM" + suffix, hint: "",
+      available: hasPhp, reason: hasPhp ? "" : !ready ? stateReason : "no PHP version reported",
+      armable: true, confirm: "again",
+      armedText: "press again to restart PHP-FPM",
+      done: "PHP-FPM restart requested",
+      path: serviceActionPath(org, id, "php"),
+      body: { action: "reboot", version: php } },
+    // The one row here that takes every site on the server down with it, so it
+    // is confirmed by a key nothing else in the panel uses and no movement key
+    // could reach. See the panel's `runServerAction`.
+    { id: "reboot", label: "Reboot server", hint: "",
+      available: rebootable, reason: rebootable ? "" : stateReason,
+      armable: true, confirm: "Y",
+      armedText: "press Y to reboot",
+      done: "Reboot requested",
+      path: serverActionPath(org, id),
+      body: { action: "reboot" } },
+    { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
+    { id: "ssh", label: "Copy ssh command", hint: "s",
+      available: ssh !== "", reason: ssh !== "" ? "" : "no public IP" }
   ]
 }
 
@@ -449,6 +528,11 @@ function deploymentLabel(status) {
 // Nothing here may touch a QML type, so the result carries `depth` rather than
 // a pixel indent and `tone` rather than a colour — ForgeRow owns the metrics
 // and the palette those turn into.
+// A site row in the tree arms without going through an action at all — `d`
+// reaches it directly — so the deploy's wording is the default rather than
+// something the deploy action has to carry.
+var defaultArmedText = "press again to deploy"
+
 function rowView(row, ctx) {
   var kind = row ? String(row.kind) : ""
   var c = ctx || {}
@@ -471,7 +555,8 @@ function rowView(row, ctx) {
       tone: tone,
       depth: 0,
       showChevron: true,
-      siteKey: "",
+      actionKey: "",
+      armedText: "",
       deployedAt: ""
     }
   }
@@ -491,11 +576,15 @@ function rowView(row, ctx) {
       tone: "idle",
       depth: 0,
       showChevron: false,
-      // Only the deploy action answers to the site's key, and it has to: the
-      // arm and the send are reported on whichever row offers the deploy, and
-      // in this view that is this one. Every other action leaves it empty so a
-      // pending deploy doesn't light up the whole list.
-      siteKey: action.id === "deploy" ? String(c.siteKey || "") : "",
+      // The key the arm and the send are reported on. Only an action that
+      // writes carries one: handing it to `Open in Forge` as well would light
+      // up the whole list on one pending action. In the site view it is the
+      // site's own key, because the tree's site row reports the same deploy and
+      // has to light up with it; in the server view it is the row's, because
+      // two of the four rows send to the same endpoint and only the one that
+      // was pressed should say so.
+      actionKey: action.armable === true ? String(c.armKey || "") : "",
+      armedText: String(action.armedText || defaultArmedText),
       deployedAt: ""
     }
   }
@@ -515,7 +604,8 @@ function rowView(row, ctx) {
       // and sites under their server either way.
       depth: (c.showOrgHeaders ? 1 : 0) + 1,
       showChevron: false,
-      siteKey: site ? String(site.key) : "",
+      actionKey: site ? String(site.key) : "",
+      armedText: defaultArmedText,
       deployedAt: site ? site.deployedAt : ""
     }
   }
@@ -532,7 +622,8 @@ function rowView(row, ctx) {
     tone: server ? serverTone(server.state) : "idle",
     depth: c.showOrgHeaders ? 1 : 0,
     showChevron: true,
-    siteKey: "",
+    actionKey: "",
+    armedText: "",
     deployedAt: ""
   }
 }
@@ -747,6 +838,20 @@ function serverSitesPath(org, serverId, cursor) {
 function deployPath(org, serverId, siteId) {
   return "/orgs/" + encode(org) + "/servers/" + encode(serverId)
     + "/sites/" + encode(siteId) + "/deployments"
+}
+
+// A write against the server itself, and one against a service running on it.
+// Both are gated behind `server:manage-services` — the scope a deliberately
+// read-only token lacks — which is why the service reports their 403 on the row
+// rather than across the organization, the way the deploy log's is.
+function serverActionPath(org, serverId) {
+  return "/orgs/" + encode(org) + "/servers/" + encode(serverId) + "/actions"
+}
+
+// `service` is never API data: it comes from the fixed list in `serverActions`.
+function serviceActionPath(org, serverId, service) {
+  return "/orgs/" + encode(org) + "/servers/" + encode(serverId)
+    + "/services/" + encode(service) + "/actions"
 }
 
 // The deploy log, fetched only when someone asks for it. Note the scope: this

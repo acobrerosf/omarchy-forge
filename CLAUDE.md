@@ -77,12 +77,14 @@ ForgeIcon.qml           the bar mark + badge (Shape/CurveRenderer).
 **`ARCHITECTURE.md` is the design document of record** — the envelope contract, accounts vs
 organizations, the rate budget, the queue and pagination, subscriptions, and how a row is
 rendered. Read it before changing any of those, and update it rather than re-explaining a
-decision in a file header. Three couplings from it are worth repeating here because they break
+decision in a file header. A few couplings from it are worth repeating here because they break
 silently: `Model.parseEnvelope`/`envelopeError` expect the exact envelope shape;
 `Service._isMissingToken` matches the literal prefix `"No API token"` produced by `api_request`
-(don't reword that message without changing both); `_applyEnvelope`'s `quiet` flag exists so the
-deploy log's 403 — Forge gates it behind the *write* scope — is reported on the pane instead of
-across the organization's rows; a site name reaching a *path* (the saved log's filename) goes
+(don't reword that message without changing both); `_applyEnvelope`'s `quiet` flag exists so a
+403 on a request that belongs to a keypress — the deploy log's, a server action's, both gated
+behind a *write* scope — is reported on the row or the pane instead of across the organization's
+rows; every write goes out on `Service`'s single-flight `actionProcess` via `_startAction`, never
+through the queue; a site name reaching a *path* (the saved log's filename) goes
 through `Model.safeFileName`, which is the separator guard the other three don't cover; and
 `omarchy-notification-send --exec` takes a
 shell *string*, not an argv array — the shell runs it through `bash -lc` on click, so an address
