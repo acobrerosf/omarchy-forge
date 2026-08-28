@@ -15,7 +15,7 @@ Item {
   property real iconSize: Style.space(11)
   property color color: Color.foreground
   property color badgeColor: Color.urgent
-  // "none" | "busy" | "bad" | "warn"
+  // "none" | "busy" | "bad" | "warn" | "maintenance"
   property string badge: "none"
 
   implicitWidth: iconSize
@@ -44,6 +44,19 @@ Item {
   // The badge sits proud of the bottom-right corner, which is the emptiest
   // part of the mark, and carries a ring of background so it stays legible
   // where it overlaps the glyph.
+  //
+  // `maintenance` draws hollow, for the reason ForgeRow's `warn` dot does: the
+  // palette has no fourth colour that is distinct in every theme, so the fourth
+  // state is a shape. Kept the same here as there — same ring, same colour, the
+  // surface's foreground — so the bar and the rows under it speak one
+  // vocabulary. `badgeColor` is not it: the panel binds that to the accent, so
+  // a theme with a distinct one would ring the bar badge in a colour the row
+  // beneath it does not use.
+  //
+  // The hole is filled with background rather than left transparent. The badge
+  // is ~4px at the size the bar draws it, and the mark is all diagonals: a
+  // transparent 2px interior shows the glyph through it and the whole thing
+  // reads as a solid dot, which is the one state hollow has to be told from.
   Rectangle {
     visible: root.badge !== "none"
     anchors.right: parent.right
@@ -53,7 +66,14 @@ Item {
     width: Math.max(3, Math.round(root.iconSize * 0.36))
     height: width
     radius: width / 2
-    color: root.badgeColor
+    antialiasing: true
+    color: root.badge === "maintenance" ? Color.background : root.badgeColor
+    // A third of the diameter, but never so much of it that the hole closes up:
+    // at 5px a plain third would leave 1px of interior, which is less legible
+    // than the 4px badge it was meant to improve on.
+    border.width: root.badge === "maintenance"
+      ? Math.max(1, Math.min(Math.round(width / 3), Math.floor((width - 2) / 2))) : 0
+    border.color: root.badge === "maintenance" ? root.color : root.badgeColor
     opacity: root.badge === "busy" ? busyPulse.opacityValue : 1.0
 
     Rectangle {

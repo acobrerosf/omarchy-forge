@@ -30,13 +30,21 @@ Create the token at <https://forge.laravel.com/profile/api>. The scopes it needs
 | `server:view` | read servers, sites, and deployment status |
 | `site:manage-deploys` | deploy from the bar, **and** read deployment logs |
 | `server:manage-services` | restart nginx or PHP-FPM, reboot a server |
+| `site:manage-commands` | take a site in and out of maintenance mode |
 
-Leave both write scopes off and the widget is strictly read-only. Everything that would change
+Leave all three write scopes off and the widget is strictly read-only. Everything that would change
 something says so rather than failing quietly: the deploy key reports that the token isn't allowed
 to, a server action names the scope it wanted, and the deployment log reports that reading it needs
 one too. The log is genuinely gated behind the *write* scope — that is Forge's choice, not this
 plugin's — so a token deliberately kept read-only can watch every deployment fail and not be told
 why.
+
+`site:manage-commands` is worth a second look before you grant it. It is Forge's *run a command on
+the site* scope, and maintenance mode happens to live behind it — so a token that can park a site
+can also run arbitrary commands on it. That is Forge's grouping, not this plugin's, and the only
+thing the widget sends to that endpoint is the maintenance toggle. If that trade isn't worth one
+keystroke to you, leave it off: everything else still works, and the toggle says which scope it
+wanted.
 
 Tokens go into the login keyring via `secret-tool`, not into a config file. The widget never
 handles them: every request is made by the bundled `omarchy-forge` helper, which reads the token
@@ -94,9 +102,15 @@ being watched:
 | Badge | Meaning |
 |---|---|
 | none | every server is up and no deployment is failing |
+| hollow | a site is in maintenance mode, and nothing louder is happening |
 | pulsing | a deployment is running |
-| solid | a server is unreachable or revoked, or a deployment failed |
 | warning | no token yet, an account's token is missing, or the last request errored |
+| solid | a server is unreachable or revoked, or a deployment failed |
+
+A badge reports the worst thing it can see, in that order from the bottom up — so a failing deploy
+still shows through a site that is parked, and the hollow badge means "something is deliberately
+offline and nothing is broken". Hollow rather than a fifth colour because a colour that reads
+distinctly in every theme was not available; the rows use the same hollow dot for the same state.
 
 Each organization unfolds into its servers, and each server into its sites with the state of their
 latest deployment, the branch, and the commit. A server whose site starts failing unfolds itself,
@@ -106,8 +120,24 @@ A site opens into a view of its own: what you can do to it, and what the API alr
 
 | | |
 |---|---|
-| **Actions** | deploy, read the deployment log, open the site, open it in Forge, copy its ssh command. One that can't run says why rather than going missing — a site with no repository, or one that has never deployed |
+| **Actions** | deploy, toggle maintenance mode, read the deployment log, open the site, open it in Forge, copy its ssh command. One that can't run says why rather than going missing — a site with no repository, or one that has never deployed |
 | **Details** | PHP version, app type, status, maintenance mode, isolation, zero-downtime, how many releases it keeps, aliases, healthcheck. All of it arrives in the refresh the panel already pays for, so the view costs no request |
+
+**Maintenance mode** takes the site offline for everyone visiting it — Forge puts the application
+behind a 503 — and brings it back on the same two presses. The row names which way it is about to
+go, and arming it says so again in full before the second press. It needs `site:manage-commands`;
+without it the toggle still sends, and the refusal comes back on the row itself naming the scope it
+wanted rather than across everything being watched.
+
+Because Forge does the work out on the server, the answer is "requested", not "done". The site row
+says `enabling…` or `disabling…` while that is happening, and settles to `maintenance` with a
+hollow dot once it has landed — so a site that is deliberately offline is visible from the bar
+without opening anything. A running or failed deployment still takes the row back: a site that is
+both parked and broken is worth knowing about as broken.
+
+The toggle is offered on every site, not just the ones where it will work. Forge's own refusal for
+a site with no Laravel installation is a better answer than a guess from the app type, which would
+wrongly rule out Statamic and Craft.
 
 **Deployment log** opens the output of the latest deploy, ANSI stripped, scrolled to the bottom —
 which is where the answer is when something failed. It is fetched when asked for and never

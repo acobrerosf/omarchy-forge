@@ -81,10 +81,14 @@ decision in a file header. A few couplings from it are worth repeating here beca
 silently: `Model.parseEnvelope`/`envelopeError` expect the exact envelope shape;
 `Service._isMissingToken` matches the literal prefix `"No API token"` produced by `api_request`
 (don't reword that message without changing both); `_applyEnvelope`'s `quiet` flag exists so a
-403 on a request that belongs to a keypress — the deploy log's, a server action's, both gated
-behind a *write* scope — is reported on the row or the pane instead of across the organization's
-rows; every write goes out on `Service`'s single-flight `actionProcess` via `_startAction`, never
-through the queue; a site name reaching a *path* (the saved log's filename) goes
+403 on a request that belongs to a keypress — the deploy log's, a server action's, a maintenance
+toggle's, all gated behind a *write* scope — is reported on the row or the pane instead of across
+the organization's rows, and for a write it is the job's `scopeMessage` that decides both the
+wording and the quiet; every write goes out on `Service`'s single-flight `actionProcess` via
+`_startAction`, never through the queue, carrying its own method (POST is only the default) and
+— where its meaning depends on live state, as the maintenance toggle's does — an `armIntent` in
+its arm key, so a refresh landing mid-arm invalidates it instead of retargeting it; a site name
+reaching a *path* (the saved log's filename) goes
 through `Model.safeFileName`, which is the separator guard the other three don't cover; and
 `omarchy-notification-send --exec` takes a
 shell *string*, not an argv array — the shell runs it through `bash -lc` on click, so an address

@@ -25,7 +25,8 @@ Rectangle {
   property string status: ""
   property string timeText: ""
 
-  // "bad" | "busy" | "ok" | "idle"
+  // "bad" | "busy" | "warn" | "ok" | "idle". `warn` is drawn as a ring rather
+  // than a fill — see the dot below.
   property string tone: "idle"
 
   // How far under its parent this row sits, in steps rather than pixels.
@@ -76,6 +77,10 @@ Rectangle {
     case "bad": return root.badColor
     case "busy": return root.busyColor
     case "ok": return root.okColor
+    // Drawn as a ring rather than a fill, but the colour still comes out of
+    // this switch — so the vocabulary is complete and the dot below has one
+    // place to ask, whichever shape it is about to draw.
+    case "warn": return root.foreground
     }
     return root.dimColor
   }
@@ -110,6 +115,12 @@ Rectangle {
     anchors.rightMargin: Style.space(8)
     spacing: Style.space(8)
 
+    // A fourth tone had nowhere to go in the palette: `Color` offers exactly
+    // five values, `busyColor` and `okColor` are already the same one in a
+    // theme that sets no accent, and `muted` falls back to the foreground the
+    // dim colour is derived from. So `warn` is distinguished by shape — a ring
+    // where every other tone is a disc — which is the same move the busy pulse
+    // makes, and is legible in every theme rather than most of them.
     Rectangle {
       id: dot
       anchors.verticalCenter: parent.verticalCenter
@@ -117,7 +128,12 @@ Rectangle {
       width: root.showDot ? Style.space(6) : 0
       height: Style.space(6)
       radius: width / 2
-      color: root.toneColor
+      antialiasing: true
+      color: root.tone === "warn" ? "transparent" : root.toneColor
+      // Proportional, not a hairline: `Style.space` tracks the configured font
+      // size, so a fixed 1px ring reads as a smudge on a large bar.
+      border.width: root.tone === "warn" ? Math.max(1, Math.round(width / 3)) : 0
+      border.color: root.toneColor
       opacity: root.tone === "idle" ? 0.4 : 1.0
 
       SequentialAnimation on opacity {

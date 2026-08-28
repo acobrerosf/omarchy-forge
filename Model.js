@@ -209,7 +209,12 @@ function sitesFrom(body) {
       deploymentRetention: Number(a.deployment_retention || 0),
       healthcheckUrl: a.healthcheck_url ? String(a.healthcheck_url) : "",
       aliases: Array.isArray(a.aliases) ? a.aliases.map(String) : [],
-      maintenance: maintenance.enabled === true
+      maintenance: maintenance.enabled === true,
+      // Forge does the flip out on the box, so `enabled` stays put for a few
+      // seconds after a toggle is accepted and `status` is the only thing that
+      // moves. Keeping it is what lets a row report the flip instead of
+      // looking unchanged until the next sweep: "enabling" | "disabling".
+      maintenanceStatus: maintenance.status ? String(maintenance.status) : ""
     })
   }
   return out
@@ -354,15 +359,59 @@ function canDeploy(site) {
 // the view teaches the accelerator rather than hiding it. An unavailable
 // action is still listed — a missing "Deployment log" would read as a bug,
 // where one that says "never deployed" answers the question. `armable` marks
-// the one that writes: it is what `rowView` hangs the arm key on, and four of
-// these five change nothing on a server.
-function siteActions(site) {
+// the two that write: it is what `rowView` hangs the arm key on, and four of
+// these six change nothing on a server.
+//
+// Takes the org because the maintenance toggle sends somewhere, and a path
+// cannot be built without it — the same reason `serverActions` takes one.
+function siteActions(org, site) {
   var deployable = canDeploy(site)
   var deployed = !!(site && site.deploymentId)
   var url = site ? externalUrl(site.url) : ""
+  // The subject can be gone from the API — see the panel's `actionRows`. Every
+  // predicate here answers for that rather than reaching into nothing.
+  var parked = !!(site && site.maintenance)
+  var moving = site ? String(site.maintenanceStatus) : ""
   return [
     { id: "deploy", label: "Deploy", hint: "d", armable: true,
+      // The arm belongs to the *site*, not to this row: the tree's row for the
+      // same site reports the same deploy and has to light up with it.
+      armsSubject: true,
       available: deployable, reason: deployable ? "" : "no repository" },
+    // Takes the site offline for everyone who visits it, and brings it back on
+    // the same two presses — so the deploy's confirm is the right weight, and
+    // the reboot's `Y` would be miscalibrated for something this reversible.
+    //
+    // `armIntent` rides into the arm key. The label and the method here are
+    // derived from live state, and this list is rebuilt on every refresh, so a
+    // sweep landing inside the arm window would otherwise turn a "press again
+    // to take the site offline" into a DELETE. Folding the intent into the key
+    // means the flip invalidates the arm instead of silently retargeting it.
+    { id: "maintenance", hint: "",
+      label: parked ? "Disable maintenance mode" : "Enable maintenance mode",
+      armable: true, confirm: "again", armIntent: parked ? "off" : "on",
+      // Forge is out on the box doing the flip; pressing again until it lands
+      // would only race it.
+      available: !!site && moving === "",
+      reason: !site ? "not listed" : moving ? moving + " now" : "",
+      armedText: parked ? "press again to bring the site back"
+                        : "press again to take the site offline",
+      done: parked ? "Maintenance mode off — requested"
+                   : "Maintenance mode on — requested",
+      method: parked ? "DELETE" : "POST",
+      scopeMessage: "Your token can't change maintenance mode — that needs "
+        + "the site:manage-commands scope",
+      // What changed rides the *sites* payload rather than the server list, and
+      // `enabled` does not move until Forge has finished out on the box — so
+      // one look is not enough to see the flip land. See `Service._armSettle`.
+      refetch: "sites", settleSites: true,
+      path: site ? maintenancePath(org, site.serverId, site.id) : "",
+      // `status` is the only field Forge requires, and 503 is the one value in
+      // its enum that means "come back later". `secret` and `redirect` are the
+      // other two it accepts and both stay out: they are free text, and what
+      // rides the argv `_startAction` builds is a fixed word decided here, not
+      // something a user typed.
+      body: parked ? null : { status: 503 } },
     { id: "log", label: "Deployment log", hint: "",
       available: deployed, reason: deployed ? "" : "never deployed" },
     { id: "open", label: "Open site", hint: "o",
@@ -411,12 +460,18 @@ function serverActions(org, server) {
   var ssh = sshCommand(server)
   var id = server ? server.id : ""
   var suffix = php ? " (" + php + ")" : ""
+  // All four writes here go out on the one scope, so the refusal is written
+  // once. It rides the action rather than the service because it is the wording
+  // for *this* endpoint, and the wrapper that sends it is shared.
+  var scopeMessage = "Your token can't manage servers — that needs "
+    + "the server:manage-services scope"
   return [
     { id: "nginx-restart", label: "Restart nginx", hint: "",
       available: ready, reason: ready ? "" : stateReason,
       armable: true, confirm: "again",
       armedText: "press again to restart nginx",
       done: "nginx restart requested",
+      scopeMessage: scopeMessage,
       path: serviceActionPath(org, id, "nginx"),
       body: { action: "reboot" } },
     { id: "php-reload", label: "Reload PHP-FPM" + suffix, hint: "",
@@ -424,6 +479,7 @@ function serverActions(org, server) {
       armable: true, confirm: "again",
       armedText: "press again to reload PHP-FPM",
       done: "PHP-FPM reload requested",
+      scopeMessage: scopeMessage,
       path: serviceActionPath(org, id, "php"),
       body: { action: "reload", version: php } },
     { id: "php-restart", label: "Restart PHP-FPM" + suffix, hint: "",
@@ -431,16 +487,21 @@ function serverActions(org, server) {
       armable: true, confirm: "again",
       armedText: "press again to restart PHP-FPM",
       done: "PHP-FPM restart requested",
+      scopeMessage: scopeMessage,
       path: serviceActionPath(org, id, "php"),
       body: { action: "reboot", version: php } },
     // The one row here that takes every site on the server down with it, so it
     // is confirmed by a key nothing else in the panel uses and no movement key
-    // could reach. See the panel's `runServerAction`.
+    // could reach. See the panel's `runWriteAction`.
     { id: "reboot", label: "Reboot server", hint: "",
       available: rebootable, reason: rebootable ? "" : stateReason,
       armable: true, confirm: "Y",
       armedText: "press Y to reboot",
       done: "Reboot requested",
+      scopeMessage: scopeMessage,
+      // A restarted service changes nothing this widget draws. A rebooting
+      // server changes its own state, and that arrives with the server list.
+      refetch: "org",
       path: serverActionPath(org, id),
       body: { action: "reboot" } },
     { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
@@ -461,7 +522,10 @@ function siteDetails(site) {
   add("PHP", site.phpVersion)
   add("Type", site.appType)
   add("Status", site.siteStatus)
-  if (site.maintenance) add("Maintenance", "on")
+  // "enabling"/"disabling" while Forge is still working on the flip, so the
+  // block says which way it is going rather than lagging a refresh behind.
+  if (site.maintenanceStatus) add("Maintenance", site.maintenanceStatus)
+  else if (site.maintenance) add("Maintenance", "on")
   if (site.isolated) add("Isolation", "isolated user")
   if (site.zeroDowntime) add("Deploys", "zero downtime")
   if (site.usesEnvoyer) add("Deploys", "via Envoyer")
@@ -492,6 +556,51 @@ function deploymentTone(status) {
     return "ok"
   }
   return "idle"
+}
+
+// Which fact a site reports — its deployment's, unless maintenance mode
+// outranks it. A running or failed deploy still wins: those are the transient
+// thing you opened the panel to look at, and a site that is both parked and
+// broken is worth knowing about as broken.
+//
+// The precedence is spelled out here and nowhere else; `siteTone` and
+// `siteStatus` are both thin readers of it. The two maintenance verdicts are
+// named rather than toned because the tone alone could not tell `siteStatus`
+// which words to use: a flip Forge is still working on pulses exactly like a
+// deploy does, and one it has finished is a settled state of its own.
+function _siteFact(site) {
+  if (!site) return "idle"
+  var tone = deploymentTone(site.deploymentStatus)
+  if (tone === "busy" || tone === "bad") return tone
+  if (site.maintenanceStatus) return "flip"
+  if (site.maintenance) return "parked"
+  return tone
+}
+
+// What a site reports and in what tone. Both halves come back together because
+// they have to agree, and everything that draws a site asks here — the row and
+// the panel's hero — rather than each spelling the precedence out again.
+//
+// `timed` says whether the label is the *deployment's*, which is the only one
+// the deployment's timestamp belongs beside: "maintenance · 2h ago" would date
+// the wrong fact. See the panel's `siteDetailLine`.
+function siteStatus(site) {
+  var fact = _siteFact(site)
+  if (fact === "flip")
+    return { label: String(site.maintenanceStatus) + "…", tone: "busy", timed: false }
+  if (fact === "parked") return { label: "maintenance", tone: "warn", timed: false }
+  return { label: site ? deploymentLabel(site.deploymentStatus) : "",
+           tone: fact, timed: !!site }
+}
+
+// The tone alone, for the two callers that colour something without labelling
+// it — the service's aggregate health and the panel's hero badge. It reads the
+// fact directly rather than `siteStatus().tone` because those two walk every
+// site of an organization on every sweep page, and the label they would throw
+// away costs a lowercase, a regex and an object each time.
+function siteTone(site) {
+  var fact = _siteFact(site)
+  return fact === "flip" ? "busy" : fact === "parked" ? "warn" : fact
 }
 
 function serverTone(state) {
@@ -543,7 +652,8 @@ function rowView(row, ctx) {
     var health = String(c.orgHealth || "setup")
     var tone = health === "bad" || health === "error" ? "bad"
       : health === "setup" ? "idle"
-      : health === "busy" ? "busy" : "ok"
+      : health === "busy" ? "busy"
+      : health === "maintenance" ? "warn" : "ok"
     // The slug is what the dashboard URL uses, so it is worth showing when the
     // name differs from it.
     var slug = String(row.org)
@@ -594,12 +704,13 @@ function rowView(row, ctx) {
     var parts = []
     if (site && site.branch) parts.push(site.branch)
     if (site && site.commitHash) parts.push(site.commitHash)
+    var reported = siteStatus(site)
     return {
       kind: kind,
       label: site ? String(site.name) : "",
       detail: parts.join(" · "),
-      status: site ? deploymentLabel(site.deploymentStatus) : "",
-      tone: site ? deploymentTone(site.deploymentStatus) : "idle",
+      status: reported.label,
+      tone: reported.tone,
       // Servers sit under their organization when there is one to sit under,
       // and sites under their server either way.
       depth: (c.showOrgHeaders ? 1 : 0) + 1,
@@ -835,9 +946,23 @@ function serverSitesPath(org, serverId, cursor) {
     + "/sites?include=server,latestDeployment", cursor)
 }
 
-function deployPath(org, serverId, siteId) {
+// Everything addressed to one site hangs off this, so the three segments are
+// encoded in one place rather than once per endpoint.
+function sitePath(org, serverId, siteId) {
   return "/orgs/" + encode(org) + "/servers/" + encode(serverId)
-    + "/sites/" + encode(siteId) + "/deployments"
+    + "/sites/" + encode(siteId)
+}
+
+function deployPath(org, serverId, siteId) {
+  return sitePath(org, serverId, siteId) + "/deployments"
+}
+
+// Maintenance mode is an *integration* in Forge's model: POST installs it,
+// DELETE removes it. Both are gated behind `site:manage-commands` — the same
+// scope that runs arbitrary commands on the site — so the service reports their
+// 403 on the row rather than across the organization.
+function maintenancePath(org, serverId, siteId) {
+  return sitePath(org, serverId, siteId) + "/integrations/laravel-maintenance"
 }
 
 // A write against the server itself, and one against a service running on it.

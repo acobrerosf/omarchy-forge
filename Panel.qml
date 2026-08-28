@@ -233,19 +233,28 @@ Panel {
     var out = []
     var forSite = routeKind === "site"
     if (!forSite && routeKind !== "server") return out
-    var actions = forSite ? Model.siteActions(routeSite)
+    var actions = forSite ? Model.siteActions(route.org, routeSite)
                           : Model.serverActions(route.org, routeServer)
     var prefix = route.org + "/" + (forSite ? route.siteId : route.serverId) + "/"
+    var subjectKey = forSite && routeSite ? String(routeSite.key) : ""
     for (var i = 0; i < actions.length; i++)
       out.push({ kind: "action", org: route.org, serverId: route.serverId,
                  siteId: forSite ? route.siteId : "", action: actions[i],
-                 // What the arm and the send are reported on. A site's is the
-                 // site's own key, because the tree's row for it has to light
-                 // up with the deploy; a server's is the row's, because two of
-                 // its rows send to the same endpoint and only the one that was
-                 // pressed should say so.
-                 armKey: forSite ? (routeSite ? String(routeSite.key) : "")
-                                 : prefix + actions[i].id,
+                 // What the arm and the send are reported on, and the action
+                 // says which it wants. Deploy asks for the subject's key,
+                 // because the tree's row for that site reports the same deploy
+                 // and has to light up with it; everything else takes its own
+                 // row's, because rows can send to the same endpoint and only
+                 // the one that was pressed should say so.
+                 //
+                 // `armIntent` is folded in where an action has one. This list
+                 // is rebuilt on every refresh, and the maintenance row's label
+                 // and method are derived from live state — so without it a
+                 // sweep landing inside the arm window would leave the arm
+                 // matching a row that now means the opposite thing.
+                 armKey: actions[i].armsSubject ? subjectKey
+                   : prefix + actions[i].id
+                     + (actions[i].armIntent ? "/" + actions[i].armIntent : ""),
                  key: prefix + actions[i].id })
     return out
   }
@@ -458,18 +467,28 @@ Panel {
     return parts.join(" · ")
   }
 
+  // The same rule the row under it draws by, so the hero's words and its badge
+  // cannot say different things about one site.
+  //
+  // The timestamp is the *deployment's*, so it is only appended to a label that
+  // is also the deployment's — `timed` says which. Joining it to "maintenance"
+  // would date the wrong fact: a site parked a moment ago would read
+  // "maintenance · 2h ago". The tree row is left alone, where the two sit on
+  // separate lines rather than in one phrase.
   function siteDetailLine(site) {
-    var label = Model.deploymentLabel(site.deploymentStatus)
-    var when = site.deployedAt ? Model.relativeTime(site.deployedAt, nowMs) : ""
-    return when === "" ? label : label + " · " + when
+    var reported = Model.siteStatus(site)
+    var when = reported.timed && site.deployedAt
+      ? Model.relativeTime(site.deployedAt, nowMs) : ""
+    return when === "" ? reported.label : reported.label + " · " + when
   }
 
   // The badge follows whatever the hero is about, so in a site view it reports
   // that site rather than the health of everything being watched.
   readonly property string heroTone: {
     if (routeSite) {
-      var tone = Model.deploymentTone(routeSite.deploymentStatus)
-      return tone === "bad" ? "bad" : tone === "busy" ? "busy" : "none"
+      var tone = Model.siteTone(routeSite)
+      return tone === "bad" ? "bad" : tone === "busy" ? "busy"
+        : tone === "warn" ? "maintenance" : "none"
     }
     if (routeKind === "server") {
       var serverTone = routeServer ? Model.serverTone(routeServer.state) : "idle"
@@ -477,6 +496,7 @@ Panel {
     }
     return health === "bad" ? "bad"
       : health === "busy" ? "busy"
+      : health === "maintenance" ? "maintenance"
       : (health === "setup" || health === "error") ? "warn" : "none"
   }
 
@@ -535,10 +555,11 @@ Panel {
     case "open": openCurrent(); break
     case "forge": openCurrentInForge(); break
     case "ssh": copyCurrentSsh(); break
+    case "maintenance":
     case "nginx-restart":
     case "php-reload":
     case "php-restart":
-    case "reboot": runServerAction(row); break
+    case "reboot": runWriteAction(row); break
     }
   }
 
@@ -556,11 +577,17 @@ Panel {
     forge.deploy(currentOrg(), site)
   }
 
-  // The two confirms. A service restart takes the deploy's two presses. A
-  // reboot takes a key of its own: enter is one row away from enter on
-  // something harmless, and no key a mistyped movement could land on should
-  // ever be the last press before a server goes down.
-  function runServerAction(row) {
+  // The two confirms. A service restart and a maintenance toggle take the
+  // deploy's two presses. A reboot takes a key of its own: enter is one row
+  // away from enter on something harmless, and no key a mistyped movement could
+  // land on should ever be the last press before a server goes down.
+  function runWriteAction(row) {
+    // `""` is also the disarmed state, so a row with no arm key would match on
+    // its *first* press and send without a confirm. Nothing produces one today
+    // — `runAction`'s availability check is what answers the user for a subject
+    // that has gone from the API, and it blocks the one row that could — but
+    // the two-press guarantee should not rest on that staying true.
+    if (String(row.armKey) === "") return
     if (armedKey !== row.armKey) {
       arm(row.armKey, String(row.action.confirm || "again"))
       return
@@ -568,7 +595,7 @@ Panel {
     // A second enter on a Y-confirm disarms rather than sends: pressing the
     // same key twice is exactly the mistake the extra key is there to catch.
     if (armedConfirm === "Y") { disarm(); return }
-    sendServerAction(row)
+    sendWriteAction(row)
   }
 
   // `Y`, and only for the row that asked for it. The cursor cannot have moved
@@ -577,14 +604,17 @@ Panel {
     var row = currentRow()
     if (!row || armedConfirm !== "Y" || armedKey === "") return
     if (row.armKey !== armedKey) return
-    sendServerAction(row)
+    sendWriteAction(row)
   }
 
-  function sendServerAction(row) {
+  // The action carries everything that differs between one write and another —
+  // where it goes, how, what to re-read — so this hands the whole entry over
+  // rather than sorting it by subject first.
+  function sendWriteAction(row) {
     disarm()
     if (!forge) return
     actionRequestedKey = row.armKey
-    forge.serverAction(row.org, row.serverId, row.action, row.armKey)
+    forge.sendAction(row.org, row.serverId, row.action, row.armKey)
   }
 
   function arm(key, confirm) {
@@ -837,6 +867,9 @@ Panel {
             case "error": return "warn"
             case "setup": return "warn"
             case "busy": return "busy"
+            // Its own value rather than `warn`, which is spoken for by the two
+            // above: the icon draws this one hollow, the way the rows do.
+            case "maintenance": return "maintenance"
             }
             return "none"
           }
@@ -1016,6 +1049,7 @@ Panel {
                 badgeColor: root.heroTone === "busy" ? root.busyColor : root.urgent
                 badge: root.heroTone === "bad" ? "bad"
                      : root.heroTone === "busy" ? "busy"
+                     : root.heroTone === "maintenance" ? "maintenance"
                      : root.heroTone === "warn" ? "warn" : "none"
               }
             }

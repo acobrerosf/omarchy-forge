@@ -294,22 +294,29 @@ Item {
     if (state.lastError !== "") return "error"
     for (var i = 0; i < state.servers.length; i++)
       if (Model.serverTone(state.servers[i].state) === "bad") return "bad"
+    // Both accumulate rather than returning, for the reason `busy` already
+    // did: a site in maintenance three rows up must not hide a failing deploy
+    // further down the list from the bar icon.
     var busy = false
+    var maintenance = false
     var all = allSites(key)
     for (var j = 0; j < all.length; j++) {
-      var tone = Model.deploymentTone(all[j].deploymentStatus)
+      var tone = Model.siteTone(all[j])
       if (tone === "bad") return "bad"
       if (tone === "busy") busy = true
+      if (tone === "warn") maintenance = true
     }
-    return busy ? "busy" : "ok"
+    return busy ? "busy" : maintenance ? "maintenance" : "ok"
   }
 
   function _healthRank(health) {
     switch (health) {
-    case "bad": return 4
-    case "error": return 3
-    case "setup": return 2
-    case "busy": return 1
+    case "bad": return 5
+    case "error": return 4
+    case "setup": return 3
+    case "busy": return 2
+    // Below busy: deliberate, and not a thing that has gone wrong.
+    case "maintenance": return 1
     }
     return 0
   }
@@ -1081,32 +1088,52 @@ Item {
     // action word built in `Model`, not a credential, and the rule the stdin
     // config exists for is about the one thing that must never appear in a
     // command line. The helper moves it onto that config for curl's sake.
-    actionProcess.command = [cliPath, "api", "--account", account, "POST", job.path]
+    //
+    // The method rides the job too. Everything here was a POST until removing
+    // a site's maintenance mode turned out to be a DELETE; the helper passes
+    // whatever it is straight to curl, so this is the only place that knew.
+    actionProcess.command = [cliPath, "api", "--account", account,
+                             String(job.method || "POST"), job.path]
       .concat(job.body ? [JSON.stringify(job.body)] : [])
     actionProcess.running = true
   }
 
+  // A deploy's 403 is the only one left loud, so it carries no `scopeMessage`:
+  // it goes out on the same token and the same scope every sweep already needs,
+  // which makes a refusal the organization's business rather than this row's.
   function deploy(org, site) {
     if (!site || String(org) === "") return
     if (!Model.canDeploy(site)) return
-    _startAction({ kind: "deploy", org: String(org), serverId: String(site.serverId),
+    _startAction({ org: String(org), serverId: String(site.serverId),
                    key: String(site.key), body: null,
                    path: Model.deployPath(org, site.serverId, site.id),
-                   done: "Deployment queued" })
+                   done: "Deployment queued", refetchSites: true })
   }
 
-  // `action` is a `Model.serverActions` entry, so the path and the body were
-  // built beside the label that describes them rather than assembled here out
-  // of whatever the panel happened to pass. `key` is the row's, not the
-  // server's: two of those rows send to the same endpoint, and only the one
-  // that was pressed should say so.
-  function serverAction(org, serverId, action, key) {
+  // Every other write, whatever its subject. `action` is a `Model.serverActions`
+  // or `Model.siteActions` entry, so everything that varies — the path, the
+  // body, the method, the 403 wording, what to re-read afterwards — was
+  // declared beside the label that describes it rather than assembled here out
+  // of whatever the panel happened to pass. That is what keeps this one
+  // function rather than one per subject: the next write to be added is an
+  // entry in `Model`, not a fourth near-duplicate wrapper.
+  //
+  // `key` is the row's, not the subject's: rows can send to the same endpoint,
+  // and only the one that was pressed should say so.
+  function sendAction(org, serverId, action, key) {
     if (!action || !action.path || String(org) === "") return
-    _startAction({ kind: "server", org: String(org), serverId: String(serverId),
+    var refetch = String(action.refetch || "")
+    _startAction({ org: String(org), serverId: String(serverId),
                    key: String(key), path: String(action.path),
+                   // POST is only the default: turning maintenance mode off is
+                   // a DELETE, and the helper passes whatever this is to curl.
+                   method: String(action.method || "POST"),
                    body: action.body || null,
                    done: String(action.done || "Sent"),
-                   reboot: String(action.id) === "reboot" })
+                   scopeMessage: String(action.scopeMessage || ""),
+                   settleSites: action.settleSites === true,
+                   refetchSites: refetch === "sites",
+                   refetchOrg: refetch === "org" })
   }
 
   function _onAction(text) {
@@ -1116,16 +1143,17 @@ Item {
     busyActionKey = ""
     if (!job) return
 
-    var deploying = job.kind === "deploy"
-    // A deploy's refusal is the organization's business: it is the same token
-    // and the same scope every sweep already uses. A server action's is not.
-    // Forge gates those behind `server:manage-services`, which a deliberately
-    // read-only token does not have, so left loud one keypress would paint a
-    // scope error across rows that are perfectly healthy — the reason `_onLog`
-    // is quiet, for the same kind of request.
-    if (!_applyEnvelope(job.org, job.account, envelope, !deploying)) {
-      var message = !deploying && envelope.status === 403
-        ? "Your token can't manage servers — that needs the server:manage-services scope"
+    // Which refusals are the organization's business and which are this row's
+    // is carried by the job rather than decided here. A deploy carries no
+    // `scopeMessage`, so it stays loud: it uses the same token and the same
+    // scope every sweep already needs. The rest are gated behind write scopes a
+    // deliberately read-only token does not have, and left loud one keypress
+    // would paint a scope error across rows that are perfectly healthy — the
+    // reason `_onLog` is quiet, for the same kind of request.
+    var quiet = !!job.scopeMessage
+    if (!_applyEnvelope(job.org, job.account, envelope, quiet)) {
+      var message = quiet && envelope.status === 403
+        ? job.scopeMessage
         : Model.envelopeError(envelope)
       actionFinished(job.key, false, message)
       return
@@ -1137,18 +1165,67 @@ Item {
     // answers 202 — so what changed only shows a moment later. Look again
     // shortly rather than making the user wait out a whole refresh interval.
     if (!orgs[job.org]) return
-    if (deploying) {
-      // And look at the deployed server directly: under rotation the re-poll
-      // only advances the window, which for a large organization will usually
-      // be looking somewhere else entirely.
-      _patch(job.org, { nextDueMs: Date.now() + 6000 })
-      fetchServerSites(job.org, job.serverId, true)
-    } else if (job.reboot) {
-      // A restarted service changes nothing this widget draws. A rebooting
-      // server changes its own state, and that arrives with the server list,
-      // so the org's own refresh is the one worth pulling forward.
-      _patch(job.org, { nextDueMs: Date.now() + 6000 })
+    if (!job.refetchSites && !job.refetchOrg) return
+    _patch(job.org, { nextDueMs: Date.now() + 6000 })
+    // A server's own state arrives with the server list, so pulling the org's
+    // refresh forward is all a reboot needs. What a deploy or a maintenance
+    // toggle changed rides the *sites* payload, so look at that server
+    // directly: under rotation the re-poll only advances the window, which for
+    // a large organization will usually be looking somewhere else entirely.
+    if (!job.refetchSites) return
+    fetchServerSites(job.org, job.serverId, true)
+    if (job.settleSites) _armSettle(job.org, job.serverId)
+  }
+
+  // ---------------------------------------------------------------- settling
+
+  // A deploy flips `deployment_status` the moment Forge queues it, so the
+  // re-read above sees the change. A maintenance flip does not: Forge is out on
+  // the box, `maintenance_mode.enabled` stays put, and the re-read is therefore
+  // *guaranteed* to observe the transitional `status`. Nothing else is coming
+  // for it either — the pulled-forward tick only advances the site rotation by
+  // one window, which past 150 sites is usually a different server — so the row
+  // would pulse `enabling…` until the rotation came back around, with the
+  // toggle refusing every press while it did.
+  //
+  // Hence a bounded second look, for the jobs that ask for one. It stops as
+  // soon as the flip has landed, so a settled toggle costs nothing extra, and
+  // it gives up after two rather than polling: a flip that has not landed in
+  // 16s is the ordinary refresh's problem, not this keypress's.
+  property var _settle: null
+
+  function _armSettle(org, serverId) {
+    _settle = { org: String(org), serverId: String(serverId), left: 2 }
+    settleTimer.restart()
+  }
+
+  function _serverIsFlipping(org, serverId) {
+    var state = orgs[String(org)]
+    if (!state) return false
+    var sites = state.sitesByServer[String(serverId)]
+    if (!sites) return false
+    for (var i = 0; i < sites.length; i++)
+      if (String(sites[i].maintenanceStatus) !== "") return true
+    return false
+  }
+
+  function _onSettleTick() {
+    var job = _settle
+    if (!job) { settleTimer.stop(); return }
+    // Nothing on that server is still moving, so there is nothing left to look
+    // for — whether this tick's predecessor found it or the ordinary sweep did.
+    if (!_serverIsFlipping(job.org, job.serverId)) {
+      _settle = null
+      settleTimer.stop()
+      return
     }
+    // Reassigned rather than counted down in place, for the reason `_patch`
+    // exists — this one has nothing bound to it, but the rule is cheaper to
+    // keep than to reason about per property.
+    var left = job.left - 1
+    _settle = left > 0 ? { org: job.org, serverId: job.serverId, left: left } : null
+    if (left <= 0) settleTimer.stop()
+    fetchServerSites(job.org, job.serverId, true)
   }
 
   // ---------------------------------------------------------------- actions
@@ -1253,6 +1330,16 @@ Item {
       if (!state || state.refreshing || now < state.nextDueMs) continue
       refresh(org)
     }
+  }
+
+  // Not folded into the ticker above: this one runs only in the seconds after a
+  // write that asked for it, and its interval is chosen to outlast a flip
+  // rather than to pace a refresh. See `_armSettle`.
+  Timer {
+    id: settleTimer
+    interval: 8000
+    repeat: true
+    onTriggered: root._onSettleTick()
   }
 
   // A hung helper would otherwise pin the queue forever, since every start is

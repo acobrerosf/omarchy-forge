@@ -520,8 +520,9 @@ cmd_add() {
     cat <<'EOF'
 Create a token at https://forge.laravel.com/profile/api
 
-Scopes: read access to servers and sites is enough to watch them. Add the
-deployment scope only if you want to trigger deploys from the bar.
+Scopes: read access to servers and sites is enough to watch them. The write
+scopes are opt-in, one per thing the bar can do — deploy, restart a service,
+toggle maintenance mode. README.md lists them and what each one costs.
 
 One token per Forge account. A token that can already see several
 organizations only needs adding once.

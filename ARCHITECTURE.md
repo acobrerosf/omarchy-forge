@@ -196,22 +196,61 @@ A refusal is always reported. `fetchServerSites` can return silently because the
 that server anyway; nothing comes along later to fill this pane in, so a hold, a ceiling, and the
 jobs a 429 drops out of the queue each answer the signal instead of vanishing.
 
-**Writes don't go through it.** A deploy, a service restart and a reboot all go out on
-`actionProcess`, which is single-flight: one press cannot become two requests, and the answer
-arrives at `_onAction` rather than in the middle of a sweep. What the queue would have done for
-them they do by hand — consult the hold, charge the budget — and `_startAction` is the one place
-that does it, so a second kind of write was a job object and a path, not a second code path.
+**Writes don't go through it.** A deploy, a service restart, a reboot and a maintenance toggle all
+go out on `actionProcess`, which is single-flight: one press cannot become two requests, and the
+answer arrives at `_onAction` rather than in the middle of a sweep. What the queue would have done
+for them they do by hand — consult the hold, charge the budget — and `_startAction` is the one
+place that does it, so each new kind of write was a job object and a path, not a second code path.
 
-Two of them differ from a deploy. The request carries a **body** (`{"action":"reboot"}`, and for
-PHP the pool's version, which the endpoint takes rather than infers). It reaches the helper as an
-argument — it is not a credential — and the helper hands it to curl down the same stdin config the
-token rides, not because it is a secret but because stdin is already spoken for there and a temp
-file would be a second thing to clean up. And the envelope is applied `quiet`, for the reason
-the deploy log's is: Forge gates these behind `server:manage-services`, so a deliberately
-read-only token is refused here, and left loud one keypress would paint a scope error across rows
-that are perfectly healthy. Forge answers all of them 202 — the work is asynchronous — so the flash
-says "requested", and a reboot pulls the organization's next refresh forward to where the changed
-state will show.
+The job carries everything that varies, and all of it is declared in `Model` beside the label that
+describes it — which is what leaves one wrapper rather than one per subject. `Service.sendAction`
+turns any `serverActions`/`siteActions` entry into a job; `Service.deploy` is separate only because
+it is reached from a key rather than from a row of that list:
+
+- a **body** (`{"action":"reboot"}`, the PHP pool's version, `{"status":503}` for maintenance). It
+  reaches the helper as an argument — it is not a credential — and the helper hands it to curl down
+  the same stdin config the token rides, not because it is a secret but because stdin is already
+  spoken for there and a temp file would be a second thing to clean up. Everything sent is decided
+  in `Model`; no user-typed string has ever reached that argv, which is why the maintenance
+  integration's optional `secret` and `redirect` are not offered.
+- a **method**. Everything was a POST until removing a site's maintenance mode turned out to be a
+  DELETE. `_startAction` defaults to POST and the helper passes whatever it is to `curl --request`,
+  so no other layer knows.
+- a **`scopeMessage`**, which decides both the 403 wording *and* whether the envelope is applied
+  `quiet` — a job that has one is quiet. Only a deploy has none, and so is the only write left
+  loud: it goes out on the same token and the same scope every sweep already needs, which makes a
+  refusal the organization's business. The rest are gated behind write scopes a read-only token
+  lacks (`server:manage-services`; `site:manage-commands` for maintenance, which is Forge's
+  *run a command* scope rather than a separate integrations one — `site:manage-integrations` is
+  declared in the spec's scope list, but no endpoint in it is gated behind that scope), and left
+  loud one keypress would paint a scope error across rows that are perfectly healthy.
+- **what to re-read**, as a `refetch` of `"org"` or `"sites"`. Forge answers all of them 202 — the
+  work is asynchronous — so the flash says "requested", not "done". `"org"` pulls the organization's
+  next refresh forward, which is all a reboot needs, since a server's state arrives with the server
+  list. `"sites"` also re-reads that one server's sites directly, because what a deploy or a
+  maintenance toggle changed rides the *sites* payload, and under rotation the pulled-forward sweep
+  will usually be looking elsewhere.
+
+Maintenance mode is the one where "requested" would have been a lie for several seconds: unlike a
+queued deploy, which flips `deployment_status` immediately, `maintenance_mode.enabled` does not
+move until Forge has finished out on the box. The payload's sibling `status` — `enabling` /
+`disabling` — is what the row reports in the meantime, so the re-read has something true to say
+rather than looking unchanged. `Model.sitesFrom` keeps it for that reason alone.
+
+That is also why the maintenance entry is the one that declares **`settleSites`**. The re-read
+`_onAction` fires goes out immediately, so for a flip it is *guaranteed* to observe the transitional
+`status` — and nothing else is coming for it, because the pulled-forward tick only advances the site
+rotation by one window, which past 150 sites is usually a different server. The toggle disables
+itself while the flip is moving, so without a second look the row would pulse `enabling…` and refuse
+every press until the rotation came back around. `Service._armSettle` gives it one: a timer that
+re-reads that server up to twice more at 8s, and stops the moment no site on it is still flipping.
+A settled toggle therefore costs nothing extra, and a flip that has not landed in 16s is handed back
+to the ordinary refresh rather than polled for.
+
+There is a `GET` on the same integration path, under the *read* scope, which would confirm a flip
+directly. It is deliberately unused: a read belongs in the queue rather than on `actionProcess`, so
+it would mean a new job kind and a new signal, and a second request per toggle charged against the
+budget — to learn what `status` already delivers free.
 
 **What `queue` is and isn't.** The `queue` object holds the pending list and nothing else — push,
 push-front, take, drop-by-org. The dispatch policy (`_pump`) stays on the service root, because it
@@ -284,6 +323,33 @@ branching on "is this an org, a server or a site" is readable in one place. It r
 a `depth`, never QML types: `Style.space()` and the tone→colour mapping belong to `ForgeRow.qml`,
 which owns the palette.
 
+A site's tone is `Model`'s to decide, not `rowView`'s: the row, the panel's hero and the service's
+aggregate health all draw the same site and would otherwise each spell out the precedence —
+maintenance mode outranks a settled deployment, a running or failed one outranks maintenance. That
+lives in `_siteFact`, and the two public readers are thin over it. `siteStatus` returns the label
+with the tone because the two have to agree; `siteTone` reads the fact directly rather than taking
+`siteStatus().tone`, because `healthFor` walks every site of an organization on every sweep page and
+the label it would throw away costs a lowercase, a regex and an object per site.
+
+`siteStatus` also reports **`timed`** — whether the label is the deployment's, and so whether the
+deployment's timestamp belongs beside it. The hero's `siteDetailLine` joins the two with a `·`, and
+"maintenance · 2h ago" would date the wrong fact. The tree row ignores it: there the status and the
+time sit on separate lines, and that column is the deployment's throughout.
+
+That tone vocabulary has four values, and the fourth is distinguished by **shape rather than
+colour**. `Color` exposes five values; `busyColor` and `okColor` are already the same one in a theme
+that sets no accent, and `muted` falls back to the foreground `dimColor` derives from. So `warn` is
+drawn as a ring where every other tone is a filled disc — the same move the busy pulse makes, and
+legible in every theme rather than most of them. `ForgeIcon`'s badge does the same for the same
+reason, so the bar and the rows under it speak one vocabulary; its ring is a separate badge value
+because `warn` there is spoken for by `setup` and `error`. Both rings are the surface's foreground,
+*not* the accent the panel binds to `badgeColor` — a theme with a distinct accent would otherwise
+ring the bar badge in a colour the row beneath it does not use. Both scale their border with the
+dot, since `Style.space` tracks the configured font size and a fixed hairline vanishes on a large
+bar; the badge additionally clamps its border so the hole cannot close up, and fills that hole with
+the background rather than leaving it transparent, because at the ~4px the bar draws it the mark's
+own diagonals show through and the ring reads as a disc.
+
 `ForgeRow.qml` follows the shell's own `notifications/components/NotificationCard.qml`: declared
 scalar properties in, signals out, no reference back to the panel or the service. Per-screen
 volatile state (cursor, armed, deploying, relative time) is bound directly on the delegate rather
@@ -342,11 +408,21 @@ its mouse area is larger than the glyph — a caption-sized mark is not a target
 
 A view's rows go through `Model.rowView` like every other row, as `kind: "action"`. Only an action
 that writes carries an `actionKey` — that is what `armedKey` and `busyActionKey` compare against,
-and handing it to `Open in Forge` as well would light up the whole list on one pending action. Its
-value differs by view, and has to: the site view arms on the *site's* key, because the tree's row
-for that site reports the same deploy and must light up with it; the server view arms on the
-*row's*, because two of its four rows post to the same endpoint and only the one that was pressed
-should say so.
+and handing it to `Open in Forge` as well would light up the whole list on one pending action.
+
+Its value differs by action, and has to. Deploy declares `armsSubject`, so it arms on the *site's*
+key: the tree's row for that site reports the same deploy and must light up with it. Everything
+else arms on its own row's, because rows can post to the same endpoint and only the one that was
+pressed should say so. This used to be a property of the *view* — every site action took the site's
+key — which held only while the site view had exactly one write in it. A second one would have
+armed in lockstep with the deploy and shown `sending…` beside it.
+
+An action whose meaning depends on live state also declares an **`armIntent`**, folded into the
+same key. `actionRows` is rebuilt on every refresh, and the maintenance row's label, method and
+body are all derived from `maintenance_mode`; without this, a sweep landing inside the four-second
+arm window would leave `armedKey` still matching a row that now means the opposite, and the second
+press would send a DELETE where a POST was armed. Putting the intent in the key makes the flip
+invalidate the arm instead of silently retargeting it — visibly, on the row, with no timer.
 
 **Two confirms, not one.** A deploy and a service restart take the same two presses. A reboot takes
 enter to arm and a capital `Y` to send, and every other key — a second enter, a lower-case `y` —

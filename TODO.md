@@ -9,21 +9,16 @@ Everything below was checked against the v2 OpenAPI spec
 
 ## Features
 
-### 4. Maintenance mode
-
-`Model.sitesFrom` now keeps `maintenance_mode.enabled` and the site view's
-DETAILS block says so when it is on. What is left is the row and the bar badge —
-a site in maintenance is worth seeing without opening it — and the toggle.
-
-Toggling is `POST`/`DELETE .../sites/{site}/integrations/laravel-maintenance`,
-scope `site:manage-integrations`. Splitting this in two is reasonable: show it
-now (free), toggle it later.
-
 ### 6. Run a site command
 
 `POST .../sites/{site}/commands` then `GET .../commands/{id}/output`, scope
-`site:manage-commands`. "Run `php artisan migrate` from the bar" is a genuinely
-useful thing to have during a deploy that half-failed.
+`site:manage-commands` — which maintenance mode already required, so this asks
+for no scope anyone using that toggle has not already granted. That removes the
+main argument for keeping it low: the cost is now the friction below, not a
+permission ask.
+
+"Run `php artisan migrate` from the bar" is a genuinely useful thing to have
+during a deploy that half-failed.
 
 This is arbitrary remote code execution, so it wants deliberate friction: a
 prompt rather than a keystroke, no history of one-key repeats, and a clear
@@ -59,7 +54,7 @@ don't, which is why it sits below the rest.
 
 `GET .../servers/{server}/monitors` (scope `server:view`) and the site
 `heartbeats` endpoints. Forge's own alerting, surfaced in the bar. Would need
-its own idea of what "unhealthy" means on top of the three tones we have, so
+its own idea of what "unhealthy" means on top of the four tones we have, so
 it is a bigger design question than it looks.
 
 ### 11. The rest of the services
