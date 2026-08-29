@@ -57,6 +57,27 @@ Item {
       + "/" + String(deploymentId)
   }
 
+  // A command run, on the same terms as the log and for the same reasons — one
+  // panel asked, and the output is a document rather than a property. Unlike
+  // the log it arrives more than once: the run is watched from `waiting`
+  // through to a terminal state, and every look answers here, so the pane can
+  // say what is happening rather than sitting on "fetching" for a minute.
+  //
+  // `running` is what separates "not finished yet" from "finished and printed
+  // nothing", which are the same empty string otherwise.
+  signal commandRunUpdated(string requestKey, bool ok, bool running,
+                           string commandId, string header, string text,
+                           string message)
+
+  // The send time rather than the command id, because the id is not known
+  // until the run has been found — see `Model.commandFrom`. It is the same
+  // moment the panel used to open the pane, so both sides can name the key
+  // without either having to hear it from the other.
+  function commandRequestKey(org, serverId, siteId, sentAtMs) {
+    return String(org) + "/" + String(serverId) + ":" + String(siteId)
+      + "@" + String(sentAtMs)
+  }
+
   readonly property string pluginDir: String(Qt.resolvedUrl("."))
     .replace(/^file:\/\//, "")
     .replace(/\/$/, "")
@@ -224,15 +245,30 @@ Item {
     }
     orgs = nextOrgs
 
-    queue.keepOrgs(merged)
+    // Work queued for an organization nobody watches any more is spend with no
+    // reader — but a pane may be waiting on it, so it is answered on the way
+    // out rather than dropped in silence.
+    queue.drop(function (job) {
+      if (merged[job.org] !== undefined) return false
+      _abandonJob(job)
+      return true
+    })
 
     _tick()
   }
 
-  function _shallowCopy(source) {
+  // The one copy loop. Everything here that a panel can reach is replaced
+  // rather than mutated — QML only notices a `var` property when it is assigned
+  // — so this is the shape most of the state changes in this file take.
+  function _merge(source, changes) {
     var out = ({})
     for (var key in source) out[key] = source[key]
+    for (var change in changes) out[change] = changes[change]
     return out
+  }
+
+  function _shallowCopy(source) {
+    return _merge(source, null)
   }
 
   // Panels bind to these, so state has to be replaced rather than mutated —
@@ -240,10 +276,8 @@ Item {
   function _patch(org, changes) {
     var current = orgs[org]
     if (!current) return
-    var updated = _shallowCopy(current)
-    for (var key in changes) updated[key] = changes[key]
     var next = _shallowCopy(orgs)
-    next[org] = updated
+    next[org] = _merge(current, changes)
     orgs = next
   }
 
@@ -475,12 +509,6 @@ Item {
       _jobs = kept
     }
 
-    // Work queued for an organization nobody watches any more is spend with no
-    // reader.
-    function keepOrgs(wanted) {
-      drop(function (job) { return wanted[job.org] === undefined })
-    }
-
     // Whether anything queued matches — the on-demand fetch's dedupe reads it.
     function contains(matches) {
       for (var i = 0; i < _jobs.length; i++)
@@ -502,6 +530,29 @@ Item {
   // well past that is stuck rather than slow.
   readonly property int requestTimeoutMs: 25000
 
+  // A queued job thrown away because the organization it belongs to stopped
+  // being watched. A sweep needs no farewell — the next tick is its answer —
+  // but a log and a command look each have a pane waiting on a signal that is
+  // no longer coming, and a pane left holding "queued…" forever is the same
+  // silence `_holdAccount` was taught not to leave behind. The run itself may
+  // well finish out on the box; there is simply nothing left here to watch it
+  // with, so the watch goes with the organization.
+  function _abandonJob(job) {
+    var message = "That organization is no longer being watched"
+    if (job.kind === "log") {
+      deploymentLogFetched(logRequestKey(job.org, job.serverId, job.siteId,
+                                         job.deploymentId), false, "", message)
+      return
+    }
+    if (!Model.isCommandJob(job)) return
+    if (_commandCurrent(job)) {
+      _commandWatch = null
+      commandTimer.stop()
+    }
+    commandRunUpdated(job.requestKey, false, false, String(job.commandId || ""),
+                      "", "", message)
+  }
+
   // One request at a time for the whole session, so two organizations coming
   // due together interleave rather than racing.
   function _pump() {
@@ -513,7 +564,7 @@ Item {
       // job is closing the refresh — including one whose sites request errored
       // and answered nothing.
       if (job.kind === "sweepDone") { _finishRefresh(job.org); continue }
-      if (!orgs[job.org]) continue
+      if (!orgs[job.org]) { _abandonJob(job); continue }
 
       _current = job
       _currentStartedMs = Date.now()
@@ -532,6 +583,12 @@ Item {
       return Model.serverSitesPath(job.org, job.serverId, job.cursor)
     if (job.kind === "log")
       return Model.deploymentLogPath(job.org, job.serverId, job.siteId, job.deploymentId)
+    if (job.kind === "commandFind")
+      return Model.commandListPath(job.org, job.serverId, job.siteId)
+    if (job.kind === "commandShow")
+      return Model.commandPath(job.org, job.serverId, job.siteId, job.commandId)
+    if (job.kind === "commandOutput")
+      return Model.commandOutputPath(job.org, job.serverId, job.siteId, job.commandId)
     return Model.sitesPath(job.org, job.cursor)
   }
 
@@ -680,6 +737,14 @@ Item {
       if (job.kind === "log")
         deploymentLogFetched(logRequestKey(job.org, job.serverId, job.siteId, job.deploymentId),
                              false, "", "Rate limited — try again shortly")
+      // A dropped look at a command is not the end of the run — the hold is
+      // this minute's, and the ladder outlives it — so the pane is told to
+      // expect a wait rather than told the watch is over.
+      if (Model.isCommandJob(job)) {
+        commandRunUpdated(job.requestKey, true, true, String(job.commandId || ""),
+                          "rate limited — looking again shortly", "", "")
+        _scheduleCommandPoll()
+      }
       return true
     })
 
@@ -1063,13 +1128,17 @@ Item {
   // and the charge, it therefore has to do here by hand.
   property var _action: null
 
+  // Answers whether the request went out. Both refusals below are reported to
+  // the row either way, but a caller that has state to set up around the send —
+  // `runSiteCommand`, whose whole point is what happens after it — has to know
+  // that there is nothing to set it up for.
   function _startAction(job) {
     // A refusal is reported rather than swallowed: a keypress that looks like
     // it missed is worse than one that says why. Same reasoning as the guards
     // in `fetchDeploymentLog` — nothing comes along later to explain this one.
     if (actionProcess.running) {
       actionFinished(job.key, false, "Still sending the last one")
-      return
+      return false
     }
     var account = (orgs[job.org] && orgs[job.org].account) || accountForOrg(job.org)
     // Sending it anyway would only earn another refusal and push the hold out
@@ -1078,24 +1147,35 @@ Item {
     if (held > 0) {
       actionFinished(job.key, false,
                      "Rate limited — try again in " + Math.ceil(held / 1000) + "s")
-      return
+      return false
     }
     job.account = account
     _action = job
     busyActionKey = job.key
     budget.charge(budget.bucketFor(account))
-    // The body reaches the helper in argv, unlike the token: it is a fixed
-    // action word built in `Model`, not a credential, and the rule the stdin
+    // Most bodies reach the helper in argv, unlike the token: they are fixed
+    // action words built in `Model`, not credentials, and the rule the stdin
     // config exists for is about the one thing that must never appear in a
-    // command line. The helper moves it onto that config for curl's sake.
+    // command line. The helper moves them onto that config for curl's sake.
+    //
+    // A command someone typed is the exception, and asks for `bodyStdin`. It is
+    // not a credential either, but it can quote one, and /proc/<pid>/cmdline is
+    // readable by every process on the machine — so it goes down the pipe the
+    // clipboard and the file writer already use. `-` is the helper's word for
+    // "the body is on stdin"; the write itself happens in `onStarted`, because
+    // there is no stdin to write to until the child exists.
     //
     // The method rides the job too. Everything here was a POST until removing
     // a site's maintenance mode turned out to be a DELETE; the helper passes
     // whatever it is straight to curl, so this is the only place that knew.
+    var piped = job.bodyStdin === true && !!job.body
+    actionProcess.stdinBody = piped ? JSON.stringify(job.body) : ""
+    actionProcess.stdinEnabled = piped
     actionProcess.command = [cliPath, "api", "--account", account,
                              String(job.method || "POST"), job.path]
-      .concat(job.body ? [JSON.stringify(job.body)] : [])
+      .concat(piped ? ["-"] : job.body ? [JSON.stringify(job.body)] : [])
     actionProcess.running = true
+    return true
   }
 
   // A deploy's 403 is the only one left loud, so it carries no `scopeMessage`:
@@ -1121,7 +1201,14 @@ Item {
   // `key` is the row's, not the subject's: rows can send to the same endpoint,
   // and only the one that was pressed should say so.
   function sendAction(org, serverId, action, key) {
-    if (!action || !action.path || String(org) === "") return
+    // An action with no path is one whose subject has gone from the API since
+    // the row was built — a site dropped by the refresh that landed inside the
+    // arm window. The press is spent either way, so it says so rather than
+    // disappearing: silence here reads as a key that missed.
+    if (!action || !action.path || String(org) === "") {
+      actionFinished(String(key), false, "That is no longer listed")
+      return
+    }
     var refetch = String(action.refetch || "")
     _startAction({ org: String(org), serverId: String(serverId),
                    key: String(key), path: String(action.path),
@@ -1134,6 +1221,36 @@ Item {
                    settleSites: action.settleSites === true,
                    refetchSites: refetch === "sites",
                    refetchOrg: refetch === "org" })
+  }
+
+  // Running a command is a write like any other, so it goes out on the same
+  // single-flight process with the same job shape. It has its own door only
+  // because of what happens *after* the 202: nothing else here has an answer
+  // worth waiting for, and the coordinates the watch needs — which site, what
+  // was typed, when — are not in an action's vocabulary.
+  // Answers with the key its updates will carry, because the panel needs it to
+  // filter them and the send time it is built from is minted here — and answers
+  // `""` when nothing was sent, so the panel does not open a pane onto a run
+  // that does not exist. Both ways out say why on the row first.
+  function runSiteCommand(org, serverId, siteId, action, key) {
+    if (!action || !action.path || String(org) === "") {
+      actionFinished(String(key), false, "That site is no longer listed")
+      return ""
+    }
+    var sentAtMs = Date.now()
+    var requestKey = commandRequestKey(org, serverId, siteId, sentAtMs)
+    var started = _startAction(
+      { org: String(org), serverId: String(serverId),
+        siteId: String(siteId), kind: "command",
+        key: String(key), path: String(action.path),
+        method: String(action.method || "POST"),
+        body: action.body || null, bodyStdin: true,
+        sent: String(action.body ? action.body.command : ""),
+        sentAtMs: sentAtMs, requestKey: requestKey,
+        done: String(action.done || "Sent"),
+        scopeMessage: String(action.scopeMessage || ""),
+        settleSites: false, refetchSites: false, refetchOrg: false })
+    return started ? requestKey : ""
   }
 
   function _onAction(text) {
@@ -1160,6 +1277,11 @@ Item {
     }
 
     actionFinished(job.key, true, job.done)
+
+    // The 202 for a command carries no body at all — a deploy hands its
+    // resource back, this hands back nothing — so the run has to be found
+    // before it can be followed. That is the watch's first look.
+    if (job.kind === "command") { _startCommandWatch(job); return }
 
     // Forge does all of this asynchronously — every one of these endpoints
     // answers 202 — so what changed only shows a moment later. Look again
@@ -1226,6 +1348,290 @@ Item {
     _settle = left > 0 ? { org: job.org, serverId: job.serverId, left: left } : null
     if (left <= 0) settleTimer.stop()
     fetchServerSites(job.org, job.serverId, true)
+  }
+
+  // ----------------------------------------------------------- command runs
+
+  // Watching a command from `waiting` to a terminal state, and then reading
+  // what it printed. One watch for the whole session, like `_action` and for
+  // the same reason: the run is single-flight on the way out, so there is only
+  // ever one worth following back.
+  //
+  // It lives here rather than in `Panel` because it is polling, and a timer on
+  // the panel would run once per monitor — the same reason the sweep is a
+  // service. Panels hear it through `commandRunUpdated` and filter by key.
+  //
+  // The ladder rather than a fixed interval: a trivial command lands in about
+  // ten seconds, so the first looks are close together, and a slow one earns
+  // longer gaps instead of spending the minute's budget on it. Ten looks over
+  // roughly a hundred seconds, and then it stops asking — a migration that has
+  // not finished by then is not something to keep a poll alive for, and `r`
+  // starts the ladder over for anyone still watching.
+  readonly property var commandPollLadder: [3, 3, 5, 5, 8, 8, 13, 13, 21, 21]
+  property var _commandWatch: null
+
+  // The last run this session recognised, and which command on which site it
+  // was. `Model.commandFrom` takes it as a floor: reading a failure and running
+  // the same thing again a minute later — the ordinary way a command is
+  // retried — would otherwise recognise the *previous* run as this one and
+  // print its output as the new result. One slot rather than a table, because
+  // the run a new one can be confused with is the one before it.
+  property var _lastRun: null
+
+  function _runSite(job) {
+    return String(job.org) + "/" + String(job.serverId) + "/" + String(job.siteId)
+  }
+
+  function _startCommandWatch(job) {
+    // There is one watch for the session and a second run displaces it, so the
+    // pane that was following the old one has to be told — two monitors is all
+    // it takes, since the service is shared and the panels are not. Without
+    // this it sits on "running…" with no lines and a `r` that answers nothing.
+    if (_commandWatch && _commandWatch.requestKey !== job.requestKey)
+      commandRunUpdated(_commandWatch.requestKey, false, false,
+                        _commandWatch.commandId, "", "",
+                        "Stopped following this run — another command was started")
+    commandTimer.stop()
+    var site = _runSite(job)
+    _commandWatch = { org: job.org, account: job.account,
+                      serverId: job.serverId, siteId: job.siteId,
+                      site: site, sent: job.sent, sentAtMs: job.sentAtMs,
+                      // Only the same text on the same site can be mistaken for
+                      // this run, so anything else carries no floor at all.
+                      afterMs: _lastRun && _lastRun.site === site
+                        && _lastRun.sent === job.sent ? _lastRun.madeMs : 0,
+                      requestKey: job.requestKey, commandId: "",
+                      stage: "follow", header: "", step: 0 }
+    // Said before the first look rather than after it, so the pane opens
+    // reading "queued" instead of sitting blank until a request comes back.
+    commandRunUpdated(job.requestKey, true, true, "", "queued", "", "")
+    _pollCommand()
+  }
+
+  // Anyone who closed the pane. Keyed, so a second panel still watching the
+  // same run is not what stops it — and a key that has moved on is ignored
+  // rather than cancelling whatever replaced it.
+  //
+  // This, the output landing, and the next run are the *only* three things that
+  // end a watch. A refusal never does: the run is out on the box whatever a
+  // look at it came back with, so throwing the watch away would make it
+  // unreachable for the rest of its life — see `_commandFailed`.
+  function stopCommandWatch(requestKey) {
+    if (!_commandWatch || _commandWatch.requestKey !== String(requestKey)) return
+    _commandWatch = null
+    commandTimer.stop()
+  }
+
+  // `r` in the pane. The ladder starts over, because someone asking again is
+  // saying they are still watching — from wherever the watch had got to, so a
+  // run whose output was the part that failed asks for the output again rather
+  // than starting from the index. Answers whether there was anything left to
+  // look at, so the panel does not report a look it never took.
+  function refreshCommand(requestKey) {
+    if (!_commandWatch || _commandWatch.requestKey !== String(requestKey)) return false
+    _commandWatch = _commandCopy({ step: 0 })
+    _pollCommand()
+    return true
+  }
+
+  // Reassigned rather than mutated, the same rule the org state follows.
+  function _commandCopy(changes) {
+    return _commandWatch ? _merge(_commandWatch, changes) : null
+  }
+
+  // Every request the watch makes leaves through here, the output read
+  // included: it is the one place that knows about the hold and the ceiling,
+  // and a final read fired past them would earn a 429 that pushes the hold out
+  // further for everything else.
+  function _pollCommand() {
+    var watch = _commandWatch
+    if (!watch) return
+    // Before the id is known the run has to be recognised in the index; after
+    // it, it is addressed directly — one row of JSON instead of five, and no
+    // chance of adopting a different run with the same text. Once it is over,
+    // there is one thing left to ask for.
+    var kind = watch.stage === "output" ? "commandOutput"
+      : watch.commandId === "" ? "commandFind" : "commandShow"
+    var key = watch.requestKey
+    var pending = function (job) {
+      return job.requestKey === key && Model.isCommandJob(job)
+    }
+    if (queue.contains(pending) || (_current !== null && pending(_current))) return
+
+    // A hold is not a reason to give up on the run — it is on the box either
+    // way — so the pane is told how long and the ladder carries on. Same for
+    // the ceiling: this is the on-demand spend the margin exists for, but not
+    // at the cost of the sweep that watches everything else.
+    var held = budget.blockedMs(watch.account)
+    if (held > 0) {
+      commandRunUpdated(key, true, true, watch.commandId,
+                        "rate limited — looking again in "
+                        + Math.ceil(held / 1000) + "s", "", "")
+      _scheduleCommandPoll()
+      return
+    }
+    if (budget.wouldExceed(watch.account, 1)) {
+      commandRunUpdated(key, true, true, watch.commandId,
+                        "waiting for the rate limit", "", "")
+      _scheduleCommandPoll()
+      return
+    }
+
+    queue.pushFront({ org: watch.org, account: watch.account, kind: kind,
+                      serverId: watch.serverId, siteId: watch.siteId,
+                      commandId: watch.commandId, sent: watch.sent,
+                      sentAtMs: watch.sentAtMs, afterMs: watch.afterMs,
+                      header: watch.header, requestKey: key })
+  }
+
+  function _scheduleCommandPoll() {
+    var watch = _commandWatch
+    if (!watch) return
+    if (watch.step >= commandPollLadder.length) {
+      // Out of looks rather than out of run: the command is still going, and
+      // saying so is more use than a pane that quietly stops updating. Unless
+      // it is not still going — a ladder that ran out while the output was
+      // what could not be read should say the part that is true.
+      commandRunUpdated(watch.requestKey, true, true, watch.commandId,
+                        watch.stage === "output"
+                          ? "finished — press r to read the output"
+                          : "still running — press r to look again", "", "")
+      commandTimer.stop()
+      return
+    }
+    commandTimer.interval = commandPollLadder[watch.step] * 1000
+    _commandWatch = _commandCopy({ step: watch.step + 1 })
+    commandTimer.restart()
+  }
+
+  // The three reads share a refusal: they belong to a keypress, so a hold or a
+  // dropped job has to answer rather than vanish — the same rule the deploy
+  // log's guards follow. `server:view` is all any of them wants, which is why
+  // the 403 here reads differently from the one the send earns.
+  function _commandRefused(job, envelope) {
+    var message = envelope.status === 403
+      ? "Your token can't read command runs — that needs the server:view scope"
+      : Model.envelopeError(envelope)
+    commandRunUpdated(job.requestKey, false, false, String(job.commandId || ""),
+                      "", "", message)
+  }
+
+  // What a refused look does to the watch: nothing. The run is out on the box
+  // whatever this one request came back with, so the watch outlives every
+  // refusal — throwing it away here is what used to leave `r` flashing "Looking
+  // again" at a run nothing could reach any more.
+  //
+  // The refusal decides only whether the ladder keeps ticking. A 429, a 500, a
+  // timeout, an envelope that would not parse: all of them pass, so the pane
+  // hears what went wrong and the next look is scheduled — the same answer
+  // `_holdAccount` gives a command job it drops. A token without the scope
+  // would say the same thing every time, so that one stops asking and reports
+  // it, and `r` is still there for once the token has been fixed.
+  function _commandFailed(job, envelope) {
+    if (!_commandCurrent(job)) return
+    if (envelope.status === 401 || envelope.status === 403
+        || _isMissingToken(envelope)) {
+      commandTimer.stop()
+      _commandRefused(job, envelope)
+      return
+    }
+    commandRunUpdated(job.requestKey, true, true, String(job.commandId || ""),
+                      Model.envelopeError(envelope) + " — looking again", "", "")
+    _scheduleCommandPoll()
+  }
+
+  // Still the watch this answer belongs to? A pane closed and reopened on a
+  // second run would otherwise be updated by the first one's last look.
+  function _commandCurrent(job) {
+    return !!_commandWatch && _commandWatch.requestKey === job.requestKey
+  }
+
+  // The preamble all three answers share: the envelope when it is worth acting
+  // on, and `null` when it was refused or belongs to a watch that has moved on.
+  // Written once because the three copies of it had already drifted apart, and
+  // a stale job's failure was stopping the current watch's ladder.
+  function _commandAnswer(job, text) {
+    var envelope = Model.parseEnvelope(text)
+    if (!_applyEnvelope(job.org, job.account, envelope, true)) {
+      _commandFailed(job, envelope)
+      return null
+    }
+    return _commandCurrent(job) ? envelope : null
+  }
+
+  function _onCommandFind(job, text) {
+    var envelope = _commandAnswer(job, text)
+    if (!envelope) return
+
+    var found = Model.commandFrom(envelope.body, job.sent, job.sentAtMs, job.afterMs)
+    if (!found) {
+      // Forge has not written the run down yet. That is ordinary in the first
+      // second or two, so it is another look rather than an error — and the
+      // ladder running out is what eventually says so.
+      commandRunUpdated(job.requestKey, true, true, "", "queued", "", "")
+      _scheduleCommandPoll()
+      return
+    }
+    // Kept for the next run of the same command on this site, which is the one
+    // thing that could be mistaken for this one. See `_lastRun`.
+    _lastRun = { site: _commandWatch.site, sent: job.sent, madeMs: found.madeMs }
+    _commandWatch = _commandCopy({ commandId: found.id })
+    _afterCommandState(job, found.attributes)
+  }
+
+  function _onCommandShow(job, text) {
+    var envelope = _commandAnswer(job, text)
+    if (!envelope) return
+
+    var data = envelope.body ? envelope.body.data : null
+    _afterCommandState(job, data ? data.attributes : null)
+  }
+
+  // Where both looks land: either it is still going, and the ladder gets
+  // another turn, or it is over and there is output to read.
+  function _afterCommandState(job, attributes) {
+    var state = Model.commandStateFrom(attributes)
+    if (state.running) {
+      commandRunUpdated(job.requestKey, true, true,
+                        _commandWatch.commandId, state.header, "", "")
+      _scheduleCommandPoll()
+      return
+    }
+    // Deliberately silent here. Saying the run is over while the request for
+    // what it printed is still in flight leaves the pane holding a finished
+    // state and no lines, which is how it renders "this command printed
+    // nothing" — a different fact, and the wrong one, for the second before the
+    // output lands. The run is only over once there is something to show for
+    // it, so `_onCommandOutput` is what says so.
+    //
+    // The state the run ended in rides the watch rather than this one job: the
+    // read it belongs to goes out through `_pollCommand` like the other two, so
+    // a hold can put a ladder step between here and the request that carries it.
+    commandTimer.stop()
+    _commandWatch = _commandCopy({ stage: "output", header: state.header })
+    _pollCommand()
+  }
+
+  function _onCommandOutput(job, text) {
+    var envelope = _commandAnswer(job, text)
+    if (!envelope) return
+
+    var data = envelope.body ? envelope.body.data : null
+    var attributes = data ? data.attributes : null
+    // An empty string is a real answer here — plenty of commands print
+    // nothing — so only a missing field is a failure to report. The watch stays
+    // for it: an answer this shape is worth asking about again, and `r` is how.
+    if (!attributes || typeof attributes.output !== "string") {
+      commandRunUpdated(job.requestKey, false, false, String(job.commandId || ""),
+                        job.header, "", "Forge returned no output for this command")
+      return
+    }
+
+    // The run is over and this was the last thing wanted from it.
+    _commandWatch = null
+    commandTimer.stop()
+    commandRunUpdated(job.requestKey, true, false, String(job.commandId || ""),
+                      job.header, attributes.output, "")
   }
 
   // ---------------------------------------------------------------- actions
@@ -1342,6 +1748,15 @@ Item {
     onTriggered: root._onSettleTick()
   }
 
+  // Not `repeat`: every interval on the ladder is a different length, so each
+  // tick is armed by the answer before it. See `_scheduleCommandPoll`.
+  Timer {
+    id: commandTimer
+    interval: 3000
+    repeat: false
+    onTriggered: root._pollCommand()
+  }
+
   // A hung helper would otherwise pin the queue forever, since every start is
   // guarded on `running`. Only a request that has actually overrun is killed:
   // a fixed ticker that aborted whatever happened to be in flight when it fired
@@ -1375,6 +1790,9 @@ Item {
         if (job.kind === "servers") root._onServers(job, text)
         else if (job.kind === "serverSites") root._onServerSites(job, text)
         else if (job.kind === "log") root._onLog(job, text)
+        else if (job.kind === "commandFind") root._onCommandFind(job, text)
+        else if (job.kind === "commandShow") root._onCommandShow(job, text)
+        else if (job.kind === "commandOutput") root._onCommandOutput(job, text)
         else root._onSites(job, text)
       }
       root._pump()
@@ -1411,8 +1829,20 @@ Item {
 
   Process {
     id: actionProcess
+    // Set by `_startAction` when the job asked for `bodyStdin`, and written the
+    // moment the child exists — the same dance `pipeProcess` does, and for the
+    // same reason: there is no stdin before `started`, and disabling it again
+    // is what sends the EOF the helper's `cat` is waiting for.
+    property string stdinBody: ""
     running: false
+    stdinEnabled: false
     stdout: StdioCollector { id: actionOut; waitForEnd: true }
+    onStarted: {
+      if (!stdinEnabled) return
+      write(stdinBody)
+      stdinBody = ""
+      stdinEnabled = false
+    }
     onExited: root._onAction(String(actionOut.text || ""))
   }
 }

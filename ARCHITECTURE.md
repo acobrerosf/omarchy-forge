@@ -196,6 +196,57 @@ A refusal is always reported. `fetchServerSites` can return silently because the
 that server anyway; nothing comes along later to fill this pane in, so a hold, a ceiling, and the
 jobs a 429 drops out of the queue each answer the signal instead of vanishing.
 
+**A command run is the deploy log's shape, four times over.** `POST .../commands` is a write and
+goes out on `actionProcess` like every other; everything after it is reads, and they go through the
+queue for the reasons above. Three job kinds — `commandFind`, `commandShow`, `commandOutput` — each
+named in `_pathFor` rather than defaulted, each answering the one signal `commandRunUpdated`.
+
+Two things make it more than a log fetch with a different path.
+
+Forge answers the POST **202 with no body at all**, where a deploy hands its `DeploymentResource`
+back. So the run cannot be received, only recognised: `commandFind` reads `?sort=-created_at` and
+`Model.commandFrom` takes the newest row that clears three tests. The `command` has to match what
+was sent — exactly, which is why `siteCommandAction` trims once and everything downstream uses what
+it sends; a trailing space typed into the field would otherwise leave a run that is on the box
+unfindable forever. The `created_at` has to be no older than the send, minus a generous two-minute
+margin, because that half compares Forge's clock with this machine's and only has to separate the
+run from the history behind it. And it has to be newer than the last run this session recognised for
+the same command on the same site — `_lastRun`, carried in as `afterMs`. That third test is exact
+rather than generous, because it compares one Forge timestamp with another and no skew comes into
+it, and it is the one that matters most often: the text alone would adopt an identical run from last
+month, recency alone would adopt somebody else's run from the dashboard, and the first two together
+still adopt **the user's own retry a minute ago** — which is what reading a failure and running the
+same thing again is. Once found, the id is known and `commandShow` addresses it directly.
+
+And it is the only thing here that **polls**. `commandPollLadder` is 3, 3, 5, 5, 8, 8, 13, 13, 21,
+21 seconds: a trivial command lands in about ten, and a slow one earns longer gaps instead of
+spending the minute on it. Ten looks and it stops, saying so rather than going quiet — `r` starts
+the ladder over. The watch lives on the service and not on the panel, for the reason the sweep does:
+a timer in a bar widget runs once per monitor. Panels hear the signal and filter by a request key
+built from the send time, which is minted in `runSiteCommand` and returned to the caller, because
+the panel needs it before the first answer can arrive.
+
+Every request the watch makes leaves through `_pollCommand` — the terminal `commandOutput` read
+included, which is what the watch's `stage` is for. It is the one place that knows about the hold
+and the ceiling, and a final read fired past them earns a 429 that pushes the hold out further for
+everything else.
+
+**Three things end a watch, and a refusal is not one of them:** the output landing, the pane closing
+(`stopCommandWatch`), and the next run displacing it. The run is out on the box whatever a look at it
+came back with, so a 429, a 500 or a timeout leaves the watch exactly where it was — `_commandFailed`
+reports what happened and schedules the next look, the same answer `_holdAccount` gives a command job
+it drops. Only `401`/`403`/no-token stops the ladder, because that one would say the same thing every
+time; the watch survives even then, so `r` still reaches the run once the token is fixed. The
+converse obligation is that anything which *does* end a watch has to say so: displacing one emits a
+final refusal on the old key (two monitors share this service and one of them is about to be
+stranded), and `_abandonJob` answers a log or command job thrown away because its organization
+stopped being watched — in `_pump` and in `_reconcile` alike.
+
+The scopes split across those four paths, which no other endpoint here does: the POST wants
+`site:manage-commands`, all three reads want only `server:view`. So a read-only token can follow a
+run it was not allowed to start, and the 403 belongs on the row that sent rather than on the pane
+that reads.
+
 **Writes don't go through it.** A deploy, a service restart, a reboot and a maintenance toggle all
 go out on `actionProcess`, which is single-flight: one press cannot become two requests, and the
 answer arrives at `_onAction` rather than in the middle of a sweep. What the queue would have done
@@ -210,9 +261,17 @@ it is reached from a key rather than from a row of that list:
 - a **body** (`{"action":"reboot"}`, the PHP pool's version, `{"status":503}` for maintenance). It
   reaches the helper as an argument — it is not a credential — and the helper hands it to curl down
   the same stdin config the token rides, not because it is a secret but because stdin is already
-  spoken for there and a temp file would be a second thing to clean up. Everything sent is decided
-  in `Model`; no user-typed string has ever reached that argv, which is why the maintenance
-  integration's optional `secret` and `redirect` are not offered.
+  spoken for there and a temp file would be a second thing to clean up. Everything sent this way is
+  decided in `Model`, never typed.
+  
+  The one exception asks for it explicitly. A command to run on a site is a body somebody wrote, and
+  a job that sets **`bodyStdin`** is sent as `api … POST <path> -`, with the JSON written to the
+  helper's own stdin on `started` and stdin closed to end it — the dance `pipeProcess` already does
+  for the clipboard and for saving a file. It is not a credential either, but it can quote one, and
+  `/proc/<pid>/cmdline` is readable by every process on the machine. So the rule survives in the
+  form that matters: **nothing a user typed reaches an argv.** (The maintenance integration's
+  optional `secret` and `redirect` are still not offered — not for that reason any more, but
+  because a toggle is not a place to type.)
 - a **method**. Everything was a POST until removing a site's maintenance mode turned out to be a
   DELETE. `_startAction` defaults to POST and the helper passes whatever it is to `curl --request`,
   so no other layer knows.
@@ -220,10 +279,10 @@ it is reached from a key rather than from a row of that list:
   `quiet` — a job that has one is quiet. Only a deploy has none, and so is the only write left
   loud: it goes out on the same token and the same scope every sweep already needs, which makes a
   refusal the organization's business. The rest are gated behind write scopes a read-only token
-  lacks (`server:manage-services`; `site:manage-commands` for maintenance, which is Forge's
-  *run a command* scope rather than a separate integrations one — `site:manage-integrations` is
-  declared in the spec's scope list, but no endpoint in it is gated behind that scope), and left
-  loud one keypress would paint a scope error across rows that are perfectly healthy.
+  lacks (`server:manage-services`; `site:manage-commands` for maintenance *and* for running a
+  command, which is what that scope is actually named for — `site:manage-integrations` is declared
+  in the spec's scope list, but no endpoint in it is gated behind that scope), and left loud one
+  keypress would paint a scope error across rows that are perfectly healthy.
 - **what to re-read**, as a `refetch` of `"org"` or `"sites"`. Forge answers all of them 202 — the
   work is asynchronous — so the flash says "requested", not "done". `"org"` pulls the organization's
   next refresh forward, which is all a reboot needs, since a server's state arrives with the server
@@ -363,11 +422,33 @@ hold keyboard focus — so a site's actions are not a second window and could no
 different `rows`.
 
 `navStack` holds what has been pushed over the tree; `route` is its top. `rows` switches on it:
-nothing pushed is the tree, a `site` or `server` route is that subject's actions, a `log` route is
-empty because the log is a pane and not a list. Everything downstream is untouched — one cursor,
-one delegate, one key handler, one clamp in `onRowsChanged` — which is the point. The server view
-cost exactly what that predicted: a branch in `actionRows`, a `runAction` case, and no new
-navigation model.
+nothing pushed is the tree, a `site` or `server` route is that subject's actions, and a `log` or
+`commandOutput` route is empty because a pane is not a list — `paneRoute` is the two of them
+together, drawn once rather than at each of the half-dozen places that has to know. A `command`
+route is one row, the send, built from what has been typed. Everything downstream is untouched —
+one cursor, one delegate, one key handler, one clamp in `onRowsChanged` — which is the point. The
+server view cost exactly what that predicted: a branch in `actionRows`, a `runAction` case, and no
+new navigation model.
+
+The command prompt is the first thing here that needed more than that, because it is the one place
+in the panel where a keypress is a *letter*. `PanelKeyCatcher.blocked` is the documented way out:
+while it is set the catcher forwards everything to the focused field, `h j k l` included. Nothing
+gives focus back on its own, so `stopCommandEditing` does it by hand — and does it **deferred**.
+Clearing the flag synchronously unblocks the catcher while the enter that armed the row is still
+being delivered, and that same press goes on to reach `onActivateRequested`, which on a row that was
+just armed reads as "enter again" and hands the arm straight back. The arm never survived the press
+that made it, and the `Y` that should have confirmed went into the command as a character. One turn
+of the event loop is the whole fix.
+
+The arm's expiry is the other half of that lesson. Every *deliberate* way of dropping it returns to
+the field with the text intact — a stray key at the confirm, `j`/`k`, enter again — because the
+likely next move is fixing a typo. The eight-second timer does not, and must not: taking the
+keyboard back on a timer is a silent change of what the next key means, and the next key after a
+confirm line is overwhelmingly `Y`.
+
+The prompt is also the one view that is *replaced* rather than pushed. Once it has sent, backing out
+onto a filled-in command that has already run is an invitation to run it twice, so `replaceView`
+swaps it for the output pane and `h` lands on the site.
 
 Two keys had to come from somewhere, and the horizontal axis is where. `PanelKeyCatcher` reads
 `h j k l` as movement before `onTextKey` ever sees them, so a letter for "open the log" was never
@@ -422,7 +503,11 @@ same key. `actionRows` is rebuilt on every refresh, and the maintenance row's la
 body are all derived from `maintenance_mode`; without this, a sweep landing inside the four-second
 arm window would leave `armedKey` still matching a row that now means the opposite, and the second
 press would send a DELETE where a POST was armed. Putting the intent in the key makes the flip
-invalidate the arm instead of silently retargeting it — visibly, on the row, with no timer.
+invalidate the arm instead of silently retargeting it — visibly, on the row, with no timer. The
+command row's intent is the typed command itself, which is the sharper case: that row is nothing
+*but* its text, and the field keeps focus for one turn of the event loop after enter has armed it,
+so a keystroke landing in that window would otherwise leave the arm pointing at something the row
+never named. `confirmArmed` says so when the key no longer matches, rather than doing nothing.
 
 **Two confirms, not one.** A deploy and a service restart take the same two presses. A reboot takes
 enter to arm and a capital `Y` to send, and every other key — a second enter, a lower-case `y` —

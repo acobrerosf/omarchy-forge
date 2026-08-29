@@ -87,9 +87,23 @@ the organization's rows, and for a write it is the job's `scopeMessage` that dec
 wording and the quiet; every write goes out on `Service`'s single-flight `actionProcess` via
 `_startAction`, never through the queue, carrying its own method (POST is only the default) and
 — where its meaning depends on live state, as the maintenance toggle's does — an `armIntent` in
-its arm key, so a refresh landing mid-arm invalidates it instead of retargeting it; a site name
-reaching a *path* (the saved log's filename) goes
-through `Model.safeFileName`, which is the separator guard the other three don't cover; and
+its arm key, so a refresh landing mid-arm invalidates it instead of retargeting it; a body a *user
+typed* — only the site command's — never rides that argv, and asks for `bodyStdin` instead, which
+sends it as `api … POST <path> -` and writes it to the helper's stdin on `started`; a site name
+reaching a *path* (a saved log's or command output's filename) goes
+through `Model.safeFileName`, which is the separator guard the other three don't cover; the command
+watch that polls a run to its end lives on `Service` and not on `Panel`, for the reason the sweep
+does — a timer in a bar widget runs once per monitor — and it says nothing when the run turns
+terminal, because announcing that while the output request is still in flight leaves the pane
+finished with no lines, which renders as "printed nothing"; that watch ends on exactly three
+things — the output landing, the pane closing, the next run displacing it — and never on a
+refusal, since the run is on the box whatever a look at it came back with and dropping the watch
+leaves `r` pointing at nothing (`_commandFailed` reports and reschedules instead), while anything
+that *does* end one owes the pane a farewell — the displaced key in `_startCommandWatch`, a
+dropped read in `_holdAccount` or `_abandonJob`; the command prompt is the one place
+that sets `PanelKeyCatcher.blocked`, and `stopCommandEditing` clears it *deferred* on purpose,
+or the enter that arms goes on to reach `onActivateRequested` and un-arms the row it just armed;
+and
 `omarchy-notification-send --exec` takes a
 shell *string*, not an argv array — the shell runs it through `bash -lc` on click, so an address
 reaching it must pass `Model.externalUrl` **and** `Util.shellQuote`. Any new address that leaves

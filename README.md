@@ -1,307 +1,216 @@
 # Forge
 
 [Laravel Forge](https://forge.laravel.com) servers and deployments in the [Omarchy](https://omarchy.org/)
-bar. The icon tells you whether anything is broken; the panel tells you what, and lets you redeploy
-it without opening a browser. One icon covers every organization you have a token for, however many
-Forge accounts those tokens belong to.
+bar. The icon tells you whether anything is broken; the panel tells you what, and lets you fix it
+without opening a browser.
 
-Built on the Forge **v2** API. The v1 API was discontinued on 31 August 2026 and nothing here uses it.
+Uses the Forge **v2** API. One icon covers every organization you have a token for.
 
 <img src="screenshots/panel.png" alt="The panel, with two organizations and a server unfolded into its sites" width="420">
 
-## Install
+## Getting started
+
+**1. Install the plugin.**
 
 ```sh
 omarchy plugin add https://github.com/acobrerosf/omarchy-forge.git --enable
 ```
 
-Then set up the token, either from the panel's **Set up Forge** button or from a terminal:
+**2. Create a Forge API token** at <https://forge.laravel.com/profile/api>.
+
+Tick these scopes:
+
+| Scope | What it buys you |
+|---|---|
+| `user:view` | required — confirms the token works |
+| `organization:view` | required — finds the organizations to watch |
+| `server:view` | required — servers, sites, deployment status |
+| `site:manage-deploys` | deploy from the bar, and read deployment logs |
+| `server:manage-services` | restart nginx or PHP-FPM, reboot a server |
+| `site:manage-commands` | run a command on a site, toggle maintenance mode |
+
+The first three are the minimum. Leave the rest off and the widget is read-only — everything that
+would change something says which scope it wanted instead of failing quietly.
+
+**3. Add the token.** Click **Set up Forge** in the panel, or run:
 
 ```sh
 ~/.config/omarchy/plugins/acobrerosf.forge/omarchy-forge setup
 ```
 
-Create the token at <https://forge.laravel.com/profile/api>. The scopes it needs:
+It asks for the token, then lets you pick which of that token's organizations to watch.
 
-| Scope | Why |
-|---|---|
-| `user:view` | confirm the token works during setup |
-| `organization:view` | find the organizations to watch |
-| `server:view` | read servers, sites, and deployment status |
-| `site:manage-deploys` | deploy from the bar, **and** read deployment logs |
-| `server:manage-services` | restart nginx or PHP-FPM, reboot a server |
-| `site:manage-commands` | take a site in and out of maintenance mode |
+**4. That's it.** The Forge mark appears in the bar. Click it, or press its key, and the panel opens
+with your organizations. Move with `j`/`k`, press enter to unfold, press `d` twice on a site to
+deploy it.
 
-Leave all three write scopes off and the widget is strictly read-only. Everything that would change
-something says so rather than failing quietly: the deploy key reports that the token isn't allowed
-to, a server action names the scope it wanted, and the deployment log reports that reading it needs
-one too. The log is genuinely gated behind the *write* scope — that is Forge's choice, not this
-plugin's — so a token deliberately kept read-only can watch every deployment fail and not be told
-why.
+Tokens are stored in your login keyring, never in a config file, and the widget never handles them
+— every request is made by the bundled `omarchy-forge` helper.
 
-`site:manage-commands` is worth a second look before you grant it. It is Forge's *run a command on
-the site* scope, and maintenance mode happens to live behind it — so a token that can park a site
-can also run arbitrary commands on it. That is Forge's grouping, not this plugin's, and the only
-thing the widget sends to that endpoint is the maintenance toggle. If that trade isn't worth one
-keystroke to you, leave it off: everything else still works, and the toggle says which scope it
-wanted.
-
-Tokens go into the login keyring via `secret-tool`, not into a config file. The widget never
-handles them: every request is made by the bundled `omarchy-forge` helper, which reads the token
-itself and passes it to curl on stdin, so it never appears in a command line or an environment
-anything else can read.
-
-## Organizations
-
-One token belongs to an **account**; an account can see several **organizations**; an organization is
-watched through exactly one account. A token that already sees three organizations only needs adding
-once. An organization that belongs to somebody else's Forge account needs a token of its own.
-
-Either way it is the same command — from the panel (`a`, or the **Add organization** button) or from
-a terminal:
-
-```sh
-omarchy-forge add
-```
-
-It asks for a token and then lets you pick which of that token's organizations to watch.
-
-It does not ask you to name anything. The **account name** is a handle for this CLI — the argument
-to `--account` — and never appears in the bar, so it is derived from whoever the token belongs to
-rather than requested. Two Forge accounts sharing an email local part get distinct handles, and a
-derived name never lands on an account that already exists. `omarchy-forge accounts` lists them,
-and `omarchy-forge rename <old> <new>` changes one; `omarchy-forge add --name <handle>` sets it up
-front. What the bar shows is the **organization** name, which comes from Forge. Organizations another account already watches are
-skipped rather than fought over, since a slug is only ever one organization. Handing it a token it
-already holds updates that account instead of starting a second one — one Forge account is one
-entry in the keyring and one rate-limit budget, however many times you paste its token.
-
-To replace a token rather than add one — after rotating it, say:
-
-```sh
-omarchy-forge login --account clientco
-```
-
-```sh
-omarchy-forge accounts        # who is configured, and what each one watches
-omarchy-forge remove acme     # stop watching one organization
-omarchy-forge remove --account clientco   # drop an account, its token, and its orgs
-```
-
-The panel shows all of them in one list, grouped under a foldable heading per organization, and the
-bar icon reports the worst thing among them. Nothing needs restarting: adding an organization is
-picked up within a refresh interval.
-
-## What it shows
+## Reading the bar
 
 <img src="screenshots/bar.png" alt="The Forge mark in the Omarchy bar" width="224">
 
-Forge's own mark sits in the bar, second from the left above. It carries one badge for everything
-being watched:
+The mark carries one badge for everything being watched, showing the worst thing it can see:
 
 | Badge | Meaning |
 |---|---|
-| none | every server is up and no deployment is failing |
-| hollow | a site is in maintenance mode, and nothing louder is happening |
+| none | everything is up and no deployment is failing |
+| hollow | a site is in maintenance mode |
 | pulsing | a deployment is running |
-| warning | no token yet, an account's token is missing, or the last request errored |
-| solid | a server is unreachable or revoked, or a deployment failed |
+| warning | no token, a missing token, or the last request errored |
+| solid | a server is unreachable, or a deployment failed |
 
-A badge reports the worst thing it can see, in that order from the bottom up — so a failing deploy
-still shows through a site that is parked, and the hollow badge means "something is deliberately
-offline and nothing is broken". Hollow rather than a fifth colour because a colour that reads
-distinctly in every theme was not available; the rows use the same hollow dot for the same state.
+Middle-click the icon to refresh.
 
-Each organization unfolds into its servers, and each server into its sites with the state of their
-latest deployment, the branch, and the commit. A server whose site starts failing unfolds itself,
-once — collapse it again and it stays collapsed.
+## Using the panel
 
-A site opens into a view of its own: what you can do to it, and what the API already said about it.
-
-| | |
-|---|---|
-| **Actions** | deploy, toggle maintenance mode, read the deployment log, open the site, open it in Forge, copy its ssh command. One that can't run says why rather than going missing — a site with no repository, or one that has never deployed |
-| **Details** | PHP version, app type, status, maintenance mode, isolation, zero-downtime, how many releases it keeps, aliases, healthcheck. All of it arrives in the refresh the panel already pays for, so the view costs no request |
-
-**Maintenance mode** takes the site offline for everyone visiting it — Forge puts the application
-behind a 503 — and brings it back on the same two presses. The row names which way it is about to
-go, and arming it says so again in full before the second press. It needs `site:manage-commands`;
-without it the toggle still sends, and the refusal comes back on the row itself naming the scope it
-wanted rather than across everything being watched.
-
-Because Forge does the work out on the server, the answer is "requested", not "done". The site row
-says `enabling…` or `disabling…` while that is happening, and settles to `maintenance` with a
-hollow dot once it has landed — so a site that is deliberately offline is visible from the bar
-without opening anything. A running or failed deployment still takes the row back: a site that is
-both parked and broken is worth knowing about as broken.
-
-The toggle is offered on every site, not just the ones where it will work. Forge's own refusal for
-a site with no Laravel installation is a better answer than a guess from the app type, which would
-wrongly rule out Statamic and Craft.
-
-**Deployment log** opens the output of the latest deploy, ANSI stripped, scrolled to the bottom —
-which is where the answer is when something failed. It is fetched when asked for and never
-otherwise, so it costs nothing at rest, and it is one request when it does.
-
-| Key | In the log |
-|---|---|
-| `j` `k` or ↑ ↓ | scroll |
-| `g` / `G` | jump to the top or the bottom |
-| `c` | copy the whole log to the clipboard |
-| `w` | write it to `~/Downloads/forge-<site>-<deployment>.log` — the panel says where it landed |
-| `h` or esc | back |
-
-Copying and saving both use the log already on screen, so neither costs a second request, and both
-give you the ANSI-stripped text rather than the escape-laden original.
-
-Deployments that finish or fail between refreshes raise a desktop notification, which names the
-organization when more than one is being watched. Clicking it opens the site.
-
-A missing or rejected token is reported once per account rather than once per organization behind
-it, because that is where the problem actually is.
-
-## Keys
+Organizations unfold into servers, servers into sites with their latest deployment, branch and
+commit. A server whose site starts failing unfolds itself once.
 
 | Key | Action |
 |---|---|
 | `j` `k` or ↑ ↓ | move the cursor |
-| enter / space | open what the row is about — unfold an organization or a server, or open a site's actions. Unfolding a server also refreshes its sites |
-| `l` or → | the same, but never closes something already open — on a server already unfolded, opens its actions |
-| `h` or ← | back: out of a view, or fold up the row the cursor is in |
-| `d` | deploy the site under the cursor |
-| `o` | open the site's URL — or, on a server row, its page in Forge |
-| `f` | open the row's page in the Forge dashboard |
+| enter / space | unfold an organization or server, or open a site |
+| `l` or → | go deeper — on an unfolded server, opens its actions |
+| `h` or ← | back, or fold up the current row |
+| `d` | deploy the site under the cursor (press twice) |
+| `o` | open the site's URL, or a server's page in Forge |
+| `f` | open the row in the Forge dashboard |
 | `s` | copy an `ssh forge@…` command for the server |
 | `r` | refresh now |
 | `a` | add an organization |
-| `Y` | confirm a reboot that enter has armed |
-| esc | back one level, or close from the list |
+| `Y` | confirm a reboot or a command that enter has armed |
+| esc | back one level, or close |
 
-The line at the bottom of the panel names what the row under the cursor can do, rather than every
-key at once — which is where the keys that only work in one place say so: `l` into a server's
-actions, `Y` to confirm a reboot.
+Anything that changes something takes **two presses**: the first arms the row and says so, the
+second sends it. Arms expire after a few seconds. A reboot and a command need a capital `Y` for the
+second press rather than enter, so a mistyped `j` or `k` can never be the last key before a server
+goes down.
 
-Deploying takes two presses. The first arms the row and says so; the second sends it. The arm
-expires after four seconds. `d` works from the list and from a site's own view, so nothing got
-slower when sites stopped being the last level.
+The line at the bottom of the panel names what the row under the cursor can do.
+
+Mouse: left click a row to unfold it or open a site; click the ⚙ on a server row for its actions;
+right click to open it in Forge. Inside a view, the trail at the top left is the way back.
 
 <img src="screenshots/deploy.png" alt="A site row armed, reading 'press again to deploy'" width="420">
 
-Mouse: left click a row to unfold it, or to open a site's actions; click the ⚙ on a server row for
-that server's actions; right click to open it in Forge. Inside a view, the trail at the top left is
-the way back. Middle click the bar icon to refresh.
+### A site
 
-## The server view
-
-A server opens into a view of its own, the way a site does. Two ways in: press `l` (or →) on a
-server that is already unfolded, where the key had nothing left to do, or click the ⚙ at the right
-of any server row — folded or not, since the pointer has no double duty to work around. Enter
-still folds and unfolds.
+Opening a site gives you its actions and its details, all from data the refresh already fetched.
 
 | | |
 |---|---|
-| **Restart nginx** | two presses, like a deploy |
-| **Reload PHP-FPM** | a graceful FPM reload of the server's PHP version, which the row names |
-| **Restart PHP-FPM** | the harder version of the same |
-| **Reboot server** | arms on enter, and sends only on a capital `Y` |
+| **Actions** | deploy, toggle maintenance mode, run a command, read the deployment log, open the site, open it in Forge, copy its ssh command |
+| **Details** | PHP version, app type, status, maintenance mode, isolation, zero-downtime, releases kept, aliases, healthcheck |
 
-Everything here needs `server:manage-services`; without it the action still sends, and Forge's
-refusal comes back naming the scope. One Forge would refuse for another reason — a server still
-provisioning, or one that reported no PHP version — says so on the row instead of being sent.
-Forge does all of this asynchronously, so the answer is "requested", not "done"; what changed shows
-up in the next refresh, which a reboot pulls forward.
+An action that can't run says why — a site with no repository, or one that has never deployed.
 
-**Rebooting is confirmed differently on purpose.** Enter arms it, and then only `Y` sends —
-lower-case `y` does not, a second enter does not, and neither does anything else: the next key
-disarms and says so. The arm expires after eight seconds. `j` and `k` cannot reach `Y` by a
-mistype, which is the point; it also means a reboot needs the keyboard, since the mouse can arm
-the row but not confirm it.
+**Maintenance mode** takes the site offline behind a 503, and brings it back on the same two
+presses. Forge does the work out on the server, so the row says `enabling…` until it has landed.
 
-Stopping a service, power-cycling a server, and the four other services Forge exposes are
-deliberately absent — see *Known gaps*.
+**Run a command** opens a prompt: type a command, enter to arm, `Y` to run. It runs as `forge` in
+the site's directory. Nothing is remembered between opens — no history, no repeat key, on purpose.
+The output arrives when the run finishes.
 
-## The rate limit
+**Deployment log** opens the latest deploy's output, ANSI stripped, scrolled to the bottom.
 
-Forge allows **60 requests a minute per user** — per Forge account, that is, shared with anything
-else on it, including Forge's own dashboard if you have it open.
+| Key | In a log or command output |
+|---|---|
+| `j` `k` or ↑ ↓ | scroll |
+| `g` / `G` | top / bottom |
+| `c` | copy the whole thing |
+| `w` | save it to `~/Downloads/` — the panel says where it landed |
+| `r` | look at a command run again |
+| `h` or esc | back |
 
-Each account therefore gets its own budget, and the widget keeps a separate ledger for each. Two
-tokens issued by the *same* person share one budget and are tracked as one, which is why setup
-records who a token belongs to.
+### A server
 
-One refresh costs **two requests per organization**, whatever the server count: one for the server
-list, one for every site in the organization with its latest deployment folded in
-(`?include=server,latestDeployment`). Five servers or fifty, it is the same two a minute at the
-default 60-second interval. A list longer than 30 rows costs one more request per extra page, since
-that is how Forge hands long lists out, up to five pages a refresh. An organization with more than
-150 sites is walked **in rotation**: each refresh checks the next slice of the list and the panel
-says so, nothing already on screen is dropped meanwhile, and full coverage arrives over a few
-refreshes rather than in one. The trade is that a status change at the far end of the rotation is
-noticed up to one rotation late; unfolding a server fetches that server's sites fresh right then
-(one extra request, held back for 15 seconds between asks), and sites keep whatever status their
-last look saw until the walk comes around again. Opening a deployment log is one more request,
-charged the same way and refused the same way — under a hold it says how long is left rather than
-asking.
+Press `l` on an unfolded server, or click the ⚙ on any server row.
 
-That figure does not change with the number of screens. Polling lives in a single service the
-shell loads once per session, not in the bar widget — which is created once per monitor. Two
-copies of the widget watching the same organization share one poll, and a deployment notifies
-once rather than once per screen.
+| | |
+|---|---|
+| **Restart nginx** | two presses |
+| **Reload PHP-FPM** | a graceful reload of the server's PHP version |
+| **Restart PHP-FPM** | the harder version |
+| **Reboot server** | enter to arm, capital `Y` to send |
 
-The site sweep for an organization is still dropped for that tick if it would take its account's
-last minute over 40 requests, and the panel says so — but at one request it takes a lot of
-organizations on one Forge account to get there. A server list is never dropped, because the bar
-icon depends on it.
+Forge does all of this asynchronously, so the answer is "requested" — what changed shows up in the
+next refresh.
 
-That ledger only counts what the widget itself spent, so Forge can still refuse a request — the
-dashboard in a browser tab is spending the same minute. When it does, the panel says "rate limited"
-and everything on that Forge account stops until the limit resets: queued work is dropped rather
-than sent, refreshes wait, and a deploy tells you how many seconds are left instead of asking again.
-It resumes on its own. Forge says when the reset is due on the response that refuses; if it doesn't,
-the wait is a minute.
+### Notifications
 
-Turning **Watch deployments** off halves that again, to one request per organization per tick, at
-the price of showing server health only. With the cost no longer growing with your server count,
-there is rarely a reason to.
+Deployments that finish or fail between refreshes raise a desktop notification, naming the
+organization when more than one is watched. Clicking it opens the site.
+
+## More than one organization
+
+One token belongs to an **account**; an account can see several **organizations**. A token that
+already sees three organizations only needs adding once. An organization on somebody else's Forge
+account needs a token of its own.
+
+Press `a` in the panel, or:
+
+```sh
+omarchy-forge add                          # store a token, pick its organizations
+omarchy-forge accounts                     # who is configured, and what each one watches
+omarchy-forge login --account clientco     # replace a token after rotating it
+omarchy-forge remove acme                  # stop watching one organization
+omarchy-forge remove --account clientco    # drop an account, its token, and its orgs
+```
+
+All of them show in one list, grouped per organization. Nothing needs restarting — a new
+organization is picked up within a refresh.
 
 ## Settings
 
-Bar widget settings, editable in Setup → Plugins or directly in `~/.config/omarchy/shell.json`:
+Editable in Setup → Plugins, or in `~/.config/omarchy/shell.json`:
 
 | Key | Default | What |
 |---|---|---|
 | `refreshIntervalSec` | `60` | seconds between refreshes (15–3600) |
 | `watchDeployments` | `true` | also fetch sites and deployment status |
 | `notifyDeployments` | `true` | notify when a deployment finishes or fails |
-| `organization` | `""` | which organizations this copy shows — empty for all of them |
-| `dashboardUrlTemplate` | `https://forge.laravel.com/{org}/{server}/{site}` | where `f` and right-click point — `{org}`/`{server}` are slugs, `{site}` an id, `{serverId}` also available; must be an `http`/`https` address |
+| `organization` | `""` | which organizations this copy shows — empty for all |
+| `dashboardUrlTemplate` | `https://forge.laravel.com/{org}/{server}/{site}` | where `f` and right-click point — `{org}`/`{server}` are slugs, `{site}` an id, `{serverId}` also available |
 
-`organization` is a filter over what the helper is watching, not a second place to configure one.
-Empty shows everything; a slug narrows the widget to that organization; a comma-separated list
-narrows it to those. `allowMultiple` is still on, so you can put a second copy in the bar pinned to
-one organization if you would rather have separate icons — each organization is polled on its own
-schedule, and where two widgets want the same one, the shorter of their two intervals wins and they
-share the result.
+`organization` is a filter, not a second place to configure one. A slug narrows the widget to that
+organization; a comma-separated list narrows it to those. You can put a second copy in the bar
+pinned to one organization if you would rather have separate icons.
+
+## Rate limits
+
+Forge allows **60 requests a minute per Forge account**, shared with anything else on it —
+including its own dashboard in a browser tab.
+
+A refresh costs **two requests per organization**, whatever your server count, and that figure
+doesn't change with the number of monitors. Opening a deployment log is one more. Running a command
+costs about a dozen, spread over a hundred seconds.
+
+The widget keeps a budget per account and backs off before it runs out, telling you on the row
+rather than failing silently. If Forge refuses anyway, the panel says "rate limited" and everything
+on that account waits until the limit resets, then resumes on its own.
+
+Organizations with more than 150 sites are checked in rotation across several refreshes — nothing
+is dropped, but a status change at the far end can be noticed one rotation late. The panel says
+when that is happening.
 
 ## The CLI
 
 `omarchy-forge` works on its own, and is useful for scripting even if you never open the panel:
 
 ```sh
-omarchy-forge setup           # guided setup, and how a second organization gets added later
-omarchy-forge add             # store a token and pick which of its organizations to watch
+omarchy-forge setup           # guided setup
+omarchy-forge add             # store a token and pick organizations to watch
 omarchy-forge accounts        # accounts, tokens, and what each one watches
 omarchy-forge orgs [account]  # organizations a token can see
 omarchy-forge org [slug]      # show or set the default organization
 omarchy-forge remove <slug>   # stop watching an organization
-omarchy-forge remove --account NAME        # drop an account, its token, and its orgs
-omarchy-forge rename OLD NEW               # give an account a different CLI handle
-omarchy-forge login --account NAME         # replace the token on an account
+omarchy-forge rename OLD NEW  # give an account a different CLI handle
 omarchy-forge logout [account]             # remove an account's token
 omarchy-forge status [--org SLUG]          # server health as a table
-omarchy-forge doctor          # every account: token, auth, rate limit left
-omarchy-forge api --account default GET /orgs/acme/servers   # raw request, JSON envelope
-omarchy-forge api --org acme POST /orgs/acme/servers/1/actions '{"action":"reboot"}'
+omarchy-forge doctor                       # every account: token, auth, rate limit left
+omarchy-forge api --account default GET /orgs/acme/servers      # raw request
 ```
 
 To have it on your `PATH`:
@@ -310,63 +219,38 @@ To have it on your `PATH`:
 ln -sf ~/.config/omarchy/plugins/acobrerosf.forge/omarchy-forge ~/.local/bin/omarchy-forge
 ```
 
-`api` always prints one envelope, whatever went wrong:
+`api` always prints one JSON envelope, whatever went wrong:
 
 ```json
 {"ok": true, "status": 200, "rateRemaining": 57, "rateReset": null, "body": { }, "error": null}
 ```
 
-`rateReset` is how many seconds are left before the limit resets, or `null` — Forge only says when
-it is the response refusing you.
+A third argument is a JSON request body; pass `-` to read it from stdin instead. `--account` names
+the credential to use and `--org` picks it by organization; with neither, the default organization's
+account is used. `$FORGE_TOKEN` (with `$FORGE_ACCOUNT`) overrides the keyring for one run.
 
-A third argument is a JSON request body, checked for being JSON before anything is sent. It reaches
-curl the way the token does — down the config on stdin — rather than through a command line.
-
-`--account` names the credential to use and `--org` picks it by which organization owns it; with
-neither, the account behind the default organization is used. `$FORGE_TOKEN` overrides the keyring
-for that one account, for CI or for trying a token without storing it — set `$FORGE_ACCOUNT`
-alongside it to say which.
-
-State lives in `~/.local/state/omarchy/forge.json`: which accounts exist, which organizations each
-one reaches, and which is the default. Tokens are never in there.
+State lives in `~/.local/state/omarchy/forge.json` — which accounts exist, which organizations each
+reaches, and which is the default. Tokens are never in there.
 
 ## Requirements
 
-- Omarchy 4.0 or newer (the Quickshell plugin host)
-- `curl`, `jq`, `secret-tool` — all present on a stock Omarchy install
-- `wl-copy` for the copy action
-- `gum`, optionally — it makes picking organizations nicer; there is a numbered fallback without it
+- Omarchy 4.0 or newer
+- `curl`, `jq`, `secret-tool` — all on a stock Omarchy install
+- `wl-copy` for the copy actions
+- `gum`, optionally — nicer organization picking; there is a numbered fallback without it
 
-## Known gaps
+## Known limits
 
-- **The dashboard URL is a template, not something derived.** The Forge API never hands out a web
-  link, so `dashboardUrlTemplate` is a setting. `{org}` and `{server}` are slugs, `{site}` is an id;
-  `{serverId}` is available if you need the numeric server id instead. Note that a server's
-  slug is fixed at creation and does not follow a rename, which is why it has to come from the API
-  rather than be derived from the name.
-- **The server view stops at four actions.** Forge can also `stop` a service and `power-cycle` a
-  server; neither is here, because a service stopped from the bar is one nothing in this widget
-  could start again, and a power cycle is not something to reach by keypress. mysql, postgres,
-  redis and supervisor take the same endpoint and are not listed either — only the two services a
-  bad deploy actually leaves you wanting. PHP acts on the server's own version; a site isolated
-  onto a different one would need the site view, not this one.
-- **The server list stops at 150 rows.** Forge returns 30 rows a page — whatever `page[size]` asks
-  for — and points at the rest with a cursor. The widget follows it, up to five pages per refresh,
-  or until the account's minute is nearly spent, and says "showing the first 150 servers" rather
-  than quietly showing a prefix. Sites are no longer capped this way: past 150 the list is checked
-  in rotation across refreshes (see the rate limit section), so every site is watched, just not all
-  in the same minute. `omarchy-forge` on the command line still stops at five pages and warns on
-  stderr; `FORGE_MAX_PAGES` raises its cap for a one-off run.
-- **Notification text is scrubbed harder than it should need to be.**
-  `omarchy-notification-send` passes the headline and the description to `notify-send` as bare
-  positionals with no `--` in front of them, so both its own option loop and notify-send's GLib
-  parser — which permutes, and so reads options *after* positionals — take a leading `-` as a
-  flag. A site named `--hint=string:omarchy-exec:…` would become the command the toast runs when
-  clicked. This plugin defends itself by stripping leading hyphens and control characters from
-  both strings, so a site name that starts with a hyphen loses it in the notification. The real
-  fix is one line in `/usr/bin/omarchy-notification-send` — `notify-send "${args[@]}" --
-  "$headline" "$description"` — which protects every other plugin too, but that script is
-  package-owned, so it is a report to file upstream rather than something this repo can change.
+- **The dashboard URL is a template.** The Forge API hands out no web link, so
+  `dashboardUrlTemplate` is a setting.
+- **The server view stops at four actions.** Stopping a service and power-cycling a server are
+  deliberately absent, as are the database and queue services.
+- **The server list stops at 150 rows** and says so rather than quietly showing a prefix. Sites are
+  not capped — past 150 they are checked in rotation.
+- **A command run has no history and no partial output.** You see the run you just started, and its
+  output arrives when it finishes.
+- **Deployment logs need a write scope.** That is Forge's choice, not this plugin's — a strictly
+  read-only token can watch a deployment fail and not be told why.
 
 ## License
 

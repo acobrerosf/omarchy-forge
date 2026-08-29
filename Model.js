@@ -408,10 +408,17 @@ function siteActions(org, site) {
       path: site ? maintenancePath(org, site.serverId, site.id) : "",
       // `status` is the only field Forge requires, and 503 is the one value in
       // its enum that means "come back later". `secret` and `redirect` are the
-      // other two it accepts and both stay out: they are free text, and what
-      // rides the argv `_startAction` builds is a fixed word decided here, not
-      // something a user typed.
+      // other two it accepts and both stay out: they are free text with no
+      // reading on a row, and a maintenance toggle is not the place to type.
+      // Running a command is, and it is the one body here a user writes — so it
+      // travels on stdin rather than in the argv this one rides. See
+      // `siteCommandAction`.
       body: parked ? null : { status: 503 } },
+    // No `armable` and no path: this one opens a prompt, the way `log` opens a
+    // pane. What it eventually sends is declared in `siteCommandAction`, which
+    // cannot be built until there is a command to put in it.
+    { id: "command", label: "Run a command", hint: "",
+      available: !!site, reason: "not listed" },
     { id: "log", label: "Deployment log", hint: "",
       available: deployed, reason: deployed ? "" : "never deployed" },
     { id: "open", label: "Open site", hint: "o",
@@ -419,6 +426,120 @@ function siteActions(org, site) {
     { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
     { id: "ssh", label: "Copy ssh command", hint: "s", available: true, reason: "" }
   ]
+}
+
+// The row the command prompt arms, built from what has been typed rather than
+// from the site alone — which is why it is a function of its own and not a
+// seventh entry in `siteActions`. Everything else about it is an ordinary write
+// job, so `Panel.runWriteAction` and `Service._startAction` need no special
+// case beyond the two below.
+//
+// `confirm: "Y"` rather than the deploy's "again": this is arbitrary remote
+// code execution, so it takes the same second key a reboot does, and for the
+// same reason — the press that sends it should be one nothing else means.
+//
+// `bodyStdin` is the other difference. Every other body here is a fixed word
+// decided in this file; this one is what someone typed, and while it is not a
+// credential it can quote one, so it does not go in an argv that
+// /proc/<pid>/cmdline hands to every process on the machine.
+//
+// The text is trimmed once, here, and everything downstream uses what this
+// sends: Forge stores the command as it received it and `commandFrom` compares
+// the two exactly, so a trailing space typed into the field would leave the run
+// unfindable — it would be on the box and the pane would never see it.
+function siteCommandAction(org, site, command) {
+  var text = String(command === undefined || command === null ? "" : command).trim()
+  var ready = !!site && text !== ""
+  return { id: "command-run", label: "Run", hint: "",
+           armable: true, confirm: "Y",
+           // Rides into the arm key, for the reason the maintenance toggle's
+           // does — and more so: this row *is* its text. The field can still be
+           // typed into for one turn of the event loop after enter has armed it
+           // (see `Panel.stopCommandEditing`), and without the intent that
+           // keystroke would leave the arm matching a row that now runs
+           // something else.
+           armIntent: text,
+           available: ready,
+           reason: !site ? "not listed" : "type a command first",
+           armedText: "press Y to run",
+           // Forge answers 202 and goes off to the box, the same as every other
+           // write here — the pane that opens next is what says how it went.
+           done: "Command sent",
+           method: "POST",
+           scopeMessage: "Your token can't run commands — that needs the "
+             + "site:manage-commands scope",
+           path: site ? commandsPath(org, site.serverId, site.id) : "",
+           body: { command: text }, bodyStdin: true }
+}
+
+// ------------------------------------------------------------ command runs
+
+// Forge's five states, split the one way the pane cares about. `waiting` is
+// queued and `running` is on the box; both mean look again.
+function commandIsTerminal(status) {
+  var value = String(status || "")
+  return value === "finished" || value === "timeout" || value === "failed"
+}
+
+// The line above the output. `status` is the only field that has always been
+// populated — a command run long enough ago comes back with a null `exit_code`
+// and a null `error_output` even when it plainly failed — so the state word
+// leads and everything else is added only when it is there.
+function commandStateFrom(attributes) {
+  var attrs = attributes || {}
+  var status = String(attrs.status || "")
+  var parts = [status === "" ? "unknown" : status]
+  var duration = String(attrs.duration || "")
+  if (duration !== "") parts.push(duration)
+  if (typeof attrs.exit_code === "number") parts.push("exit " + attrs.exit_code)
+  var failure = plainText(attrs.error_output || "")
+  if (failure !== "") parts.push(failure)
+  return { running: !commandIsTerminal(status), status: status,
+           bad: status === "failed" || status === "timeout",
+           header: parts.join(" · ") }
+}
+
+// The header's first word is always the state — see `commandStateFrom` — and it
+// is what decides whether the line is drawn as a failure. Read back rather than
+// carried alongside, so the two never disagree about which words are bad.
+function commandHeaderBad(header) {
+  var word = String(header || "").split(" ")[0]
+  return word === "failed" || word === "timeout"
+}
+
+// Which row of the index is the run that was just sent. Forge answers the POST
+// 202 with no body at all — unlike a deploy, which hands its resource back — so
+// the id has to be recognised rather than received.
+//
+// Matching on the command text alone would adopt an identical run somebody
+// started from the dashboard an hour ago, so the send time is the other half of
+// it. The margin is generous because `created_at` is Forge's clock, not this
+// machine's, and only has to separate this run from the history behind it.
+var commandClockSkewMs = 120000
+
+// Which leaves the run the *user* just made themselves, and that margin is far
+// too wide for: re-running the same command a minute later, which is what
+// reading a failure and trying again is, would adopt the failure. So the caller
+// carries `afterMs` — the `created_at` of the last run it adopted for this site
+// and this text — and a candidate has to be newer than that. Exact rather than
+// generous, because this half compares one Forge timestamp with another and no
+// clock skew comes into it. It is a floor rather than a single id, so three
+// repeats in a row are covered by the same number as two.
+function commandFrom(body, sent, sinceMs, afterMs) {
+  var rows = body && body.data ? body.data : []
+  if (!rows.length) return null
+  var text = String(sent || "")
+  var floor = Math.max(Number(sinceMs || 0) - commandClockSkewMs,
+                       Number(afterMs || 0) + 1)
+  for (var i = 0; i < rows.length; i++) {
+    var attrs = rows[i].attributes || {}
+    if (String(attrs.command || "") !== text) continue
+    var made = Date.parse(String(attrs.created_at || ""))
+    if (isNaN(made) || made < floor) continue
+    // `madeMs` is what the caller keeps to become the next run's `afterMs`.
+    return { id: String(rows[i].id), attributes: attrs, madeMs: made }
+  }
+  return null
 }
 
 // ----------------------------------------------------------- server actions
@@ -987,6 +1108,42 @@ function deploymentLogPath(org, serverId, siteId, deploymentId) {
   return deployPath(org, serverId, siteId) + "/" + encode(deploymentId) + "/log"
 }
 
+// Running a command on a site, and reading back what it did. Note that the
+// scopes are split across the same four paths, which no other endpoint here
+// does: the POST is gated behind `site:manage-commands` — Forge's *run a
+// command* scope, which maintenance mode also sits behind — while all three
+// reads want only `server:view`. So a token that can watch a server can follow
+// a run it is not allowed to start, and the 403 belongs on the row that sent
+// rather than on the pane that reads.
+function commandsPath(org, serverId, siteId) {
+  return sitePath(org, serverId, siteId) + "/commands"
+}
+
+// Newest first, because the run being looked for is the one just sent — see
+// `commandFrom`. `pagedPath` is what percent-encodes `page[size]`: curl reads a
+// literal bracket as a glob and refuses the URL outright.
+function commandListPath(org, serverId, siteId) {
+  return pagedPath(commandsPath(org, serverId, siteId) + "?sort=-created_at")
+}
+
+function commandPath(org, serverId, siteId, commandId) {
+  return commandsPath(org, serverId, siteId) + "/" + encode(commandId)
+}
+
+function commandOutputPath(org, serverId, siteId, commandId) {
+  return commandPath(org, serverId, siteId, commandId) + "/output"
+}
+
+// The three reads above, as a question a queued job can be asked. Named here
+// beside the paths they take rather than spelled out at each of the places in
+// the service that has to recognise one — a job dropped without an answer is a
+// pane waiting forever, so every drop site asks this.
+function isCommandJob(job) {
+  var kind = job ? String(job.kind || "") : ""
+  return kind === "commandFind" || kind === "commandShow"
+    || kind === "commandOutput"
+}
+
 // The API never hands out a web link, so the dashboard address is a template
 // the user can correct rather than something derived. A server row has no site
 // to point at, so `{site}` and the separator in front of it drop out together.
@@ -1115,6 +1272,12 @@ function safeFileName(value) {
 
 function logFileName(siteName, deploymentId) {
   return "forge-" + safeFileName(siteName) + "-" + safeFileName(deploymentId) + ".log"
+}
+
+// Both halves again: the site name is API data and the id is a path segment,
+// and a separator in either is what `safeFileName` is here to stop.
+function commandFileName(siteName, commandId) {
+  return "forge-" + safeFileName(siteName) + "-" + safeFileName(commandId) + ".out"
 }
 
 // A cap on what is kept in memory and laid out. Forge's own logs run to tens

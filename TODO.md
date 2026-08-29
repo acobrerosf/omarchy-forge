@@ -9,24 +9,7 @@ Everything below was checked against the v2 OpenAPI spec
 
 ## Features
 
-### 6. Run a site command
-
-`POST .../sites/{site}/commands` then `GET .../commands/{id}/output`, scope
-`site:manage-commands` — which maintenance mode already required, so this asks
-for no scope anyone using that toggle has not already granted. That removes the
-main argument for keeping it low: the cost is now the friction below, not a
-permission ask.
-
-"Run `php artisan migrate` from the bar" is a genuinely useful thing to have
-during a deploy that half-failed.
-
-This is arbitrary remote code execution, so it wants deliberate friction: a
-prompt rather than a keystroke, no history of one-key repeats, and a clear
-statement of which site and server it will run on. The pane it would show the
-output in already exists — `ForgeLogView.qml` — and so does the place to put the
-action, which is the site view's ACTIONS list.
-
-### 7. Server events feed
+### 1. Server events feed
 
 `GET .../servers/{server}/events` and `/events/{event}/output`, scope
 `server:view`. A feed of what Forge itself is doing to a server — provisioning
@@ -34,7 +17,7 @@ steps, service restarts, failures. Would give an "unreachable" server row a
 *reason* instead of a state word. One request per server when opened, so on
 demand only.
 
-### 8. Site logs
+### 2. Site logs
 
 `GET .../sites/{site}/logs/{application,nginx-error,nginx-access}`, scope
 `server:view` — note it is the *read* scope, unlike deployment output, so this
@@ -43,21 +26,21 @@ log is the natural companion to a site that is up but returning 500s. It reuses
 `ForgeLogView.qml` and adds three entries to the site view's ACTIONS list; the
 service already has the shape of the request in `fetchDeploymentLog`.
 
-### 9. Recipes
+### 3. Recipes
 
 `GET /orgs/{org}/recipes` and `POST /orgs/{org}/recipes/{recipe}/runs`, scopes
 `recipe:view` / `recipe:manage`. Run a saved script across servers from the bar.
 Real value for people who already keep recipes; nothing at all for people who
 don't, which is why it sits below the rest.
 
-### 10. Monitors and heartbeats
+### 4. Monitors and heartbeats
 
 `GET .../servers/{server}/monitors` (scope `server:view`) and the site
 `heartbeats` endpoints. Forge's own alerting, surfaced in the bar. Would need
 its own idea of what "unhealthy" means on top of the four tones we have, so
 it is a bigger design question than it looks.
 
-### 11. The rest of the services
+### 5. The rest of the services
 
 Done: nginx restart, PHP-FPM reload and restart, and server reboot behind a
 `Y` confirm, in a server view reached with `l`. What that left out, in the order

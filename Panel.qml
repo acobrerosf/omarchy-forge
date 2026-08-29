@@ -52,6 +52,12 @@ Panel {
   readonly property var routeSite: route ? siteFor(route) : null
   readonly property var routeServer: route ? serverById(route.org, route.serverId) : null
 
+  // The two routes that are a pane rather than a list. They share everything
+  // that follows from that — no cursor to move, j/k scrolls instead, a wider
+  // card, and the reading keys `g G c w` — so the distinction is drawn once
+  // here rather than at each of the places that has to know.
+  readonly property bool paneRoute: routeKind === "log" || routeKind === "commandOutput"
+
   // The log this panel asked for, and what came back. Keyed the same way the
   // service keys its answer, so two screens with two logs open don't cross.
   property string logRequestKey: ""
@@ -62,6 +68,25 @@ Panel {
   property var logLines: []
   property string logError: ""
   property bool logLoading: false
+
+  // The command prompt and the run it turns into. `commandText` is deliberately
+  // not remembered between opens: a command that can be recalled is a command
+  // that can be repeated by accident, which for this endpoint is the whole
+  // thing worth preventing.
+  property string commandText: ""
+  // Drives `PanelKeyCatcher.blocked`. While it is true the catcher forwards
+  // every key to the field instead of reading it as movement, so it has to go
+  // false again — and focus has to be handed back by hand — before `h j k l`
+  // mean anything again. See `stopCommandEditing`.
+  property bool commandEditing: false
+  property string commandRequestKey: ""
+  property var commandLines: []
+  property string commandHeader: ""
+  property string commandError: ""
+  property bool commandRunning: false
+  // The run's own id, which arrives only once it has been recognised. It names
+  // the file `w` writes; nothing else here needs it.
+  property string commandId: ""
   // Nothing here that changes a real server goes on one press: the first arms
   // the row, the second sends it. `armedConfirm` is what the second press has
   // to be — "again" for a deploy or a service restart, "Y" for a reboot, which
@@ -198,7 +223,29 @@ Panel {
   // than a different list: the same cursor, the same delegate, the same key
   // handler, so nothing about moving around has to be learned twice.
   readonly property var rows: {
-    if (routeKind === "log") return []
+    if (paneRoute) return []
+    // One row, and it is the send. Built from what has been typed rather than
+    // from the site alone, so that arming it, rendering "press Y to run" and
+    // reporting the result all go through the machinery the other writes
+    // already use — see `Model.siteCommandAction`.
+    if (routeKind === "command") {
+      if (!routeSite) return []
+      var send = Model.siteCommandAction(route.org, routeSite, commandText)
+      return [{ kind: "action", org: route.org, serverId: route.serverId,
+                siteId: route.siteId, action: send,
+                // The typed command rides the arm key the way the maintenance
+                // toggle's direction does, and for the sharper version of the
+                // same reason: this row is nothing *but* its text. A keystroke
+                // that lands after enter has armed it — the field keeps focus
+                // for one turn of the event loop, see `stopCommandEditing` —
+                // then lapses the arm instead of retargeting it at a command
+                // the row never named.
+                armKey: route.org + "/" + route.siteId + "/command-run/"
+                  + send.armIntent,
+                // Not the arm key: the cursor is restored by row key, and a row
+                // that changed its identity on every keystroke would lose it.
+                key: route.org + "/" + route.siteId + "/command-run" }]
+    }
     if (routeKind === "site" || routeKind === "server") return actionRows
 
     var out = []
@@ -273,7 +320,20 @@ Panel {
     cursorActive = false
     disarm()
     clearLog()
+    clearCommand()
     return true
+  }
+
+  // Swapping the top of the stack rather than growing it. The prompt is spent
+  // once it has sent — backing out of the output onto a filled-in command that
+  // has already run is an invitation to run it twice — so the pane takes its
+  // place and `h` lands on the site view behind them both.
+  function replaceView(view) {
+    if (navStack.length === 0) { pushView(view); return }
+    navStack = navStack.slice(0, navStack.length - 1).concat([view])
+    cursorIndex = 0
+    cursorActive = false
+    disarm()
   }
 
   function serverKey(org, serverId) {
@@ -513,6 +573,15 @@ Panel {
   readonly property string hintText: {
     if (routeKind === "log")
       return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [h] back"
+    if (routeKind === "commandOutput")
+      return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [r] look again · [h] back"
+    // Two lines because it is two states, and the one it is in is the whole
+    // question: a field that is typing into and a row that is waiting for `Y`
+    // look similar and take completely different keys.
+    if (routeKind === "command")
+      return commandEditing ? "type a command · [enter] arm · [esc] cancel"
+        : armedKey !== "" ? "[Y] run · [enter] edit again · [h] back"
+        : "[enter] arm · [h] back"
     var row = cursorActive ? currentRow() : null
     if (routeKind === "site" || routeKind === "server") {
       // The confirm key is worth naming on the one row that wants it, and
@@ -551,6 +620,14 @@ Panel {
     }
     switch (String(action.id)) {
     case "deploy": deployCurrent(); break
+    case "command": openCommandPrompt(); break
+    // The prompt's own row. It reaches the same two presses as a reboot, so it
+    // reaches them through the same function — except for the second enter,
+    // which everywhere else means "never mind" and here means "let me fix it".
+    case "command-run":
+      if (armedKey === row.armKey && armedConfirm === "Y") reopenCommandPrompt()
+      else runWriteAction(row)
+      break
     case "log": openLog(); break
     case "open": openCurrent(); break
     case "forge": openCurrentInForge(); break
@@ -603,7 +680,23 @@ Panel {
   function confirmArmed() {
     var row = currentRow()
     if (!row || armedConfirm !== "Y" || armedKey === "") return
-    if (row.armKey !== armedKey) return
+    // The arm lapsed rather than missed: an arm key carries what the row meant
+    // when it was armed — the command that was typed, the direction a toggle
+    // was pointing — so a row that no longer matches is one that changed under
+    // the arm. The press is spent saying so rather than sending something the
+    // row never named.
+    if (row.armKey !== armedKey) {
+      disarm()
+      say("That changed while it was armed — arm it again")
+      return
+    }
+    // Re-checked here, not only in `runAction`: the subject can go from the API
+    // inside the confirm window, and this path never went past that check.
+    if (row.action && row.action.available === false) {
+      disarm()
+      say(String(row.action.label) + " — " + String(row.action.reason))
+      return
+    }
     sendWriteAction(row)
   }
 
@@ -614,6 +707,27 @@ Panel {
     disarm()
     if (!forge) return
     actionRequestedKey = row.armKey
+    // A command is the one write with an answer worth waiting for, so it goes
+    // out through its own door and the pane that follows it is opened here —
+    // see `onActionFinished`, which is where the 202 lands.
+    if (String(row.action.id) === "command-run") {
+      var key = forge.runSiteCommand(row.org, row.serverId, row.siteId,
+                                     row.action, row.armKey)
+      // Nothing was sent — the last write is still in flight, the minute is
+      // spent, the site has gone. The refusal has already been said through
+      // `onActionFinished`, and there is no run to watch, so the prompt is left
+      // exactly as it was rather than dressed up as one that is running.
+      if (key === "") return
+      // Set before the answer can arrive: the service says "queued" the moment
+      // the 202 lands, and an update this screen cannot recognise is one it
+      // would throw away.
+      commandRequestKey = key
+      commandLines = []
+      commandError = ""
+      commandHeader = ""
+      commandRunning = true
+      return
+    }
     forge.sendAction(row.org, row.serverId, row.action, row.armKey)
   }
 
@@ -651,23 +765,125 @@ Panel {
     forge.fetchDeploymentLog(row.org, row.serverId, site.id, site.deploymentId)
   }
 
-  // The two ways a log leaves this pane. Both take the text already on screen,
-  // so neither costs a request — and both go out on stdin rather than in an
-  // argv, because a verbose deploy can outgrow what an argument may hold.
-  function copyLog() {
-    if (logLines.length === 0 || !forge) return
-    forge.copyToClipboard(logLines.join("\n") + "\n")
-    say("Copied " + Model.pluralize(logLines.length, "line"))
+  // The two ways what is on screen leaves this pane, for either of the panes.
+  // Both take the text already there, so neither costs a request — and both go
+  // out on stdin rather than in an argv, because a verbose deploy can outgrow
+  // what an argument may hold.
+  readonly property var paneLines: routeKind === "commandOutput" ? commandLines : logLines
+
+  function copyPane() {
+    if (paneLines.length === 0 || !forge) return
+    forge.copyToClipboard(paneLines.join("\n") + "\n")
+    say("Copied " + Model.pluralize(paneLines.length, "line"))
   }
 
-  function saveLog() {
-    if (logLines.length === 0 || !forge || !route) return
+  function savePane() {
+    if (paneLines.length === 0 || !forge || !route) return
     var site = routeSite
+    var name = site ? site.name : ""
     // The file is named after the site, which is API data reaching a path.
-    // `Model.logFileName` is what stops a site name being a separator.
-    var name = Model.logFileName(site ? site.name : "", route.deploymentId)
-    saveRequestedPath = forge.downloadDir() + "/" + name
-    forge.saveText(logLines.join("\n") + "\n", saveRequestedPath)
+    // These two are what stop a site name being a separator.
+    saveRequestedPath = forge.downloadDir() + "/"
+      + (routeKind === "commandOutput"
+         ? Model.commandFileName(name, commandId)
+         : Model.logFileName(name, route.deploymentId))
+    forge.saveText(paneLines.join("\n") + "\n", saveRequestedPath)
+  }
+
+  // ---------------------------------------------------------- run a command
+
+  function clearCommand() {
+    if (forge && commandRequestKey !== "") forge.stopCommandWatch(commandRequestKey)
+    commandRequestKey = ""
+    // The field holds its own text, so clearing the property it feeds is not
+    // enough — and leaving a spent command in it is the one-key repeat this
+    // whole route is shaped to avoid.
+    commandField.text = ""
+    commandText = ""
+    commandId = ""
+    commandLines = []
+    commandHeader = ""
+    commandError = ""
+    commandRunning = false
+    stopCommandEditing()
+  }
+
+  function openCommandPrompt() {
+    var row = currentRow()
+    var site = currentSite()
+    if (!site) { say("That site is no longer listed"); return }
+
+    clearCommand()
+    pushView({ kind: "command", org: row.org, serverId: row.serverId,
+               siteId: site.id })
+    startCommandEditing()
+  }
+
+  // Focus is handed over by hand in both directions, which is the contract
+  // `PanelKeyCatcher.blocked` documents: while the field has it the catcher is
+  // deaf, and nothing gives it back on its own. `Qt.callLater` because the
+  // field may not exist yet on the frame the route changed.
+  function startCommandEditing() {
+    commandEditing = true
+    cursorActive = false
+    Qt.callLater(function () { if (commandField.visible) commandField.forceActiveFocus() })
+  }
+
+  // Deferred, both halves of it, and that is the whole point. The enter that
+  // arms is delivered to the field *while the catcher is still blocked*;
+  // clearing the flag here and now would unblock the catcher mid-delivery, and
+  // the same keypress would go on to reach `onActivateRequested` — which, on a
+  // row that was just armed, reads as "enter again" and hands the arm straight
+  // back. The arm never survived the press that made it, so `Y` went into the
+  // field instead of confirming. One turn of the event loop is enough to keep
+  // the two apart.
+  function stopCommandEditing() {
+    if (!commandEditing) return
+    Qt.callLater(function () {
+      root.commandEditing = false
+      keyCatcher.forceActiveFocus()
+    })
+  }
+
+  // Enter in the field. It does not send — it arms, and the row below the field
+  // says what is about to run and on which site. `Y` is the press that sends.
+  function armCommand() {
+    var row = currentRow()
+    if (!row || !row.action) return
+    if (row.action.available === false) {
+      say(String(row.action.reason || "Nothing to run"))
+      return
+    }
+    stopCommandEditing()
+    cursorActive = true
+    cursorIndex = 0
+    arm(row.armKey, "Y")
+  }
+
+  // Both ways out of an armed command that was not confirmed: the text is kept
+  // and the field takes focus back, because the likely next move is to fix a
+  // typo rather than to start again.
+  function reopenCommandPrompt() {
+    disarm()
+    startCommandEditing()
+  }
+
+  // The prompt has sent, so it becomes the pane that follows the run, and the
+  // text goes with the prompt — see `commandText`.
+  function openCommandOutput() {
+    commandText = ""
+    stopCommandEditing()
+    replaceView({ kind: "commandOutput", org: route.org, serverId: route.serverId,
+                  siteId: route.siteId })
+  }
+
+  // Only the panel that has a live watch can look again, and only it should say
+  // so: once the output has landed the run is done being read, and a flash
+  // saying otherwise is a look that never happened.
+  function refreshCommandRun() {
+    if (!forge || commandRequestKey === "") return
+    say(forge.refreshCommand(commandRequestKey) ? "Looking again"
+                                                : "Nothing left to look at")
   }
 
   function disarm() {
@@ -746,7 +962,7 @@ Panel {
     // Reopening lands on the tree. A view is where a train of thought was, and
     // resuming one from an hour ago mid-way is disorienting — the log behind
     // it is stale by then anyway.
-    else { disarm(); cursorActive = false; navStack = []; clearLog() }
+    else { disarm(); cursorActive = false; navStack = []; clearLog(); clearCommand() }
   }
 
   // A server that has just started failing is worth unfolding on its own — the
@@ -783,6 +999,35 @@ Panel {
       if (root.actionRequestedKey !== key) return
       root.actionRequestedKey = ""
       root.say(message)
+      // The send was accepted, so the prompt has done its job and the pane that
+      // follows the run takes its place. A refusal — no scope, rate limited —
+      // leaves the prompt standing with the text still in it, which is what
+      // makes trying again after fixing the token one keypress.
+      if (!ok || root.routeKind !== "command") return
+      root.openCommandOutput()
+    }
+
+    // The run, from `queued` through to what it printed. Filtered by key like
+    // the log's: the service answers the session, and a second screen watching
+    // a different run must not be updated by this one.
+    function onCommandRunUpdated(requestKey, ok, running, commandId, header,
+                                 text, message) {
+      if (root.commandRequestKey !== requestKey) return
+      root.commandRunning = running
+      root.commandHeader = Model.plainText(header)
+      // Kept for the file name `w` writes, which is the only thing that needs
+      // it — and it only arrives once the run has been recognised.
+      if (commandId !== "") root.commandId = commandId
+      if (!ok) {
+        root.commandError = String(message || "Could not read the command")
+        return
+      }
+      root.commandError = ""
+      // Same guard, same boundary as the log's: split only what the guard has
+      // already been through, or an escape sequence survives the split. Only a
+      // settled run assigns at all — and an empty one assigns empty, which is
+      // what lets the pane finally say the command printed nothing.
+      if (!running) root.commandLines = text === "" ? [] : Model.logLines(text)
     }
 
     // Filtered the same way and for the same reason: the service answers the
@@ -810,6 +1055,10 @@ Panel {
   Timer {
     id: disarmTimer
     interval: 4000
+    // Plain `disarm()`, deliberately: every *deliberate* way of dropping an arm
+    // hands the command field its focus back, and this one must not — the key
+    // most likely to follow a confirm line is `Y`, and it would land in the
+    // command as a character. See ARCHITECTURE.md's Views.
     onTriggered: root.disarm()
   }
 
@@ -896,10 +1145,10 @@ Panel {
     // plain bindings, so the card follows the view onto the screen. Both
     // helpers clamp to what the screen actually has, so asking for more than
     // fits is safe.
-    contentWidth: panel.fittedContentWidth(Style.space(root.routeKind === "log" ? 620 : 420))
+    contentWidth: panel.fittedContentWidth(Style.space(root.paneRoute ? 620 : 420))
     contentHeight: panel.fittedContentHeight(column.implicitHeight + footer.implicitHeight
                                              + Style.space(12),
-                                             Style.space(root.routeKind === "log" ? 760 : 560))
+                                             Style.space(root.paneRoute ? 760 : 560))
     popoutSwitching: root.popoutSwitching
     popoutSwitchClosing: root.popoutSwitchClosing
 
@@ -907,13 +1156,23 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
 
+      // The one place this panel hands its keys away. While the command field
+      // has focus every key belongs to it — `h j k l` included, which are
+      // movement everywhere else and letters in a shell command. Nothing gives
+      // focus back on its own: `stopCommandEditing` does it by hand.
+      blocked: root.commandEditing
+
       // `h j k l` never reach onTextKey — the catcher reads them as movement
       // before that — so the horizontal axis is where a tree key has to come
       // from. It cost nothing to take: until the site view existed, right and
       // `l` were a second way to press `j`.
       onMoveRequested: function(dx, dy) {
         if (dy !== 0) {
-          if (root.routeKind === "log") logView.scrollBy(dy)
+          if (root.paneRoute) logView.scrollBy(dy)
+          // One row and a field above it: there is nowhere to move to, so j/k
+          // means what every other stray key at the confirm means — back to
+          // typing, with what was typed still there.
+          else if (root.routeKind === "command") root.reopenCommandPrompt()
           else root.moveCursor(dy)
           return
         }
@@ -923,7 +1182,7 @@ Panel {
       // Enter raises returnRequested AND activateRequested; space raises only
       // activateRequested. Handling both would run the action twice — which
       // would arm a deploy and immediately send it, skipping the confirm.
-      onActivateRequested: if (root.routeKind !== "log") root.activate()
+      onActivateRequested: if (!root.paneRoute) root.activate()
       // Out of the view first, out of the panel only from the tree.
       onCloseRequested: if (!root.back()) root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
@@ -937,6 +1196,14 @@ Panel {
           // The press is spent disarming and says so, rather than disarming
           // and then also doing whatever it usually does.
           var armedRow = root.currentRow()
+          // A command that was not confirmed goes back to being editable
+          // rather than being thrown away — the press that disarmed it was
+          // most likely aimed at the typo it names.
+          if (root.routeKind === "command") {
+            root.reopenCommandPrompt()
+            root.say("Not confirmed — still editing")
+            return
+          }
           root.disarm()
           root.say(armedRow && armedRow.action
                    ? String(armedRow.action.label) + " — not confirmed"
@@ -945,14 +1212,20 @@ Panel {
         }
         // Before the fold to lower case, because these two are a pair that
         // only means anything while their case is intact.
-        if (root.routeKind === "log") {
+        if (root.paneRoute) {
           if (text === "g") { logView.toTop(); return }
           if (text === "G") { logView.toEnd(); return }
-          if (text === "c" || text === "C") { root.copyLog(); return }
-          if (text === "w" || text === "W") { root.saveLog(); return }
+          if (text === "c" || text === "C") { root.copyPane(); return }
+          if (text === "w" || text === "W") { root.savePane(); return }
         }
         switch (String(text).toLowerCase()) {
-        case "r": root.refresh(); break
+        // In the output pane `r` looks at the run again rather than refreshing
+        // everything being watched: the one thing on screen is the one thing
+        // worth re-reading, and the ladder that was following it has stopped.
+        case "r":
+          if (root.routeKind === "commandOutput") root.refreshCommandRun()
+          else root.refresh()
+          break
         case "o": root.openCurrent(); break
         case "f": root.openCurrentInForge(); break
         case "s": root.copyCurrentSsh(); break
@@ -1089,6 +1362,62 @@ Panel {
             }
           }
 
+          // ------------------------------------------------------- command
+
+          // The prompt. Not a row: a row is something the cursor lands on and
+          // a keypress does, and this is the one place in the panel where a
+          // keypress is a letter. The row below it — the only one this route
+          // has — is what sends.
+          Column {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: root.routeKind === "command"
+
+            PanelSectionHeader {
+              text: "RUN A COMMAND"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            TextField {
+              id: commandField
+              width: parent.width
+              foreground: root.foreground
+              accent: root.busyColor
+              placeholderText: "php artisan migrate"
+              // Bound one way only: `commandText` is what the row is built
+              // from, and binding it back would fight the field's own editing.
+              onTextChanged: root.commandText = text
+              onAccepted: root.armCommand()
+              Keys.onEscapePressed: root.back()
+              // Focus arrives by hand from `startCommandEditing`; this is for
+              // the frame the route changes on, where that call is too early.
+              onVisibleChanged: if (visible && root.commandEditing) Qt.callLater(forceActiveFocus)
+            }
+
+            // Where it lands, stated rather than assumed. The site view above
+            // names the site; this names the machine and the account, which is
+            // the part a command can be wrong about.
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              color: root.foreground
+              opacity: 0.5
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              text: {
+                var site = root.routeSite
+                var server = root.routeServer
+                if (!site) return ""
+                return "runs as forge in " + Model.plainText(site.name)
+                  + "'s directory, on "
+                  + Model.plainText(server ? server.name : "this server")
+                  + (server && server.ip ? " · " + Model.plainText(server.ip) : "")
+              }
+            }
+          }
+
           // ------------------------------------------------------ servers
 
           Column {
@@ -1097,6 +1426,10 @@ Panel {
             visible: root.rows.length > 0
 
             PanelSectionHeader {
+              // The command route's one row sits directly under the field it
+              // is about, which the block above has already headed — a second
+              // header between the two would only separate them.
+              visible: root.routeKind !== "command"
               text: root.routeKind === "site" || root.routeKind === "server" ? "ACTIONS"
                 : root.showOrgHeaders ? "ORGANIZATIONS" : "SERVERS"
               foreground: root.foreground
@@ -1229,17 +1562,28 @@ Panel {
           ForgeLogView {
             id: logView
             width: parent.width
-            visible: root.routeKind === "log"
+            visible: root.paneRoute
             // An Item has no implicit height, and the card's height is this
             // column's. Asking for a screenful rather than measuring one:
             // `fittedContentHeight` clamps whatever it cannot fit, so this is
             // a request for as much as the screen will give.
             height: visible ? Style.space(460) : 0
 
-            lines: root.logLines
-            loading: root.logLoading
-            error: root.logError
-
+            // Two panes, one Item: which one is a matter of which route is up.
+            // See `paneRoute`.
+            lines: root.routeKind === "commandOutput" ? root.commandLines : root.logLines
+            loading: root.routeKind === "commandOutput"
+              ? root.commandRunning : root.logLoading
+            error: root.routeKind === "commandOutput" ? root.commandError : root.logError
+            loadingText: root.routeKind === "commandOutput"
+              ? (root.commandHeader === "" ? "queued…" : root.commandHeader + "…")
+              : "Fetching the log…"
+            emptyText: root.routeKind === "commandOutput"
+              ? "This command printed nothing." : "This deployment printed nothing."
+            header: root.routeKind === "commandOutput" && !root.commandRunning
+              ? root.commandHeader : ""
+            headerBad: root.routeKind === "commandOutput"
+              && Model.commandHeaderBad(root.commandHeader)
             foreground: root.foreground
             badColor: root.badColor
             fontFamily: root.fontFamily
@@ -1305,7 +1649,7 @@ Panel {
         Text {
           id: hints
           width: parent.width
-          visible: root.rows.length > 0 || root.routeKind === "log"
+          visible: root.rows.length > 0 || root.paneRoute
           wrapMode: Text.WordWrap
           textFormat: Text.PlainText
           color: root.foreground

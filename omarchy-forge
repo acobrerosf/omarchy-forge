@@ -522,7 +522,8 @@ Create a token at https://forge.laravel.com/profile/api
 
 Scopes: read access to servers and sites is enough to watch them. The write
 scopes are opt-in, one per thing the bar can do — deploy, restart a service,
-toggle maintenance mode. README.md lists them and what each one costs.
+toggle maintenance mode, run a command. README.md lists them and what each one
+costs; site:manage-commands is the one worth reading about before granting.
 
 One token per Forge account. A token that can already see several
 organizations only needs adding once.
@@ -954,6 +955,7 @@ Laravel Forge for the Omarchy bar.
   omarchy-forge api [--account NAME|--org SLUG] GET /orgs/...
   omarchy-forge api ... POST /orgs/.../actions '{"action":"reboot"}'
                                           raw authenticated request (JSON envelope)
+                                          a body of - is read from stdin
 
 One token per account; an account can watch several organizations. An account
 name is only a handle for this CLI — it is derived from whoever the token
@@ -1021,11 +1023,19 @@ api)
     *) break ;;
     esac
   done
-  [[ $# -ge 2 ]] || die "usage: omarchy-forge api [--account NAME] <METHOD> <path> [json-body]"
-  if [[ $# -ge 3 && -n $3 ]]; then
-    jq -e . <<<"$3" >/dev/null 2>&1 || die "the body is not valid JSON"
+  [[ $# -ge 2 ]] || die "usage: omarchy-forge api [--account NAME] <METHOD> <path> [json-body|-]"
+  # A body of `-` is read from stdin instead of argv. Every body this used to
+  # send was a fixed word — `{"action":"reboot"}` — but running a command on a
+  # site sends what someone typed, which is not a credential and yet may quote
+  # one, and argv is world-readable through /proc/<pid>/cmdline. Same reason
+  # the widget already pipes clipboard and file writes rather than passing them.
+  # Reading happens before the check below, so `-` is validated like any other.
+  body=${3:-}
+  [[ $body == - ]] && body=$(cat)
+  if [[ -n $body ]]; then
+    jq -e . <<<"$body" >/dev/null 2>&1 || die "the body is not valid JSON"
   fi
-  api_request "$1" "$2" "$account" "${3:-}"
+  api_request "$1" "$2" "$account" "$body"
   ;;
 doctor) cmd_doctor ;;
 -h | --help | help | "") usage ;;
