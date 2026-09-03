@@ -11,6 +11,13 @@ surface and rate-limit behaviour described there are promises; keep it in sync w
 
 ## Working on it
 
+**Two long-lived branches.** `develop` is where work lands; `main` is the released version and
+every commit on it is tagged `v<manifest version>`. So commit to `develop` — never to `main`,
+and don't open a branch off `main` for ordinary work. A release is `develop` fast-forwarded onto
+`main` plus a tag, which is why the `manifest.json` bump belongs in the work itself rather than
+in the merge. Because the plugin directory is a symlink to this checkout, whatever is checked out
+is what the bar is running: staying on `develop` is also how you see your own changes.
+
 The plugin directory is a symlink to this repo:
 `~/.config/omarchy/plugins/acobrerosf.forge -> /home/acobrerosf/Work/omarchy-forge`, so edits are
 live. Saving a file under `~/.config/omarchy/plugins/` reloads plugin code automatically.
