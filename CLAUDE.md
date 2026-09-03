@@ -75,49 +75,50 @@ Panel.qml               one instance per monitor (bar widget). Cursor, folding, 
                         arm-to-deploy, row assembly. Owns nothing that outlives a screen.
 ForgeRow.qml            one panel row, pure presentational. Declared properties in, signals out;
                         no service reference, no Model import.
-ForgeLogView.qml        the deploy log pane, on the same terms as ForgeRow.
+ForgeLogView.qml        the log pane, on the same terms as ForgeRow.
 Model.js                pure functions: JSON:API → flat rows, state derivation, path building.
                         `.pragma library`, no QML types, no I/O.
 ForgeIcon.qml           the bar mark + badge (Shape/CurveRenderer).
 ```
 
 **`ARCHITECTURE.md` is the design document of record** — the envelope contract, accounts vs
-organizations, the rate budget, the queue and pagination, subscriptions, and how a row is
-rendered. Read it before changing any of those, and update it rather than re-explaining a
-decision in a file header. A few couplings from it are worth repeating here because they break
-silently: `Model.parseEnvelope`/`envelopeError` expect the exact envelope shape;
-`Service._isMissingToken` matches the literal prefix `"No API token"` produced by `api_request`
-(don't reword that message without changing both); `_applyEnvelope`'s `quiet` flag exists so a
-403 on a request that belongs to a keypress — the deploy log's, a server action's, a maintenance
-toggle's, all gated behind a *write* scope — is reported on the row or the pane instead of across
-the organization's rows, and for a write it is the job's `scopeMessage` that decides both the
-wording and the quiet; every write goes out on `Service`'s single-flight `actionProcess` via
-`_startAction`, never through the queue, carrying its own method (POST is only the default) and
-— where its meaning depends on live state, as the maintenance toggle's does — an `armIntent` in
-its arm key, so a refresh landing mid-arm invalidates it instead of retargeting it; a body a *user
-typed* — only the site command's — never rides that argv, and asks for `bodyStdin` instead, which
-sends it as `api … POST <path> -` and writes it to the helper's stdin on `started`; a site or
-server name reaching a *path* (a saved log's, command output's or event output's filename) goes
-through `Model.safeFileName`, which is the separator guard the other three don't cover; the command
-watch that polls a run to its end lives on `Service` and not on `Panel`, for the reason the sweep
-does — a timer in a bar widget runs once per monitor — and it says nothing when the run turns
-terminal, because announcing that while the output request is still in flight leaves the pane
-finished with no lines, which renders as "printed nothing"; that watch ends on exactly three
-things — the output landing, the pane closing, the next run displacing it — and never on a
-refusal, since the run is on the box whatever a look at it came back with and dropping the watch
-leaves `r` pointing at nothing (`_commandFailed` reports and reschedules instead), while anything
-that *does* end one owes the pane a farewell — the displaced key in `_startCommandWatch`, a
-dropped read in `_holdAccount` or `_abandonJob`; the command prompt is the one place
-that sets `PanelKeyCatcher.blocked`, and `stopCommandEditing` clears it *deferred* on purpose,
-or the enter that arms goes on to reach `onActivateRequested` and un-arms the row it just armed;
-and
-the event feed is the one route that stays alive *under* another (its output pane), which is why
-`popView` clears it by the kind it popped where it clears the log and the command
-unconditionally, and why `openServerEvents` refuses to push over a pane or the command prompt;
-`omarchy-notification-send --exec` takes a
-shell *string*, not an argv array — the shell runs it through `bash -lc` on click, so an address
-reaching it must pass `Model.externalUrl` **and** `Util.shellQuote`. Any new address that leaves
-this process — opened, copied, or handed to another program — goes through `Model.externalUrl`.
+organizations, the rate budget, the queue and pagination, subscriptions, and how a row is rendered.
+Read it before changing any of those, and update it rather than re-explaining a decision in a file
+header. A few couplings from it are worth repeating here because they break silently:
+`Model.parseEnvelope`/`envelopeError` expect the exact envelope shape; `Service._isMissingToken`
+matches the literal prefix `"No API token"` produced by `api_request` (don't reword that message
+without changing both); `_applyEnvelope`'s `quiet` flag exists so a 403 on a request that belongs to
+a keypress — the deploy log's, a site log's, a server action's, a maintenance toggle's, all gated
+behind a scope named for writing — is reported on the row or the pane instead of across the
+organization's rows, and for a write it is the job's `scopeMessage` that decides both the wording
+and the quiet; every write goes out on `Service`'s single-flight `actionProcess` via `_startAction`,
+never through the queue, carrying its own method (POST is only the default) and — where its meaning
+depends on live state, as the maintenance toggle's does — an `armIntent` in its arm key, so a
+refresh landing mid-arm invalidates it instead of retargeting it; a body a *user typed* — only the
+site command's — never rides that argv, and asks for `bodyStdin` instead, which sends it as `api …
+POST <path> -` and writes it to the helper's stdin on `started`; a site or server name reaching a
+*path* (a saved deploy log's, site log's, command output's or event output's filename) goes through
+`Model.safeFileName`, which is the separator guard the other three don't cover; a site log reads and
+writes the *deploy log's* panel state rather than owning a fourth set, because only one pane is ever
+open and `popView` already clears that one — what tells the two apart is the route kind, the request
+key and the words; the command watch that polls a run to its end lives on `Service` and not on
+`Panel`, for the reason the sweep does — a timer in a bar widget runs once per monitor — and it says
+nothing when the run turns terminal, because announcing that while the output request is still in
+flight leaves the pane finished with no lines, which renders as "printed nothing"; that watch ends
+on exactly three things — the output landing, the pane closing, the next run displacing it — and
+never on a refusal, since the run is on the box whatever a look at it came back with and dropping
+the watch leaves `r` pointing at nothing (`_commandFailed` reports and reschedules instead), while
+anything that *does* end one owes the pane a farewell — the displaced key in `_startCommandWatch`, a
+dropped read in `_holdAccount` or `_abandonJob`; the command prompt is the one place that sets
+`PanelKeyCatcher.blocked`, and `stopCommandEditing` clears it *deferred* on purpose, or the enter
+that arms goes on to reach `onActivateRequested` and un-arms the row it just armed; and the event
+feed is the one route that stays alive *under* another (its output pane), which is why `popView`
+clears it by the kind it popped where it clears the log and the command unconditionally, and why
+`openServerEvents` refuses to push over a pane or the command prompt; `omarchy-notification-send
+--exec` takes a shell *string*, not an argv array — the shell runs it through `bash -lc` on click,
+so an address reaching it must pass `Model.externalUrl` **and** `Util.shellQuote`. Any new address
+that leaves this process — opened, copied, or handed to another program — goes through
+`Model.externalUrl`.
 
 ### Conventions that matter
 

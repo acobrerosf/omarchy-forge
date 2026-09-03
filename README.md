@@ -26,11 +26,14 @@ Tick these scopes:
 | `organization:view` | required — finds the organizations to watch |
 | `server:view` | required — servers, sites, deployment status |
 | `site:manage-deploys` | deploy from the bar, and read deployment logs |
+| `server:manage-logs` | read a site's application and nginx logs |
 | `server:manage-services` | restart nginx or PHP-FPM, reboot a server |
 | `site:manage-commands` | run a command on a site, toggle maintenance mode |
 
 The first three are the minimum. Leave the rest off and the widget is read-only — everything that
-would change something says which scope it wanted instead of failing quietly.
+would change something says which scope it wanted instead of failing quietly. The other four are
+named for what they let you change; deployment logs and site logs are reads that Forge files under
+them anyway, so a strictly read-only token is refused those two and told which scope it wanted.
 
 **3. Add the token.** Click **Set up Forge** in the panel, or run:
 
@@ -102,7 +105,7 @@ Opening a site gives you its actions and its details, all from data the refresh 
 
 | | |
 |---|---|
-| **Actions** | deploy, toggle maintenance mode, run a command, read the deployment log, open the site, open it in Forge, copy its ssh command |
+| **Actions** | deploy, toggle maintenance mode, run a command, read the deployment log, read the three site logs, open the site, open it in Forge, copy its ssh command |
 | **Details** | PHP version, app type, status, maintenance mode, isolation, zero-downtime, releases kept, aliases, healthcheck |
 
 An action that can't run says why — a site with no repository, or one that has never deployed.
@@ -116,13 +119,21 @@ The output arrives when the run finishes.
 
 **Deployment log** opens the latest deploy's output, ANSI stripped, scrolled to the bottom.
 
+**Application log**, **Nginx error log** and **Nginx access log** open what the site itself is
+writing, in the same pane. Forge hands back the tail of each rather than the whole file, as of the
+moment you asked — `r` asks again. The nginx error log is the one to open when a site is up and
+answering 500. An empty log says so rather than showing Forge's placeholder line.
+
+Site logs need the `server:manage-logs` scope. That is Forge's name for it and it reads like a
+write scope, because the same scope clears them; a token without it is told so on the pane.
+
 | Key | In a log, a command's output, or an event's output |
 |---|---|
 | `j` `k` or ↑ ↓ | scroll |
 | `g` / `G` | top / bottom |
 | `c` | copy the whole thing |
 | `w` | save it to `~/Downloads/` — the panel says where it landed |
-| `r` | look at a command run or an event's output again |
+| `r` | look at a site log, a command run or an event's output again |
 | `h` or esc | back |
 
 ### A server
@@ -198,9 +209,9 @@ Forge allows **60 requests a minute per Forge account**, shared with anything el
 including its own dashboard in a browser tab.
 
 A refresh costs **two requests per organization**, whatever your server count, and that figure
-doesn't change with the number of monitors. Opening a deployment log is one more, and so is a
-server's event feed — one per page of thirty, and one for each event's output you open. Running a
-command costs about a dozen, spread over a hundred seconds.
+doesn't change with the number of monitors. Opening a deployment log is one more, and so is a site
+log, and so is a server's event feed — one per page of thirty, and one for each event's output you
+open. Running a command costs about a dozen, spread over a hundred seconds.
 
 The widget keeps a budget per account and backs off before it runs out, telling you on the row
 rather than failing silently. If Forge refuses anyway, the panel says "rate limited" and everything
@@ -266,8 +277,10 @@ reaches, and which is the default. Tokens are never in there.
   not capped — past 150 they are checked in rotation.
 - **A command run has no history and no partial output.** You see the run you just started, and its
   output arrives when it finishes.
-- **Deployment logs need a write scope.** That is Forge's choice, not this plugin's — a strictly
-  read-only token can watch a deployment fail and not be told why.
+- **Logs need a scope named for writing.** Forge gates deployment output behind
+  `site:manage-deploys` and a site's own logs behind `server:manage-logs`, the scope that clears
+  them. That is Forge's choice, not this plugin's — a strictly read-only token can watch a
+  deployment fail and not be told why.
 
 ## License
 

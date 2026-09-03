@@ -57,7 +57,7 @@ Panel {
   // and the reading keys `g G c w` — so the distinction is drawn once here
   // rather than at each of the places that has to know.
   readonly property bool paneRoute: routeKind === "log" || routeKind === "commandOutput"
-    || routeKind === "eventOutput"
+    || routeKind === "eventOutput" || routeKind === "siteLog"
 
   // The log this panel asked for, and what came back. Keyed the same way the
   // service keys its answer, so two screens with two logs open don't cross.
@@ -660,7 +660,8 @@ Panel {
   readonly property string hintText: {
     if (routeKind === "log")
       return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [h] back"
-    if (routeKind === "commandOutput" || routeKind === "eventOutput")
+    if (routeKind === "commandOutput" || routeKind === "eventOutput"
+        || routeKind === "siteLog")
       return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [r] look again · [h] back"
     if (routeKind === "events")
       return "[enter] output · [r] refresh · [h] back"
@@ -705,6 +706,13 @@ Panel {
     var action = row.action
     if (action.available === false) {
       say(String(action.label) + " — " + String(action.reason))
+      return
+    }
+    // The three site logs share one handler and differ only by the kind their
+    // id carries, so they are matched by prefix rather than spelled out — the
+    // one place in this switch where the id is not the whole answer.
+    if (String(action.id).indexOf("site-log:") === 0) {
+      openSiteLog(action.log)
       return
     }
     switch (String(action.id)) {
@@ -856,6 +864,38 @@ Panel {
     forge.fetchDeploymentLog(row.org, row.serverId, site.id, site.deploymentId)
   }
 
+  // ---------------------------------------------------------------- site logs
+
+  // On the deploy log's state rather than a second set of properties: only one
+  // pane is ever open — `popView` clears the log on every pop, and `paneLines`
+  // falls through to it — so a `siteLog` route reading and writing the same
+  // `log*` trio is the shape that already holds. What tells the two apart is
+  // the route kind, the request key, and the words on the pane.
+  function openSiteLog(kind) {
+    var row = currentRow()
+    var site = currentSite()
+    if (!site) { say("That site is no longer listed"); return }
+    if (!forge) return
+
+    clearLog()
+    logRequestKey = forge.siteLogRequestKey(row.org, row.serverId, site.id, kind)
+    logLoading = true
+    pushView({ kind: "siteLog", org: row.org, serverId: row.serverId,
+               siteId: site.id, log: String(kind) })
+    forge.fetchSiteLog(row.org, row.serverId, site.id, kind)
+  }
+
+  // A log is a tail as of the moment it was asked for, so looking again is the
+  // point of the pane rather than a recovery from an error. The key stays the
+  // same one the command's output and an event's use.
+  function refreshSiteLog() {
+    if (!forge || routeKind !== "siteLog") return
+    logLines = []
+    logError = ""
+    logLoading = true
+    forge.fetchSiteLog(route.org, route.serverId, route.siteId, route.log)
+  }
+
   // ---------------------------------------------------------- server events
 
   function clearEvents() {
@@ -937,6 +977,7 @@ Panel {
   readonly property string paneEmptyText: routeKind === "commandOutput"
     ? "This command printed nothing."
     : routeKind === "eventOutput" ? "This event printed nothing."
+    : routeKind === "siteLog" ? "This log is empty."
     : "This deployment printed nothing."
 
   // The two ways what is on screen leaves a pane. Both take the text already
@@ -960,7 +1001,9 @@ Panel {
          ? Model.commandFileName(name, commandId)
          : routeKind === "eventOutput"
            ? Model.eventFileName(routeServer ? routeServer.name : "", route.eventId)
-           : Model.logFileName(name, route.deploymentId))
+           : routeKind === "siteLog"
+             ? Model.siteLogFileName(name, route.log)
+             : Model.logFileName(name, route.deploymentId))
     forge.saveText(paneLines.join("\n") + "\n", saveRequestedPath)
   }
 
@@ -1228,6 +1271,16 @@ Panel {
       root.logError = ok ? "" : String(message || "Could not read the log")
     }
 
+    // A site log lands in the same three properties, guarded by the same key —
+    // the two panes are never open at once, and the key's shape differs, so a
+    // stale deploy log's answer cannot be mistaken for this one's.
+    function onSiteLogFetched(requestKey, ok, text, message) {
+      if (root.logRequestKey !== requestKey) return
+      root.logLoading = false
+      root.logLines = ok ? Model.logLines(text) : []
+      root.logError = ok ? "" : String(message || "Could not read the log")
+    }
+
     // The feed, filtered the same way. A first page replaces what is shown; a
     // later one extends it, and a later one that fails says so in the footer
     // rather than blanking a list that is already on screen. The array is
@@ -1436,6 +1489,7 @@ Panel {
         case "r":
           if (root.routeKind === "commandOutput") root.refreshCommandRun()
           else if (root.routeKind === "eventOutput") root.refreshEventOutput()
+          else if (root.routeKind === "siteLog") root.refreshSiteLog()
           else if (root.routeKind === "events") root.fetchEvents("")
           else root.refresh()
           break
@@ -1511,7 +1565,12 @@ Panel {
               var server = aboutServer ? null
                 : root.route ? root.serverById(root.route.org, root.route.serverId) : null
               if (server) parts.push(server.name)
-              if (root.routeKind === "log" && root.routeSite) parts.push(root.routeSite.name)
+              if ((root.routeKind === "log" || root.routeKind === "siteLog") && root.routeSite)
+                parts.push(root.routeSite.name)
+              // Which of the three, since the hero below names the site and
+              // three panes would otherwise wear the same trail.
+              if (root.routeKind === "siteLog" && root.route)
+                parts.push(Model.siteLogLabel(root.route.log))
               return "‹ " + Model.plainText(parts.join(" / "))
             }
 

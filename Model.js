@@ -382,6 +382,42 @@ function eventsFrom(body) {
 
 // ------------------------------------------------------------- site actions
 
+// The three logs Forge keeps for a site, in the order the view lists them: the
+// application log first because it is the one a Laravel site's own errors land
+// in, then nginx's two with the error log ahead of the access log — a site that
+// answers 500 is the reason anyone opens this, and the access log is a tail of
+// hits, which is rarely what is being looked for.
+//
+// One table rather than three literals: the actions, the request, the pane's
+// breadcrumb and the saved file's name all have to agree on both halves of a
+// pair, and this is the only place either is written down.
+var siteLogKinds = [
+  { kind: "application", label: "Application log" },
+  { kind: "nginx-error", label: "Nginx error log" },
+  { kind: "nginx-access", label: "Nginx access log" }
+]
+
+function siteLogs() {
+  return siteLogKinds.slice()
+}
+
+function isSiteLogKind(kind) {
+  var wanted = String(kind || "")
+  for (var i = 0; i < siteLogKinds.length; i++)
+    if (siteLogKinds[i].kind === wanted) return true
+  return false
+}
+
+// Falls back to the kind itself rather than to an empty string: an unknown kind
+// reaching a breadcrumb is a bug, and one that reads "nginx-error" points at it
+// where a blank crumb hides it.
+function siteLogLabel(kind) {
+  var wanted = String(kind || "")
+  for (var i = 0; i < siteLogKinds.length; i++)
+    if (siteLogKinds[i].kind === wanted) return siteLogKinds[i].label
+  return wanted
+}
+
 // What the site view offers, in the order it offers it. Pure: the panel turns
 // these into rows and decides what a keypress does with one, and the labels
 // and the reasons live here beside the predicates that disable them.
@@ -390,8 +426,9 @@ function eventsFrom(body) {
 // the view teaches the accelerator rather than hiding it. An unavailable
 // action is still listed — a missing "Deployment log" would read as a bug,
 // where one that says "never deployed" answers the question. `armable` marks
-// the two that write: it is what `rowView` hangs the arm key on, and four of
-// these six change nothing on a server.
+// the two that write: it is what `rowView` hangs the arm key on, and seven of
+// these ten change nothing on a server — `command` is the third that writes,
+// and only because of what the prompt it opens eventually sends.
 //
 // Takes the org because the maintenance toggle sends somewhere, and a path
 // cannot be built without it — the same reason `serverActions` takes one.
@@ -403,6 +440,15 @@ function siteActions(org, site) {
   // predicate here answers for that rather than reaching into nothing.
   var parked = !!(site && site.maintenance)
   var moving = site ? String(site.maintenanceStatus) : ""
+  // The three logs, on the same terms as `log` below: an id the panel switches
+  // on, no `armable` and no `path`, because what they open is a pane. Generated
+  // from `siteLogKinds` rather than written out, so the order and the wording
+  // stay one decision. The `log` on each is what the request needs and the
+  // labels do not carry.
+  var logs = siteLogKinds.map(function (entry) {
+    return { id: "site-log:" + entry.kind, log: entry.kind, label: entry.label,
+             hint: "", available: !!site, reason: "not listed" }
+  })
   return [
     { id: "deploy", label: "Deploy", hint: "d", armable: true,
       // The arm belongs to the *site*, not to this row: the tree's row for the
@@ -451,12 +497,13 @@ function siteActions(org, site) {
     { id: "command", label: "Run a command", hint: "",
       available: !!site, reason: "not listed" },
     { id: "log", label: "Deployment log", hint: "",
-      available: deployed, reason: deployed ? "" : "never deployed" },
+      available: deployed, reason: deployed ? "" : "never deployed" }
+  ].concat(logs, [
     { id: "open", label: "Open site", hint: "o",
       available: url !== "", reason: url !== "" ? "" : "no address" },
     { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
     { id: "ssh", label: "Copy ssh command", hint: "s", available: true, reason: "" }
-  ]
+  ])
 }
 
 // The row the command prompt arms, built from what has been typed rather than
@@ -1179,6 +1226,20 @@ function deploymentLogPath(org, serverId, siteId, deploymentId) {
   return deployPath(org, serverId, siteId) + "/" + encode(deploymentId) + "/log"
 }
 
+// A site's own logs — what the application wrote, and nginx's two. The kind is
+// a path segment rather than a parameter, and it is one of exactly three; the
+// service refuses anything else before building this, because a fourth would
+// reach Forge as a 404 that reads like the site is gone.
+//
+// The scope the spec names is `server:manage-logs` — "allow members to clear
+// server and site logs" — so despite being a read it sits behind the scope that
+// empties them, and a token kept to `server:view` is refused. That is why the
+// service reports this one's 403 on the pane, the deploy log's way, rather than
+// across the organization's rows.
+function siteLogPath(org, serverId, siteId, kind) {
+  return sitePath(org, serverId, siteId) + "/logs/" + encode(kind)
+}
+
 // Running a command on a site, and reading back what it did. Note that the
 // scopes are split across the same four paths, which no other endpoint here
 // does: the POST is gated behind `site:manage-commands` — Forge's *run a
@@ -1219,6 +1280,12 @@ function isCommandJob(job) {
 function isEventJob(job) {
   var kind = job ? String(job.kind || "") : ""
   return kind === "events" || kind === "eventOutput"
+}
+
+// And the site log read, which is one kind but asks the same question at the
+// same three drop sites.
+function isSiteLogJob(job) {
+  return (job ? String(job.kind || "") : "") === "siteLog"
 }
 
 // The API never hands out a web link, so the dashboard address is a template
@@ -1364,6 +1431,13 @@ function eventFileName(serverName, eventId) {
   return "forge-" + safeFileName(serverName) + "-event-" + safeFileName(eventId) + ".log"
 }
 
+// A site log's file. The kind goes through the guard with the name even though
+// the three are literals here: what stops a separator reaching a path should
+// not depend on the caller having picked the kind out of the table.
+function siteLogFileName(siteName, kind) {
+  return "forge-" + safeFileName(siteName) + "-" + safeFileName(kind) + ".log"
+}
+
 // A cap on what is kept in memory and laid out. Forge's own logs run to tens
 // of kilobytes; a runaway deploy script could print without limit, and the
 // pane would try to lay out every line of it.
@@ -1392,6 +1466,22 @@ function logLines(value) {
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop()
   if (lines.length > logLineCap) lines = lines.slice(lines.length - logLineCap)
   return lines
+}
+
+// Forge does not hand back an empty string for an empty site log: it hands back
+// one line saying so, which the pane would render as content and the reader
+// would take for the log's first line. Turning it into "" is what lets the
+// pane's own empty text say it instead — the same answer a deploy that printed
+// nothing gets. Verified against the live API on an untouched nginx access log.
+//
+// Matched whole rather than by prefix: a real log line that happens to contain
+// this is still a log line. If Forge ever changes the wording, the sentence
+// shows through verbatim, which is wrong but not misleading.
+var emptyLogSentinel = "=== Empty log file ==="
+
+function siteLogContent(value) {
+  var text = String(value === undefined || value === null ? "" : value)
+  return text.trim() === emptyLogSentinel ? "" : text
 }
 
 // Every address that leaves this plugin passes through here first.

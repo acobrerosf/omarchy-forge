@@ -76,6 +76,18 @@ Item {
     return String(org) + "/" + String(serverId) + "/events/" + String(eventId)
   }
 
+  // A site's own log, which is the deploy log's road a third time. Its own
+  // signal rather than the deploy log's because the key has a different shape —
+  // a kind where that one has a deployment id — and because the 403 is about a
+  // different scope, so a shared handler would have to ask which it was
+  // answering.
+  signal siteLogFetched(string requestKey, bool ok, string text, string message)
+
+  function siteLogRequestKey(org, serverId, siteId, kind) {
+    return String(org) + "/" + String(serverId) + ":" + String(siteId)
+      + "/logs/" + String(kind)
+  }
+
   // A command run, on the same terms as the log and for the same reasons — one
   // panel asked, and the output is a document rather than a property. Unlike
   // the log it arrives more than once: the run is watched from `waiting`
@@ -564,6 +576,7 @@ Item {
       return
     }
     if (Model.isEventJob(job)) { _eventRefused(job, message); return }
+    if (Model.isSiteLogJob(job)) { _siteLogRefused(job, message); return }
     if (!Model.isCommandJob(job)) return
     if (_commandCurrent(job)) {
       _commandWatch = null
@@ -613,6 +626,8 @@ Item {
       return Model.serverEventsPath(job.org, job.serverId, job.cursor)
     if (job.kind === "eventOutput")
       return Model.eventOutputPath(job.org, job.serverId, job.eventId)
+    if (job.kind === "siteLog")
+      return Model.siteLogPath(job.org, job.serverId, job.siteId, job.log)
     return Model.sitesPath(job.org, job.cursor)
   }
 
@@ -762,6 +777,7 @@ Item {
         deploymentLogFetched(logRequestKey(job.org, job.serverId, job.siteId, job.deploymentId),
                              false, "", "Rate limited — try again shortly")
       if (Model.isEventJob(job)) _eventRefused(job, "Rate limited — try again shortly")
+      if (Model.isSiteLogJob(job)) _siteLogRefused(job, "Rate limited — try again shortly")
       // A dropped look at a command is not the end of the run — the hold is
       // this minute's, and the ladder outlives it — so the pane is told to
       // expect a wait rather than told the watch is over.
@@ -1165,6 +1181,80 @@ Item {
     }
     eventOutputFetched(eventOutputRequestKey(job.org, job.serverId, job.eventId),
                        true, attributes.output, "")
+  }
+
+  // ---------------------------------------------------------------- site logs
+
+  // The deploy log's road once more: front of the queue because a keypress is
+  // waiting on it, `quiet` because the refusal belongs to the pane, and a
+  // refusal from every drop site rather than silence. Nothing here polls — a
+  // log is a tail Forge cuts at the moment of asking, and `r` on the pane is
+  // how the reader takes another look.
+  function fetchSiteLog(org, serverId, siteId, kind) {
+    var key = String(org)
+    var server = String(serverId)
+    var site = String(siteId)
+    var log = String(kind)
+    var refuse = function (message) {
+      siteLogFetched(siteLogRequestKey(key, server, site, log), false, "", message)
+    }
+
+    // Checked here rather than trusted from the row: a kind outside the three
+    // would reach Forge as a 404, which reads on the pane like the site is
+    // gone rather than like the request was wrong.
+    if (!Model.isSiteLogKind(log)) { refuse("There is no such log"); return }
+
+    var state = orgs[key]
+    if (!state) { refuse("That organization is no longer being watched"); return }
+
+    var account = state.account || accountForOrg(key)
+    var held = budget.blockedMs(account)
+    if (held > 0) {
+      refuse("Rate limited — try again in " + Math.ceil(held / 1000) + "s")
+      return
+    }
+    if (budget.wouldExceed(account, 1)) {
+      refuse("Too close to the rate limit — try again shortly")
+      return
+    }
+
+    var pending = function (job) {
+      return job.kind === "siteLog" && job.org === key && job.siteId === site
+        && job.log === log
+    }
+    if (queue.contains(pending) || (_current !== null && pending(_current))) return
+
+    queue.pushFront({ org: key, account: account, kind: "siteLog",
+                      serverId: server, siteId: site, log: log })
+  }
+
+  function _siteLogRefused(job, message) {
+    siteLogFetched(siteLogRequestKey(job.org, job.serverId, job.siteId, job.log),
+                   false, "", message)
+  }
+
+  function _onSiteLog(job, text) {
+    var envelope = Model.parseEnvelope(text)
+    if (!_applyEnvelope(job.org, job.account, envelope, true)) {
+      // Forge's spec puts these behind `server:manage-logs` — the scope that
+      // *clears* a log — so a token kept to `server:view` reads every server
+      // and site and is still refused here, the deploy log's situation with a
+      // different scope on the sign.
+      _siteLogRefused(job, envelope.status === 403
+        ? "Your token can't read site logs — that needs the server:manage-logs scope"
+        : Model.envelopeError(envelope))
+      return
+    }
+    var data = envelope.body ? envelope.body.data : null
+    var attributes = data ? data.attributes : null
+    // `content` here, where the deploy log and an event both say `output`. An
+    // empty log is not an empty string either — see `Model.siteLogContent`.
+    if (!attributes || typeof attributes.content !== "string") {
+      _siteLogRefused(job, "Forge returned no content for this log")
+      return
+    }
+    siteLogFetched(siteLogRequestKey(job.org, job.serverId, job.siteId, job.log),
+                   true, Model.siteLogContent(attributes.content), "")
   }
 
   function _finishRefresh(org) {
@@ -1935,6 +2025,7 @@ Item {
         else if (job.kind === "commandOutput") root._onCommandOutput(job, text)
         else if (job.kind === "events") root._onEvents(job, text)
         else if (job.kind === "eventOutput") root._onEventOutput(job, text)
+        else if (job.kind === "siteLog") root._onSiteLog(job, text)
         else root._onSites(job, text)
       }
       root._pump()

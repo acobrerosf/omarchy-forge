@@ -12,7 +12,7 @@ Service.qml             one instance per session (plugin kind "service"). Pollin
                         the rate ledger, the request queue, deploys, notifications.
 Panel.qml               one instance per monitor (bar widget). Cursor, folding, arm-to-deploy,
                         rendering. Owns nothing that outlives a screen.
-ForgeLogView.qml        the deploy log pane, pure presentational.
+ForgeLogView.qml        the log pane, pure presentational.
 ForgeRow.qml            one panel row, pure presentational. Declared properties in, signals out;
                         no service reference, no Model import.
 Model.js                pure functions: JSON:API → flat rows, state derivation, path building.
@@ -211,6 +211,23 @@ attribute at all — Forge records what it did and what that printed — which i
 `Model.eventsFrom` keeps no tone and the row carries no `siteId`: a site *name* is what the
 detail shows, and a site id on a row is what `currentSite` resolves, so `d` on an event would
 otherwise arm a deploy of whichever site the event mentioned.
+
+**A site's own logs are the same road a third time.** `GET .../sites/{site}/logs/{kind}` for the
+three kinds `Model.siteLogKinds` names — the application log and nginx's two — front of the queue,
+`quiet`, `_siteLogRefused` from every drop site. Three differences, all small and all sharp. The
+text arrives in `data.attributes.content` where the deploy log and an event both say `output`, so
+the handler cannot be shared with either. An empty log is not an empty string: Forge answers with
+the single line `=== Empty log file ===`, which the pane would render as the log's first line, so
+`Model.siteLogContent` turns exactly that sentence into `""` and lets the pane's own empty text
+say it. And the scope is `server:manage-logs` — Forge's name for "clear a log" — so a read sits
+behind a scope named for a write, the deploy log's situation with a different word on the sign;
+the 403 is named on the pane for the same reason.
+
+The panel does *not* give this pane its own state. It reads and writes the deploy log's
+`logRequestKey`/`logLines`/`logError`/`logLoading`, because only one pane is ever open — `popView`
+clears the log on every pop, and `paneLines` falls through to it — and what tells a `siteLog` route
+from a `log` route is the route kind, the request key's shape and the words. A fourth set of
+properties would have to be cleared in the same places and could never hold a different value.
 
 **A command run is the deploy log's shape, four times over.** `POST .../commands` is a write and
 goes out on `actionProcess` like every other; everything after it is reads, and they go through the
@@ -438,15 +455,15 @@ hold keyboard focus — so a site's actions are not a second window and could no
 different `rows`.
 
 `navStack` holds what has been pushed over the tree; `route` is its top. `rows` switches on it:
-nothing pushed is the tree, a `site` or `server` route is that subject's actions, an `events`
-route is a server's feed, and a `log`, `commandOutput` or `eventOutput` route is empty because a
-pane is not a list — `paneRoute` is the three of them together, drawn once rather than at each of
+nothing pushed is the tree, a `site` or `server` route is that subject's actions, an `events` route
+is a server's feed, and a `log`, `siteLog`, `commandOutput` or `eventOutput` route is empty because
+a pane is not a list — `paneRoute` is the four of them together, drawn once rather than at each of
 the half-dozen places that has to know, and the pane's document, loading flag and empty text are
-chosen once on the root (`paneLines` and its siblings) for the same reason. A `command` route is
-one row, the send, built from what has been typed. Everything downstream is untouched — one
-cursor, one delegate, one key handler, one clamp in `onRowsChanged` — which is the point. The
-server view cost exactly what that predicted: a branch in `actionRows`, a `runAction` case, and no
-new navigation model.
+chosen once on the root (`paneLines` and its siblings) for the same reason. A `command` route is one
+row, the send, built from what has been typed. Everything downstream is untouched — one cursor, one
+delegate, one key handler, one clamp in `onRowsChanged` — which is the point. The server view cost
+exactly what that predicted: a branch in `actionRows`, a `runAction` case, and no new navigation
+model.
 
 The event feed is the first route that keeps state *under* another: an event's output is pushed
 over the list it was chosen from, and backing out has to land on that list, not on an empty one.
