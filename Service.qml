@@ -57,6 +57,25 @@ Item {
       + "/" + String(deploymentId)
   }
 
+  // A server's event feed and one event's output, on the log's terms: one
+  // panel asked, the answer is a document, and a refusal is always reported.
+  // The feed answers with the `cursor` it was asked for — "" for the first
+  // page — so the panel knows whether what arrived replaces its list or
+  // extends it, and with the `nextCursor` a further page would need. The
+  // list rides a `var` because it is the one answer here that is rows rather
+  // than text; the panel reassigns what it gets and never mutates it.
+  signal serverEventsFetched(string requestKey, bool ok, var events, string cursor,
+                             string nextCursor, string message)
+  signal eventOutputFetched(string requestKey, bool ok, string text, string message)
+
+  function eventsRequestKey(org, serverId) {
+    return String(org) + "/" + String(serverId) + "/events"
+  }
+
+  function eventOutputRequestKey(org, serverId, eventId) {
+    return String(org) + "/" + String(serverId) + "/events/" + String(eventId)
+  }
+
   // A command run, on the same terms as the log and for the same reasons — one
   // panel asked, and the output is a document rather than a property. Unlike
   // the log it arrives more than once: the run is watched from `waiting`
@@ -544,6 +563,7 @@ Item {
                                          job.deploymentId), false, "", message)
       return
     }
+    if (Model.isEventJob(job)) { _eventRefused(job, message); return }
     if (!Model.isCommandJob(job)) return
     if (_commandCurrent(job)) {
       _commandWatch = null
@@ -589,6 +609,10 @@ Item {
       return Model.commandPath(job.org, job.serverId, job.siteId, job.commandId)
     if (job.kind === "commandOutput")
       return Model.commandOutputPath(job.org, job.serverId, job.siteId, job.commandId)
+    if (job.kind === "events")
+      return Model.serverEventsPath(job.org, job.serverId, job.cursor)
+    if (job.kind === "eventOutput")
+      return Model.eventOutputPath(job.org, job.serverId, job.eventId)
     return Model.sitesPath(job.org, job.cursor)
   }
 
@@ -737,6 +761,7 @@ Item {
       if (job.kind === "log")
         deploymentLogFetched(logRequestKey(job.org, job.serverId, job.siteId, job.deploymentId),
                              false, "", "Rate limited — try again shortly")
+      if (Model.isEventJob(job)) _eventRefused(job, "Rate limited — try again shortly")
       // A dropped look at a command is not the end of the run — the hold is
       // this minute's, and the ladder outlives it — so the pane is told to
       // expect a wait rather than told the watch is over.
@@ -1025,6 +1050,121 @@ Item {
     // Handed on unguarded: `Model.logLines` is applied where the string enters
     // a `Text`, which is the boundary the guard is about.
     deploymentLogFetched(requestKey, true, attributes.output, "")
+  }
+
+  // ---------------------------------------------------------- server events
+
+  // The feed and one event's output take the log's road exactly: the same
+  // guards, the same queue-jump, the same rule that a refusal answers. What
+  // differs is the scope — both want only `server:view`, so a read-only token
+  // works here where the deploy log refuses it — and that the feed is a page
+  // with a cursor after it, fetched again on request rather than followed.
+  function fetchServerEvents(org, serverId, cursor) {
+    var key = String(org)
+    var server = String(serverId)
+    var page = String(cursor || "")
+    var refuse = function (message) {
+      serverEventsFetched(eventsRequestKey(key, server), false, [], page, "", message)
+    }
+
+    var state = orgs[key]
+    if (!state) { refuse("That organization is no longer being watched"); return }
+
+    var account = state.account || accountForOrg(key)
+    var held = budget.blockedMs(account)
+    if (held > 0) {
+      refuse("Rate limited — try again in " + Math.ceil(held / 1000) + "s")
+      return
+    }
+    if (budget.wouldExceed(account, 1)) {
+      refuse("Too close to the rate limit — try again shortly")
+      return
+    }
+
+    var pending = function (job) {
+      return job.kind === "events" && job.org === key && job.serverId === server
+        && String(job.cursor || "") === page
+    }
+    if (queue.contains(pending) || (_current !== null && pending(_current))) return
+
+    queue.pushFront({ org: key, account: account, kind: "events",
+                      serverId: server, cursor: page })
+  }
+
+  function fetchEventOutput(org, serverId, eventId) {
+    var key = String(org)
+    var server = String(serverId)
+    var id = String(eventId)
+    var refuse = function (message) {
+      eventOutputFetched(eventOutputRequestKey(key, server, id), false, "", message)
+    }
+
+    var state = orgs[key]
+    if (!state) { refuse("That organization is no longer being watched"); return }
+
+    var account = state.account || accountForOrg(key)
+    var held = budget.blockedMs(account)
+    if (held > 0) {
+      refuse("Rate limited — try again in " + Math.ceil(held / 1000) + "s")
+      return
+    }
+    if (budget.wouldExceed(account, 1)) {
+      refuse("Too close to the rate limit — try again shortly")
+      return
+    }
+
+    var pending = function (job) {
+      return job.kind === "eventOutput" && job.org === key && job.serverId === server
+        && job.eventId === id
+    }
+    if (queue.contains(pending) || (_current !== null && pending(_current))) return
+
+    queue.pushFront({ org: key, account: account, kind: "eventOutput",
+                      serverId: server, eventId: id })
+  }
+
+  // The two reads share a refusal, the way the command's three do: every drop
+  // site — an unwatched organization, a hold, an error — answers through here
+  // rather than spelling out which signal each kind owes.
+  function _eventRefused(job, message) {
+    if (job.kind === "events")
+      serverEventsFetched(eventsRequestKey(job.org, job.serverId), false, [],
+                          String(job.cursor || ""), "", message)
+    else
+      eventOutputFetched(eventOutputRequestKey(job.org, job.serverId, job.eventId),
+                         false, "", message)
+  }
+
+  // Quiet, like the log's: the refusal is this pane's to say. A 403 here is
+  // the surprising kind — `server:view` is the scope every sweep already
+  // needs — so it is named, on the chance the token was cut down further.
+  function _eventError(job, envelope) {
+    _eventRefused(job, envelope.status === 403
+      ? "Your token can't read server events — that needs the server:view scope"
+      : Model.envelopeError(envelope))
+  }
+
+  function _onEvents(job, text) {
+    var envelope = Model.parseEnvelope(text)
+    if (!_applyEnvelope(job.org, job.account, envelope, true)) { _eventError(job, envelope); return }
+    serverEventsFetched(eventsRequestKey(job.org, job.serverId), true,
+                        Model.eventsFrom(envelope.body), String(job.cursor || ""),
+                        Model.nextCursor(envelope.body), "")
+  }
+
+  function _onEventOutput(job, text) {
+    var envelope = Model.parseEnvelope(text)
+    if (!_applyEnvelope(job.org, job.account, envelope, true)) { _eventError(job, envelope); return }
+    var data = envelope.body ? envelope.body.data : null
+    var attributes = data ? data.attributes : null
+    // As with the log: an event that printed nothing is an empty pane, and an
+    // `output` that isn't there at all is a malformed answer.
+    if (!attributes || typeof attributes.output !== "string") {
+      _eventRefused(job, "Forge returned no output for this event")
+      return
+    }
+    eventOutputFetched(eventOutputRequestKey(job.org, job.serverId, job.eventId),
+                       true, attributes.output, "")
   }
 
   function _finishRefresh(org) {
@@ -1793,6 +1933,8 @@ Item {
         else if (job.kind === "commandFind") root._onCommandFind(job, text)
         else if (job.kind === "commandShow") root._onCommandShow(job, text)
         else if (job.kind === "commandOutput") root._onCommandOutput(job, text)
+        else if (job.kind === "events") root._onEvents(job, text)
+        else if (job.kind === "eventOutput") root._onEventOutput(job, text)
         else root._onSites(job, text)
       }
       root._pump()

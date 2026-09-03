@@ -9,13 +9,16 @@ Everything below was checked against the v2 OpenAPI spec
 
 ## Features
 
-### 1. Server events feed
+### 1. Server events feed — done
 
-`GET .../servers/{server}/events` and `/events/{event}/output`, scope
-`server:view`. A feed of what Forge itself is doing to a server — provisioning
-steps, service restarts, failures. Would give an "unreachable" server row a
-*reason* instead of a state word. One request per server when opened, so on
-demand only.
+`e` on any row, or *Server events* in the server view. Thirty at a time with a
+row that fetches the next thirty; enter opens what an event printed, in the
+log pane. *Verified* against the live API while building it, and two things
+the spec did not say are worth keeping: an event carries **no status** —
+whether it failed is only in its output, so the feed is a chronology, not an
+alarm list — and the site relationship is empty unless `include=site` is
+asked for. The "reason for unreachable" is therefore on demand, in the
+output, not something the row can show.
 
 ### 2. Site logs
 

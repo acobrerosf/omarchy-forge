@@ -349,6 +349,37 @@ function canDeploy(site) {
   return !!(site && site.repoUrl)
 }
 
+// --------------------------------------------------------------------- events
+
+// One page of a server's feed, flattened. An event carries no status — Forge
+// records what it did and what that printed, not whether it worked — so there
+// is nothing here for a tone to report, and a row is a description and a time.
+// The site is the *name*, deliberately: a row carrying a `siteId` would be one
+// `currentSite` resolves, and `d` on an event must not arm a deploy of the site
+// the event happened to mention. Sorted here as well as by the request, on the
+// `sortSites` precedent: an order the panel depends on is imposed locally.
+function eventsFrom(body) {
+  var out = []
+  var data = body && Array.isArray(body.data) ? body.data : []
+  var index = includedIndex(body)
+  for (var i = 0; i < data.length; i++) {
+    var resource = data[i]
+    var a = resource.attributes || {}
+    var site = relatedResource(resource, "site", index)
+    var siteName = site && site.attributes ? site.attributes.name : ""
+    out.push({
+      id: String(resource.id),
+      description: String(a.description || "event"),
+      ranAs: a.ran_as ? String(a.ran_as) : "",
+      siteName: siteName ? String(siteName) : "",
+      createdAt: a.created_at ? String(a.created_at) : ""
+    })
+  }
+  return out.sort(function (x, y) {
+    return (Date.parse(y.createdAt) || 0) - (Date.parse(x.createdAt) || 0)
+  })
+}
+
 // ------------------------------------------------------------- site actions
 
 // What the site view offers, in the order it offers it. Pure: the panel turns
@@ -625,6 +656,9 @@ function serverActions(org, server) {
       refetch: "org",
       path: serverActionPath(org, id),
       body: { action: "reboot" } },
+    // Always available: an unreachable server is exactly the one whose feed is
+    // worth reading, and a read is what the row is.
+    { id: "events", label: "Server events", hint: "e", available: true, reason: "" },
     { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
     { id: "ssh", label: "Copy ssh command", hint: "s",
       available: ssh !== "", reason: ssh !== "" ? "" : "no public IP" }
@@ -753,7 +787,7 @@ function deploymentLabel(status) {
 // come through here too, so every view draws with the same delegate.
 //
 // ctx: { server, site, orgLabel, orgHealth, orgSummary, siteCount,
-//        showOrgHeaders, action }
+//        showOrgHeaders, action, event }
 //
 // Nothing here may touch a QML type, so the result carries `depth` rather than
 // a pixel indent and `tone` rather than a colour — ForgeRow owns the metrics
@@ -788,7 +822,7 @@ function rowView(row, ctx) {
       showChevron: true,
       actionKey: "",
       armedText: "",
-      deployedAt: ""
+      timeAt: ""
     }
   }
 
@@ -816,7 +850,7 @@ function rowView(row, ctx) {
       // was pressed should say so.
       actionKey: action.armable === true ? String(c.armKey || "") : "",
       armedText: String(action.armedText || defaultArmedText),
-      deployedAt: ""
+      timeAt: ""
     }
   }
 
@@ -838,7 +872,26 @@ function rowView(row, ctx) {
       showChevron: false,
       actionKey: site ? String(site.key) : "",
       armedText: defaultArmedText,
-      deployedAt: site ? site.deployedAt : ""
+      timeAt: site ? site.deployedAt : ""
+    }
+  }
+
+  // An event row is a line of a feed: what Forge did, to which site, and when.
+  // It has no dot and no tone because an event has no status to report — see
+  // `eventsFrom` — and the time goes where a site's deploy time goes.
+  if (kind === "event") {
+    var event = c.event || {}
+    return {
+      kind: kind,
+      label: String(event.description || ""),
+      detail: String(event.siteName || event.ranAs || ""),
+      status: "",
+      tone: "idle",
+      depth: 0,
+      showChevron: false,
+      actionKey: "",
+      armedText: "",
+      timeAt: String(event.createdAt || "")
     }
   }
 
@@ -856,7 +909,7 @@ function rowView(row, ctx) {
     showChevron: true,
     actionKey: "",
     armedText: "",
-    deployedAt: ""
+    timeAt: ""
   }
 }
 
@@ -1063,15 +1116,18 @@ function sitesPath(org, cursor) {
 // exactly one server fresh — unfolding a row. Same includes as `sitesPath` so
 // `sitesFrom` reads both alike.
 function serverSitesPath(org, serverId, cursor) {
-  return pagedPath("/orgs/" + encode(org) + "/servers/" + encode(serverId)
-    + "/sites?include=server,latestDeployment", cursor)
+  return pagedPath(serverPath(org, serverId) + "/sites?include=server,latestDeployment", cursor)
 }
 
-// Everything addressed to one site hangs off this, so the three segments are
-// encoded in one place rather than once per endpoint.
-function sitePath(org, serverId, siteId) {
+// Everything addressed to one server hangs off this, and everything addressed
+// to one site off `sitePath` below it, so the segments are encoded in one place
+// rather than once per endpoint.
+function serverPath(org, serverId) {
   return "/orgs/" + encode(org) + "/servers/" + encode(serverId)
-    + "/sites/" + encode(siteId)
+}
+
+function sitePath(org, serverId, siteId) {
+  return serverPath(org, serverId) + "/sites/" + encode(siteId)
 }
 
 function deployPath(org, serverId, siteId) {
@@ -1091,13 +1147,28 @@ function maintenancePath(org, serverId, siteId) {
 // read-only token lacks — which is why the service reports their 403 on the row
 // rather than across the organization, the way the deploy log's is.
 function serverActionPath(org, serverId) {
-  return "/orgs/" + encode(org) + "/servers/" + encode(serverId) + "/actions"
+  return serverPath(org, serverId) + "/actions"
 }
 
 // `service` is never API data: it comes from the fixed list in `serverActions`.
 function serviceActionPath(org, serverId, service) {
-  return "/orgs/" + encode(org) + "/servers/" + encode(serverId)
-    + "/services/" + encode(service) + "/actions"
+  return serverPath(org, serverId) + "/services/" + encode(service) + "/actions"
+}
+
+// What Forge itself has done to a server — provisioning steps, deploys, key
+// installs — and what each of those printed. Both want only `server:view`, so
+// unlike the deploy log they work on a read-only token; the service still
+// reports their refusals on the pane rather than across the organization,
+// because they belong to a keypress. Newest first has to be asked for: the
+// default order is oldest first, which for a feed is the wrong end. The
+// `include=site` is load-bearing — without it the site relationship comes back
+// empty, and a row could not say which site an event was about.
+function serverEventsPath(org, serverId, cursor) {
+  return pagedPath(serverPath(org, serverId) + "/events?sort=-created_at&include=site", cursor)
+}
+
+function eventOutputPath(org, serverId, eventId) {
+  return serverPath(org, serverId) + "/events/" + encode(eventId) + "/output"
 }
 
 // The deploy log, fetched only when someone asks for it. Note the scope: this
@@ -1142,6 +1213,12 @@ function isCommandJob(job) {
   var kind = job ? String(job.kind || "") : ""
   return kind === "commandFind" || kind === "commandShow"
     || kind === "commandOutput"
+}
+
+// The two event reads, on the same terms and for the same reason.
+function isEventJob(job) {
+  var kind = job ? String(job.kind || "") : ""
+  return kind === "events" || kind === "eventOutput"
 }
 
 // The API never hands out a web link, so the dashboard address is a template
@@ -1278,6 +1355,13 @@ function logFileName(siteName, deploymentId) {
 // and a separator in either is what `safeFileName` is here to stop.
 function commandFileName(siteName, commandId) {
   return "forge-" + safeFileName(siteName) + "-" + safeFileName(commandId) + ".out"
+}
+
+// Named after the server rather than a site, because an event is the server's.
+// `serversFrom` never leaves a name empty, so `safeFileName`'s "site" fallback
+// is not reachable from here.
+function eventFileName(serverName, eventId) {
+  return "forge-" + safeFileName(serverName) + "-event-" + safeFileName(eventId) + ".log"
 }
 
 // A cap on what is kept in memory and laid out. Forge's own logs run to tens

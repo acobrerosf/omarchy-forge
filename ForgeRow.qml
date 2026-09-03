@@ -12,8 +12,9 @@ import qs.Commons
 Rectangle {
   id: root
 
-  // "org" | "server" | "site" | "action". Drives weight, size and the chevron,
-  // which are the only things that differ structurally between them.
+  // "org" | "server" | "site" | "action" | "event". Drives weight, size and
+  // the chevron, which are the only things that differ structurally between
+  // them.
   property string kind: "server"
 
   // An action row has no dot: the dot reports remote state, and an action has
@@ -68,9 +69,9 @@ Rectangle {
   signal entered()
 
   readonly property bool isSite: kind === "site"
-  // Sites and actions both sit one level in from a heading and read better a
-  // size down from it.
-  readonly property bool isCompact: isSite || kind === "action"
+  // Sites, actions and events all sit one level in from a heading and read
+  // better a size down from it.
+  readonly property bool isCompact: isSite || kind === "action" || kind === "event"
 
   readonly property color toneColor: {
     switch (root.tone) {

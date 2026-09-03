@@ -89,8 +89,8 @@ wording and the quiet; every write goes out on `Service`'s single-flight `action
 — where its meaning depends on live state, as the maintenance toggle's does — an `armIntent` in
 its arm key, so a refresh landing mid-arm invalidates it instead of retargeting it; a body a *user
 typed* — only the site command's — never rides that argv, and asks for `bodyStdin` instead, which
-sends it as `api … POST <path> -` and writes it to the helper's stdin on `started`; a site name
-reaching a *path* (a saved log's or command output's filename) goes
+sends it as `api … POST <path> -` and writes it to the helper's stdin on `started`; a site or
+server name reaching a *path* (a saved log's, command output's or event output's filename) goes
 through `Model.safeFileName`, which is the separator guard the other three don't cover; the command
 watch that polls a run to its end lives on `Service` and not on `Panel`, for the reason the sweep
 does — a timer in a bar widget runs once per monitor — and it says nothing when the run turns
@@ -104,6 +104,9 @@ dropped read in `_holdAccount` or `_abandonJob`; the command prompt is the one p
 that sets `PanelKeyCatcher.blocked`, and `stopCommandEditing` clears it *deferred* on purpose,
 or the enter that arms goes on to reach `onActivateRequested` and un-arms the row it just armed;
 and
+the event feed is the one route that stays alive *under* another (its output pane), which is why
+`popView` clears it by the kind it popped where it clears the log and the command
+unconditionally, and why `openServerEvents` refuses to push over a pane or the command prompt;
 `omarchy-notification-send --exec` takes a
 shell *string*, not an argv array — the shell runs it through `bash -lc` on click, so an address
 reaching it must pass `Model.externalUrl` **and** `Util.shellQuote`. Any new address that leaves

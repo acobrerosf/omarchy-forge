@@ -77,8 +77,8 @@ icon depends on it. A request that never left the machine (no token) is refunded
 Cost per tick per organization: **2** — the server list, then one *window* of the organization's
 site list through `/orgs/{org}/sites?include=server,latestDeployment`. For an organization of 150
 sites or fewer the window is the whole list, so the cost is 2 flat, independent of the server
-count — which is what makes an on-demand fetch (one server's sites on unfold today; a deployment
-log, a command's output tomorrow) obviously affordable — and independent of the monitor count,
+count — which is what makes an on-demand fetch (one server's sites on unfold, a deployment log, a
+page of a server's events, a command's output) obviously affordable — and independent of the monitor count,
 which is the whole reason polling lives in the service and not the widget. Past 150 sites, a tick
 spends up to `maxPages` continuations walking the next window of the rotation described below.
 
@@ -195,6 +195,22 @@ headers said, the hold a 429 imposes — because those are true whichever reques
 A refusal is always reported. `fetchServerSites` can return silently because the rotation reaches
 that server anyway; nothing comes along later to fill this pane in, so a hold, a ceiling, and the
 jobs a 429 drops out of the queue each answer the signal instead of vanishing.
+
+**A server's events are the deploy log twice.** `GET .../servers/{server}/events` and
+`.../events/{event}/output` take exactly that road — front of the queue, `quiet`, a refusal
+through `_eventRefused` from every drop site — and differ from it in two ways that both point the
+other direction. The scope is `server:view`, the one every sweep already needs, so a read-only
+token that is refused the deploy log is *not* refused here; the 403 is still named on the pane,
+because a token cut down further than the sweep can live with is the surprising case. And the
+feed is a page: `sort=-created_at` because the default is oldest first, `include=site` because
+without it the site relationship comes back empty, and `meta.next_cursor` handed back on the
+signal as `nextCursor` rather than followed — the next page is a row the reader presses, one
+request each, not a chain the service walks. The signal also echoes the `cursor` it was asked
+with, so the panel knows whether the rows replace its list or extend it. An event has no status
+attribute at all — Forge records what it did and what that printed — which is why
+`Model.eventsFrom` keeps no tone and the row carries no `siteId`: a site *name* is what the
+detail shows, and a site id on a row is what `currentSite` resolves, so `d` on an event would
+otherwise arm a deploy of whichever site the event mentioned.
 
 **A command run is the deploy log's shape, four times over.** `POST .../commands` is a write and
 goes out on `actionProcess` like every other; everything after it is reads, and they go through the
@@ -422,13 +438,34 @@ hold keyboard focus — so a site's actions are not a second window and could no
 different `rows`.
 
 `navStack` holds what has been pushed over the tree; `route` is its top. `rows` switches on it:
-nothing pushed is the tree, a `site` or `server` route is that subject's actions, and a `log` or
-`commandOutput` route is empty because a pane is not a list — `paneRoute` is the two of them
-together, drawn once rather than at each of the half-dozen places that has to know. A `command`
-route is one row, the send, built from what has been typed. Everything downstream is untouched —
-one cursor, one delegate, one key handler, one clamp in `onRowsChanged` — which is the point. The
+nothing pushed is the tree, a `site` or `server` route is that subject's actions, an `events`
+route is a server's feed, and a `log`, `commandOutput` or `eventOutput` route is empty because a
+pane is not a list — `paneRoute` is the three of them together, drawn once rather than at each of
+the half-dozen places that has to know, and the pane's document, loading flag and empty text are
+chosen once on the root (`paneLines` and its siblings) for the same reason. A `command` route is
+one row, the send, built from what has been typed. Everything downstream is untouched — one
+cursor, one delegate, one key handler, one clamp in `onRowsChanged` — which is the point. The
 server view cost exactly what that predicted: a branch in `actionRows`, a `runAction` case, and no
 new navigation model.
+
+The event feed is the first route that keeps state *under* another: an event's output is pushed
+over the list it was chosen from, and backing out has to land on that list, not on an empty one.
+Two rules follow. `popView` clears the log and the command unconditionally, as it always did —
+nothing is ever above them — but clears the feed only when the route it popped *was* the feed. And
+`e` refuses to open a feed from inside a pane or the command prompt, because a view pushed over
+either would let that same pop clear it — the pane's text, the prompt's command — on the way back.
+Backing out also returns to the row the view was opened from: `pushView` records `returnKey` and
+`returnActive` on the view, `popView` looks the key up in the rows that `navStack` has just
+re-derived, and `replaceView` carries them across, so the output pane that replaces a command
+prompt still knows where the prompt came from. That is what makes a feed of thirty events readable
+one at a time rather than scrolled back to on every return.
+
+The feed is also the first list taller than the card. The tree never was — a handful of servers
+fits — so nothing kept the cursor on screen, and `j` past the fold moved a highlight nobody could
+see. `flick.revealRow` scrolls by the least that brings the row into view, and the root calls it
+from `followCursor` on every cursor change, *deferred* through `Qt.callLater`: a view that has just
+been pushed has rows the Column has not laid out yet, and asking for their position in the same
+turn answers with zero.
 
 The command prompt is the first thing here that needed more than that, because it is the one place
 in the panel where a keypress is a *letter*. `PanelKeyCatcher.blocked` is the documented way out:

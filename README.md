@@ -75,6 +75,7 @@ commit. A server whose site starts failing unfolds itself once.
 | `l` or → | go deeper — on an unfolded server, opens its actions |
 | `h` or ← | back, or fold up the current row |
 | `d` | deploy the site under the cursor (press twice) |
+| `e` | the server's event feed — what Forge has done to it, newest first |
 | `o` | open the site's URL, or a server's page in Forge |
 | `f` | open the row in the Forge dashboard |
 | `s` | copy an `ssh forge@…` command for the server |
@@ -115,13 +116,13 @@ The output arrives when the run finishes.
 
 **Deployment log** opens the latest deploy's output, ANSI stripped, scrolled to the bottom.
 
-| Key | In a log or command output |
+| Key | In a log, a command's output, or an event's output |
 |---|---|
 | `j` `k` or ↑ ↓ | scroll |
 | `g` / `G` | top / bottom |
 | `c` | copy the whole thing |
 | `w` | save it to `~/Downloads/` — the panel says where it landed |
-| `r` | look at a command run again |
+| `r` | look at a command run or an event's output again |
 | `h` or esc | back |
 
 ### A server
@@ -134,9 +135,22 @@ Press `l` on an unfolded server, or click the ⚙ on any server row.
 | **Reload PHP-FPM** | a graceful reload of the server's PHP version |
 | **Restart PHP-FPM** | the harder version |
 | **Reboot server** | enter to arm, capital `Y` to send |
+| **Server events** | what Forge has done to the server, newest first — also `e` from any row |
 
 Forge does all of this asynchronously, so the answer is "requested" — what changed shows up in the
 next refresh.
+
+#### Events
+
+Every deploy, command run, key install and environment change Forge performs on a server is an
+event, and the feed lists them thirty at a time with the site each was about and when. Enter on one
+opens what it printed, in the same pane as a deployment log and with the same keys; enter on the
+last row, *Older events…*, fetches the next thirty. An unreachable server's feed is where the
+reason usually is.
+
+Forge records what an event did and what it printed, **not whether it succeeded** — there is no
+status on an event, so the feed has no red rows. Open the output to find out. Reading events needs
+only the `server:view` scope, so unlike deployment logs this works on a read-only token.
 
 ### Notifications
 
@@ -184,8 +198,9 @@ Forge allows **60 requests a minute per Forge account**, shared with anything el
 including its own dashboard in a browser tab.
 
 A refresh costs **two requests per organization**, whatever your server count, and that figure
-doesn't change with the number of monitors. Opening a deployment log is one more. Running a command
-costs about a dozen, spread over a hundred seconds.
+doesn't change with the number of monitors. Opening a deployment log is one more, and so is a
+server's event feed — one per page of thirty, and one for each event's output you open. Running a
+command costs about a dozen, spread over a hundred seconds.
 
 The widget keeps a budget per account and backs off before it runs out, telling you on the row
 rather than failing silently. If Forge refuses anyway, the panel says "rate limited" and everything
@@ -243,8 +258,10 @@ reaches, and which is the default. Tokens are never in there.
 
 - **The dashboard URL is a template.** The Forge API hands out no web link, so
   `dashboardUrlTemplate` is a setting.
-- **The server view stops at four actions.** Stopping a service and power-cycling a server are
+- **The server view stops at four writes.** Stopping a service and power-cycling a server are
   deliberately absent, as are the database and queue services.
+- **Events have no status.** Forge's event record says what was done and what it printed, not
+  whether it worked, so the feed cannot colour a failed step — open its output to find out.
 - **The server list stops at 150 rows** and says so rather than quietly showing a prefix. Sites are
   not capped — past 150 they are checked in rotation.
 - **A command run has no history and no partial output.** You see the run you just started, and its

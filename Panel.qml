@@ -52,11 +52,12 @@ Panel {
   readonly property var routeSite: route ? siteFor(route) : null
   readonly property var routeServer: route ? serverById(route.org, route.serverId) : null
 
-  // The two routes that are a pane rather than a list. They share everything
-  // that follows from that — no cursor to move, j/k scrolls instead, a wider
-  // card, and the reading keys `g G c w` — so the distinction is drawn once
-  // here rather than at each of the places that has to know.
+  // The routes that are a pane rather than a list. They share everything that
+  // follows from that — no cursor to move, j/k scrolls instead, a wider card,
+  // and the reading keys `g G c w` — so the distinction is drawn once here
+  // rather than at each of the places that has to know.
   readonly property bool paneRoute: routeKind === "log" || routeKind === "commandOutput"
+    || routeKind === "eventOutput"
 
   // The log this panel asked for, and what came back. Keyed the same way the
   // service keys its answer, so two screens with two logs open don't cross.
@@ -68,6 +69,29 @@ Panel {
   property var logLines: []
   property string logError: ""
   property bool logLoading: false
+
+  // A server's event feed and, above it, one event's output. The feed is the
+  // first thing here that stays alive *under* another route — backing out of
+  // an event's output must land on the list it came from, not on an empty one
+  // — which is why `popView` clears it by the kind it popped rather than
+  // unconditionally the way it clears the log. `eventsCursor` is the page
+  // after the one on screen: empty once the feed has been read to its end.
+  property string eventsRequestKey: ""
+  property var events: []
+  property string eventsCursor: ""
+  property string eventsError: ""
+  property bool eventsLoading: false
+  property string eventOutputRequestKey: ""
+  property var eventOutputLines: []
+  property string eventOutputError: ""
+  property bool eventOutputLoading: false
+  // The event the output pane is about, looked up in the feed under it.
+  readonly property var routeEvent: {
+    if (routeKind !== "eventOutput" || !route) return null
+    for (var i = 0; i < events.length; i++)
+      if (events[i].id === String(route.eventId)) return events[i]
+    return null
+  }
 
   // The command prompt and the run it turns into. `commandText` is deliberately
   // not remembered between opens: a command that can be recalled is a command
@@ -247,6 +271,7 @@ Panel {
                 key: route.org + "/" + route.siteId + "/command-run" }]
     }
     if (routeKind === "site" || routeKind === "server") return actionRows
+    if (routeKind === "events") return eventRows
 
     var out = []
     for (var o = 0; o < organizations.length; o++) {
@@ -306,7 +331,39 @@ Panel {
     return out
   }
 
+  // The event feed's rows: one per event, newest first, and — while Forge has
+  // a page after this one — a last row that fetches it. A row rather than a
+  // key, so enter and a click both reach it and it says "loading…" itself
+  // while the page is on its way; it stays available meanwhile because the
+  // service already refuses a second copy of a page it is fetching. The event
+  // object rides the row the way an action does, so the delegate has no
+  // lookup to make; the row carries no `siteId` on purpose — see
+  // `Model.eventsFrom`.
+  readonly property var eventRows: {
+    var out = []
+    if (routeKind !== "events") return out
+    var prefix = route.org + "/" + route.serverId + "/"
+    for (var i = 0; i < events.length; i++)
+      out.push({ kind: "event", org: route.org, serverId: route.serverId,
+                 eventId: events[i].id, event: events[i],
+                 key: prefix + "event/" + events[i].id })
+    if (eventsCursor !== "")
+      out.push({ kind: "action", org: route.org, serverId: route.serverId, siteId: "",
+                 action: { id: "events-more", hint: "",
+                           label: eventsLoading ? "Loading older events…" : "Older events…",
+                           available: true, reason: "" },
+                 armKey: "", key: prefix + "more" })
+    return out
+  }
+
+  // The row the view was opened from rides the view, so backing out lands on
+  // it rather than on the top of whatever list is underneath — which for a
+  // feed of thirty events read one at a time is the difference between
+  // reading and scrolling.
   function pushView(view) {
+    var from = currentRow()
+    view.returnKey = from ? String(from.key) : ""
+    view.returnActive = cursorActive
     navStack = navStack.concat([view])
     cursorIndex = 0
     cursorActive = false
@@ -315,12 +372,24 @@ Panel {
 
   function popView() {
     if (navStack.length === 0) return false
+    var popped = route
     navStack = navStack.slice(0, navStack.length - 1)
+    // `rows` has already followed `navStack`, so the origin can be looked up
+    // in it now. A row that has gone — a site the sweep dropped — falls back
+    // to the top, which is where every pop used to land.
+    var origin = String(popped.returnKey || "")
     cursorIndex = 0
-    cursorActive = false
+    if (origin !== "") cursorIndex = indexOfRow(origin)
+    cursorActive = popped.returnActive === true && rows.length > 0
     disarm()
+    // The log and the command are only ever the top of the stack, so nothing
+    // is lost by clearing them on every pop. The feed is not: an event's
+    // output sits over it, and clearing the list on the way back out of the
+    // output is what this branch exists to avoid.
     clearLog()
     clearCommand()
+    clearEventOutput()
+    if (popped.kind === "events") clearEvents()
     return true
   }
 
@@ -330,6 +399,10 @@ Panel {
   // place and `h` lands on the site view behind them both.
   function replaceView(view) {
     if (navStack.length === 0) { pushView(view); return }
+    // The replaced view's origin is this one's too: what is underneath has
+    // not changed, so where backing out lands must not either.
+    view.returnKey = route ? String(route.returnKey || "") : ""
+    view.returnActive = route ? route.returnActive === true : false
     navStack = navStack.slice(0, navStack.length - 1).concat([view])
     cursorIndex = 0
     cursorActive = false
@@ -386,6 +459,7 @@ Panel {
     if (!row) return Model.rowView(null, {})
     if (row.kind === "action")
       return Model.rowView(row, { action: row.action, armKey: row.armKey })
+    if (row.kind === "event") return Model.rowView(row, { event: row.event })
     var isOrg = row.kind === "org"
     return Model.rowView(row, {
       server: isOrg ? null : serverById(row.org, row.serverId),
@@ -451,6 +525,7 @@ Panel {
       return
     }
     if (row.kind === "action") { runAction(row); return }
+    if (row.kind === "event") { openEventOutput(row); return }
     if (!siteFor(row)) { say("That site is no longer listed"); return }
     pushView({ kind: "site", org: row.org, serverId: row.serverId, siteId: row.siteId })
   }
@@ -542,6 +617,16 @@ Panel {
     return when === "" ? reported.label : reported.label + " · " + when
   }
 
+  // What the hero says under an event's description: who it ran as and which
+  // site it was about, the same two facts its row showed.
+  function eventMeta(event) {
+    if (!event) return ""
+    var parts = []
+    if (event.ranAs) parts.push("as " + event.ranAs)
+    if (event.siteName) parts.push(event.siteName)
+    return parts.join(" · ")
+  }
+
   // The badge follows whatever the hero is about, so in a site view it reports
   // that site rather than the health of everything being watched.
   readonly property string heroTone: {
@@ -550,10 +635,12 @@ Panel {
       return tone === "bad" ? "bad" : tone === "busy" ? "busy"
         : tone === "warn" ? "maintenance" : "none"
     }
-    if (routeKind === "server") {
+    if (routeKind === "server" || routeKind === "events") {
       var serverTone = routeServer ? Model.serverTone(routeServer.state) : "idle"
       return serverTone === "bad" ? "bad" : serverTone === "busy" ? "busy" : "none"
     }
+    // An event has no status for a badge to report — see `Model.eventsFrom`.
+    if (routeKind === "eventOutput") return "none"
     return health === "bad" ? "bad"
       : health === "busy" ? "busy"
       : health === "maintenance" ? "maintenance"
@@ -573,8 +660,10 @@ Panel {
   readonly property string hintText: {
     if (routeKind === "log")
       return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [h] back"
-    if (routeKind === "commandOutput")
+    if (routeKind === "commandOutput" || routeKind === "eventOutput")
       return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [r] look again · [h] back"
+    if (routeKind === "events")
+      return "[enter] output · [r] refresh · [h] back"
     // Two lines because it is two states, and the one it is in is the whole
     // question: a field that is typing into and a row that is waiting for `Y`
     // look similar and take completely different keys.
@@ -596,8 +685,8 @@ Panel {
         + " · [f] forge · [r] refresh · [a] add org"
     if (row.kind === "server")
       return isExpanded(row.org, row.serverId)
-        ? "[l] actions · [h] fold · [f] forge · [s] copy ssh"
-        : "[enter] unfold · [f] forge · [s] copy ssh · [r] refresh"
+        ? "[l] actions · [h] fold · [e] events · [f] forge · [s] ssh"
+        : "[enter] unfold · [e] events · [f] forge · [s] ssh · [r] refresh"
     return "[enter] actions · [d] deploy · [o] open · [f] forge"
   }
 
@@ -629,6 +718,8 @@ Panel {
       else runWriteAction(row)
       break
     case "log": openLog(); break
+    case "events": openServerEvents(); break
+    case "events-more": fetchEvents(eventsCursor); break
     case "open": openCurrent(); break
     case "forge": openCurrentInForge(); break
     case "ssh": copyCurrentSsh(); break
@@ -765,12 +856,92 @@ Panel {
     forge.fetchDeploymentLog(row.org, row.serverId, site.id, site.deploymentId)
   }
 
-  // The two ways what is on screen leaves this pane, for either of the panes.
-  // Both take the text already there, so neither costs a request — and both go
-  // out on stdin rather than in an argv, because a verbose deploy can outgrow
-  // what an argument may hold.
-  readonly property var paneLines: routeKind === "commandOutput" ? commandLines : logLines
+  // ---------------------------------------------------------- server events
 
+  function clearEvents() {
+    eventsRequestKey = ""
+    events = []
+    eventsCursor = ""
+    eventsError = ""
+    eventsLoading = false
+  }
+
+  function clearEventOutput() {
+    eventOutputRequestKey = ""
+    saveRequestedPath = ""
+    eventOutputLines = []
+    eventOutputError = ""
+    eventOutputLoading = false
+  }
+
+  // `e`, and the row in the server view. Resolves the server the way `f` and
+  // `s` do — the row under the cursor, else the view's — so it means the same
+  // thing from a site as from its server. Three refusals: from inside a pane
+  // or the command prompt, because a view pushed over either would let
+  // `popView` clear it — the pane's text, the prompt's command — on the way
+  // back; and from the feed itself, where it would only stack a second copy
+  // over the first.
+  function openServerEvents() {
+    if (paneRoute || routeKind === "events" || routeKind === "command") return
+    var server = currentServer()
+    if (!server || !forge) return
+    var org = currentOrg()
+    clearEvents()
+    pushView({ kind: "events", org: org, serverId: server.id })
+    fetchEvents("")
+  }
+
+  // The first page replaces the list; a later one, asked for by the trailing
+  // row, extends it. Both are one request and both go through the log's
+  // refusals. The key is the feed's, not the page's, so the answer to either
+  // finds the same pane.
+  function fetchEvents(cursor) {
+    if (!forge || routeKind !== "events") return
+    eventsRequestKey = forge.eventsRequestKey(route.org, route.serverId)
+    eventsLoading = true
+    if (cursor === "") { eventsError = ""; eventsCursor = "" }
+    forge.fetchServerEvents(route.org, route.serverId, cursor)
+  }
+
+  function openEventOutput(row) {
+    if (!row || !forge) return
+    clearEventOutput()
+    eventOutputRequestKey = forge.eventOutputRequestKey(row.org, row.serverId, row.eventId)
+    eventOutputLoading = true
+    pushView({ kind: "eventOutput", org: row.org, serverId: row.serverId, eventId: row.eventId })
+    forge.fetchEventOutput(row.org, row.serverId, row.eventId)
+  }
+
+  function refreshEventOutput() {
+    if (!forge || routeKind !== "eventOutput") return
+    eventOutputLines = []
+    eventOutputError = ""
+    eventOutputLoading = true
+    forge.fetchEventOutput(route.org, route.serverId, route.eventId)
+  }
+
+  // ------------------------------------------------------------------ panes
+
+  // Which pane's document is on screen, decided once. Three panes share one
+  // `ForgeLogView`, and a three-way ternary in each of its bindings is the
+  // wrong shape for a decision that has to come out the same every time.
+  readonly property var paneLines: routeKind === "commandOutput" ? commandLines
+    : routeKind === "eventOutput" ? eventOutputLines : logLines
+  readonly property bool paneLoading: routeKind === "commandOutput" ? commandRunning
+    : routeKind === "eventOutput" ? eventOutputLoading : logLoading
+  readonly property string paneError: routeKind === "commandOutput" ? commandError
+    : routeKind === "eventOutput" ? eventOutputError : logError
+  readonly property string paneLoadingText: routeKind === "commandOutput"
+    ? (commandHeader === "" ? "queued…" : commandHeader + "…")
+    : routeKind === "eventOutput" ? "Fetching the event's output…" : "Fetching the log…"
+  readonly property string paneEmptyText: routeKind === "commandOutput"
+    ? "This command printed nothing."
+    : routeKind === "eventOutput" ? "This event printed nothing."
+    : "This deployment printed nothing."
+
+  // The two ways what is on screen leaves a pane. Both take the text already
+  // there, so neither costs a request — and both go out on stdin rather than
+  // in an argv, because a verbose deploy can outgrow what an argument may hold.
   function copyPane() {
     if (paneLines.length === 0 || !forge) return
     forge.copyToClipboard(paneLines.join("\n") + "\n")
@@ -781,12 +952,15 @@ Panel {
     if (paneLines.length === 0 || !forge || !route) return
     var site = routeSite
     var name = site ? site.name : ""
-    // The file is named after the site, which is API data reaching a path.
-    // These two are what stop a site name being a separator.
+    // The file is named after the site — or, for an event, the server — which
+    // is API data reaching a path. These three are what stop a name being a
+    // separator.
     saveRequestedPath = forge.downloadDir() + "/"
       + (routeKind === "commandOutput"
          ? Model.commandFileName(name, commandId)
-         : Model.logFileName(name, route.deploymentId))
+         : routeKind === "eventOutput"
+           ? Model.eventFileName(routeServer ? routeServer.name : "", route.eventId)
+           : Model.logFileName(name, route.deploymentId))
     forge.saveText(paneLines.join("\n") + "\n", saveRequestedPath)
   }
 
@@ -957,12 +1131,24 @@ Panel {
     if (cursorIndex >= rows.length) cursorIndex = Math.max(0, rows.length - 1)
   }
 
+  // Deferred, because the row the cursor moved to may not have been laid out
+  // yet — a view that has just been pushed has rows the Column has not sized.
+  function followCursor() {
+    if (!cursorActive) return
+    Qt.callLater(function () { flick.revealRow(cursorIndex) })
+  }
+  onCursorIndexChanged: followCursor()
+  onCursorActiveChanged: followCursor()
+
   onOpenedChanged: {
     if (opened) root.refresh()
     // Reopening lands on the tree. A view is where a train of thought was, and
     // resuming one from an hour ago mid-way is disorienting — the log behind
     // it is stale by then anyway.
-    else { disarm(); cursorActive = false; navStack = []; clearLog(); clearCommand() }
+    else {
+      disarm(); cursorActive = false; navStack = []
+      clearLog(); clearCommand(); clearEventOutput(); clearEvents()
+    }
   }
 
   // A server that has just started failing is worth unfolding on its own — the
@@ -1040,6 +1226,31 @@ Panel {
       // guard has not seen is how an escape sequence gets to survive one.
       root.logLines = ok ? Model.logLines(text) : []
       root.logError = ok ? "" : String(message || "Could not read the log")
+    }
+
+    // The feed, filtered the same way. A first page replaces what is shown; a
+    // later one extends it, and a later one that fails says so in the footer
+    // rather than blanking a list that is already on screen. The array is
+    // reassigned, never appended to in place — see CLAUDE.md.
+    function onServerEventsFetched(requestKey, ok, events, cursor, nextCursor, message) {
+      if (root.eventsRequestKey !== requestKey) return
+      root.eventsLoading = false
+      if (!ok) {
+        var why = String(message || "Could not read the events")
+        if (cursor === "" || root.events.length === 0) root.eventsError = why
+        else root.say(why)
+        return
+      }
+      root.eventsError = ""
+      root.events = cursor === "" ? events : root.events.concat(events)
+      root.eventsCursor = String(nextCursor || "")
+    }
+
+    function onEventOutputFetched(requestKey, ok, text, message) {
+      if (root.eventOutputRequestKey !== requestKey) return
+      root.eventOutputLoading = false
+      root.eventOutputLines = ok ? Model.logLines(text) : []
+      root.eventOutputError = ok ? "" : String(message || "Could not read the event")
     }
 
     // Saving is the one thing here that touches the filesystem, so where it
@@ -1224,8 +1435,11 @@ Panel {
         // worth re-reading, and the ladder that was following it has stopped.
         case "r":
           if (root.routeKind === "commandOutput") root.refreshCommandRun()
+          else if (root.routeKind === "eventOutput") root.refreshEventOutput()
+          else if (root.routeKind === "events") root.fetchEvents("")
           else root.refresh()
           break
+        case "e": root.openServerEvents(); break
         case "o": root.openCurrent(); break
         case "f": root.openCurrentInForge(); break
         case "s": root.copyCurrentSsh(); break
@@ -1249,6 +1463,22 @@ Panel {
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+        // Keeps the row under the cursor on screen. The tree never needed this
+        // — a handful of servers fits — but a feed of thirty events does not,
+        // and a cursor that has walked below the fold is a cursor nobody can
+        // see. Scrolls by the least that brings the row into view, so `j`
+        // through a long list reads as a list moving up one row at a time.
+        function revealRow(index) {
+          var item = rowRepeater.itemAt(index)
+          if (!item || contentHeight <= height) return
+          var top = item.mapToItem(column, 0, 0).y
+          var bottom = top + item.height
+          var y = contentY
+          if (top < y) y = top
+          else if (bottom > y + height) y = bottom - height
+          contentY = Math.max(0, Math.min(y, contentHeight - height))
+        }
 
         Column {
           id: column
@@ -1275,9 +1505,10 @@ Panel {
               // is the organization whether or not the tree shows headers for
               // it — and not the server, which the hero right below already
               // names.
-              if (root.route && (root.showOrgHeaders || root.routeKind === "server"))
+              var aboutServer = root.routeKind === "server" || root.routeKind === "events"
+              if (root.route && (root.showOrgHeaders || aboutServer))
                 parts.push(root.orgLabel(root.route.org))
-              var server = root.routeKind === "server" ? null
+              var server = aboutServer ? null
                 : root.route ? root.serverById(root.route.org, root.route.serverId) : null
               if (server) parts.push(server.name)
               if (root.routeKind === "log" && root.routeSite) parts.push(root.routeSite.name)
@@ -1296,20 +1527,30 @@ Panel {
             width: parent.width
             // In a view the hero is about the thing the view is about. Same
             // three slots, so nothing below has to move.
+            // The feed is about the server, so it wears the server's hero;
+            // an event's output is about that event, and gets its three
+            // facts — what, for whom, when — in the same three slots.
             title: root.routeSite
               ? Model.plainText(root.routeSite.name)
-              : root.routeKind === "server"
+              : root.routeKind === "eventOutput"
+                ? Model.plainText(root.routeEvent ? root.routeEvent.description : "Event")
+              : root.routeKind === "server" || root.routeKind === "events"
                 ? Model.plainText(root.routeServer ? root.routeServer.name : "Server")
                 : root.organizations.length === 1
                   ? Model.plainText(root.orgLabel(root.organizations[0])) : "Forge"
             meta: root.routeSite
               ? Model.plainText(root.siteMeta(root.routeSite))
-              : root.routeKind === "server"
+              : root.routeKind === "eventOutput"
+                ? Model.plainText(root.eventMeta(root.routeEvent))
+              : root.routeKind === "server" || root.routeKind === "events"
                 ? Model.plainText(root.routeServer ? Model.serverMeta(root.routeServer) : "")
                 : Model.plainText(root.summary)
             detail: root.routeSite
               ? root.siteDetailLine(root.routeSite)
-              : root.routeKind === "server"
+              : root.routeKind === "eventOutput"
+                ? (root.routeEvent && root.routeEvent.createdAt
+                   ? Model.relativeTime(root.routeEvent.createdAt, root.nowMs) : "")
+              : root.routeKind === "server" || root.routeKind === "events"
                 ? root.serverDetailLine(root.routeServer)
                 : root.refreshing ? "refreshing…"
                                   : Model.relativeMs(root.lastRefreshMs, root.nowMs)
@@ -1431,12 +1672,14 @@ Panel {
               // header between the two would only separate them.
               visible: root.routeKind !== "command"
               text: root.routeKind === "site" || root.routeKind === "server" ? "ACTIONS"
+                : root.routeKind === "events" ? "EVENTS"
                 : root.showOrgHeaders ? "ORGANIZATIONS" : "SERVERS"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
 
             Repeater {
+              id: rowRepeater
               model: root.rows
 
               ForgeRow {
@@ -1456,7 +1699,7 @@ Panel {
                 tone: rowItem.view.tone
                 depth: rowItem.view.depth
                 showChevron: rowItem.view.showChevron
-                showDot: rowItem.modelData.kind !== "action"
+                showDot: rowItem.modelData.kind !== "action" && rowItem.modelData.kind !== "event"
                 showActions: rowItem.modelData.kind === "server"
                 expanded: rowItem.modelData.kind === "org"
                   ? root.isOrgExpanded(rowItem.modelData.org)
@@ -1471,8 +1714,8 @@ Panel {
                 armedText: rowItem.view.armedText
                 sending: rowItem.view.actionKey !== ""
                   && root.busyKey === rowItem.view.actionKey
-                timeText: rowItem.view.deployedAt
-                  ? Model.relativeTime(rowItem.view.deployedAt, root.nowMs) : ""
+                timeText: rowItem.view.timeAt
+                  ? Model.relativeTime(rowItem.view.timeAt, root.nowMs) : ""
 
                 foreground: root.foreground
                 dimColor: root.dim
@@ -1569,17 +1812,14 @@ Panel {
             // a request for as much as the screen will give.
             height: visible ? Style.space(460) : 0
 
-            // Two panes, one Item: which one is a matter of which route is up.
-            // See `paneRoute`.
-            lines: root.routeKind === "commandOutput" ? root.commandLines : root.logLines
-            loading: root.routeKind === "commandOutput"
-              ? root.commandRunning : root.logLoading
-            error: root.routeKind === "commandOutput" ? root.commandError : root.logError
-            loadingText: root.routeKind === "commandOutput"
-              ? (root.commandHeader === "" ? "queued…" : root.commandHeader + "…")
-              : "Fetching the log…"
-            emptyText: root.routeKind === "commandOutput"
-              ? "This command printed nothing." : "This deployment printed nothing."
+            // Three panes, one Item: which one is a matter of which route is
+            // up, decided once on the root — see `paneLines`. The header is
+            // the command run's alone: it is the one pane with a state line.
+            lines: root.paneLines
+            loading: root.paneLoading
+            error: root.paneError
+            loadingText: root.paneLoadingText
+            emptyText: root.paneEmptyText
             header: root.routeKind === "commandOutput" && !root.commandRunning
               ? root.commandHeader : ""
             headerBad: root.routeKind === "commandOutput"
@@ -1604,6 +1844,23 @@ Panel {
             text: root.refreshing
               ? "Loading servers…"
               : "No servers in " + root.organizations.join(", ") + "."
+          }
+
+          // The feed's three empty states: on its way, refused, or genuinely
+          // nothing — the last is a real answer for a server Forge has not
+          // touched since it was provisioned, and reads as one.
+          Text {
+            width: parent.width
+            visible: root.routeKind === "events" && root.rows.length === 0
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            color: root.eventsError !== "" ? root.badColor : root.foreground
+            opacity: root.eventsError !== "" ? 0.9 : 0.55
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            text: root.eventsLoading ? "Fetching events…"
+              : root.eventsError !== "" ? root.eventsError
+              : "No events recorded for this server."
           }
         }
       }
@@ -1649,7 +1906,9 @@ Panel {
         Text {
           id: hints
           width: parent.width
-          visible: root.rows.length > 0 || root.paneRoute
+          // The feed keeps its footer while empty: `[h] back` is the one key
+          // that matters on a list that is still loading or came back refused.
+          visible: root.rows.length > 0 || root.paneRoute || root.routeKind === "events"
           wrapMode: Text.WordWrap
           textFormat: Text.PlainText
           color: root.foreground
