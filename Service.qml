@@ -45,28 +45,34 @@ Item {
 
   signal actionFinished(string key, bool ok, string message)
 
-  // The deploy log is a one-shot read whose answer belongs to the one panel
-  // that asked — the same reason `actionFinished` is a signal and not state.
-  // It is also tens of kilobytes, which is no business of a property every
-  // panel re-reads. `requestKey` is organization-qualified so two panels, or
-  // two organizations holding the same numeric ids, cannot cross-answer.
-  signal deploymentLogFetched(string requestKey, bool ok, string text, string message)
+  // One signal for the three document panes — a deploy log, a site log, an
+  // event's output. Each is a one-shot read whose answer belongs to the one
+  // panel that asked, the same reason `actionFinished` is a signal and not
+  // state, and each is tens of kilobytes, which is no business of a property
+  // every panel re-reads. `requestKey` is organization-qualified so two panels,
+  // or two organizations holding the same numeric ids, cannot cross-answer.
+  //
+  // One rather than three: the panel never has to ask which pane it is
+  // answering. Only one pane is ever open, the three keys differ in shape, and
+  // the wording a 403 earns — the scopes differ, and two of the three are
+  // surprising — is chosen here, in the handler that saw the status, rather
+  // than by a reader downstream trying to work out what it was given.
+  signal documentFetched(string requestKey, bool ok, string text, string message)
 
   function logRequestKey(org, serverId, siteId, deploymentId) {
     return String(org) + "/" + String(serverId) + ":" + String(siteId)
       + "/" + String(deploymentId)
   }
 
-  // A server's event feed and one event's output, on the log's terms: one
-  // panel asked, the answer is a document, and a refusal is always reported.
-  // The feed answers with the `cursor` it was asked for — "" for the first
-  // page — so the panel knows whether what arrived replaces its list or
-  // extends it, and with the `nextCursor` a further page would need. The
-  // list rides a `var` because it is the one answer here that is rows rather
-  // than text; the panel reassigns what it gets and never mutates it.
+  // A server's event feed, on the log's terms: one panel asked, the answer is
+  // rows, and a refusal is always reported. The feed answers with the `cursor`
+  // it was asked for — "" for the first page — so the panel knows whether what
+  // arrived replaces its list or extends it, and with the `nextCursor` a
+  // further page would need. The list rides a `var` because it is rows rather
+  // than text; the panel reassigns what it gets and never mutates it. One
+  // event's *output* is a document and answers `documentFetched`.
   signal serverEventsFetched(string requestKey, bool ok, var events, string cursor,
                              string nextCursor, string message)
-  signal eventOutputFetched(string requestKey, bool ok, string text, string message)
 
   function eventsRequestKey(org, serverId) {
     return String(org) + "/" + String(serverId) + "/events"
@@ -76,13 +82,10 @@ Item {
     return String(org) + "/" + String(serverId) + "/events/" + String(eventId)
   }
 
-  // A site's own log, which is the deploy log's road a third time. Its own
-  // signal rather than the deploy log's because the key has a different shape —
-  // a kind where that one has a deployment id — and because the 403 is about a
-  // different scope, so a shared handler would have to ask which it was
-  // answering.
-  signal siteLogFetched(string requestKey, bool ok, string text, string message)
-
+  // A site's own log, which is the deploy log's road a third time — and lands
+  // on `documentFetched` with it. The key has a different shape (a kind where
+  // that one has a deployment id), which is what keeps a stale answer from
+  // being mistaken for this one's.
   function siteLogRequestKey(org, serverId, siteId, kind) {
     return String(org) + "/" + String(serverId) + ":" + String(siteId)
       + "/logs/" + String(kind)
@@ -582,24 +585,113 @@ Item {
   // well past that is stuck rather than slow.
   readonly property int requestTimeoutMs: 25000
 
+  // ------------------------------------------------------- on-demand reads
+
+  // The five reads a keypress can ask for — a deploy log, a server's event
+  // feed, one event's output, the organization's recipes, a site's own log —
+  // share one road, because what makes them a group is not the repetition but
+  // the rule: each has a pane or a view waiting on a signal, so every way a
+  // request can fail to happen owes it an answer. The three functions below
+  // are that rule in one place. A sixth read kind is complete when it has an
+  // arm in each of them, a line in `_pathFor` and one in `onExited`.
+
+  // The key the answer will carry, which is also what makes two asks for the
+  // same thing the same ask. Each shape is the one its signal is filtered by
+  // on the panel, so the dedupe and the answer cannot drift apart.
+  function _readRequestKey(job) {
+    if (job.kind === "log")
+      return logRequestKey(job.org, job.serverId, job.siteId, job.deploymentId)
+    if (job.kind === "events") return eventsRequestKey(job.org, job.serverId)
+    if (job.kind === "eventOutput")
+      return eventOutputRequestKey(job.org, job.serverId, job.eventId)
+    if (job.kind === "recipes") return recipesRequestKey(job.org)
+    if (job.kind === "siteLog")
+      return siteLogRequestKey(job.org, job.serverId, job.siteId, job.log)
+    return ""
+  }
+
+  // The registry every drop site consults: an entry guard, an unwatched
+  // organization, a hold, an error on the wire. Answers `true` when it
+  // recognised the kind, so a caller with kinds of its own — the run watch's,
+  // which owe a different farewell — can tell whether it has been dealt with.
+  function _readRefused(job, message) {
+    if (job.kind === "log" || job.kind === "eventOutput" || job.kind === "siteLog") {
+      documentFetched(_readRequestKey(job), false, "", message)
+      return true
+    }
+    if (job.kind === "events") {
+      serverEventsFetched(_readRequestKey(job), false, [],
+                          String(job.cursor || ""), "", message)
+      return true
+    }
+    if (job.kind === "recipes") {
+      recipesFetched(_readRequestKey(job), false, [],
+                     String(job.cursor || ""), "", message)
+      return true
+    }
+    return false
+  }
+
+  // Queued or already on the wire. The one question every dedupe asks, asked
+  // in one place because `_current` is as much a reason not to send again as
+  // the queue is.
+  function _outstanding(matches) {
+    return queue.contains(matches) || (_current !== null && matches(_current))
+  }
+
+  // The guards every on-demand read passes, in the order that matters: an
+  // organization that is gone, then the hold, then the ceiling, then whether
+  // this is already on its way. The first three refuse — a refusal is reported
+  // rather than swallowed, because nothing comes along later to fill the pane
+  // in — and the fourth returns silently, since the answer is already coming.
+  //
+  // It jumps the queue because it belongs to a keypress. A sweep behind it can
+  // afford to arrive a second later; someone staring at a blank pane cannot.
+  function _enqueueRead(job) {
+    var state = orgs[job.org]
+    if (!state) {
+      _readRefused(job, "That organization is no longer being watched")
+      return
+    }
+
+    job.account = state.account || accountForOrg(job.org)
+    var held = budget.blockedMs(job.account)
+    if (held > 0) {
+      _readRefused(job, "Rate limited — try again in " + Math.ceil(held / 1000) + "s")
+      return
+    }
+    if (budget.wouldExceed(job.account, 1)) {
+      _readRefused(job, "Too close to the rate limit — try again shortly")
+      return
+    }
+
+    // Same kind, same key, same page is the same request. The key carries the
+    // ids, so a cursor is all that is left to compare — and for the two reads
+    // that have one, a second page is a different ask.
+    var key = _readRequestKey(job)
+    var page = String(job.cursor || "")
+    var pending = function (other) {
+      return other.kind === job.kind && _readRequestKey(other) === key
+        && String(other.cursor || "") === page
+    }
+    if (_outstanding(pending)) return
+
+    queue.pushFront(job)
+  }
+
   // A queued job thrown away because the organization it belongs to stopped
   // being watched. A sweep needs no farewell — the next tick is its answer —
-  // but a log and a command look each have a pane waiting on a signal that is
+  // but a read and a command look each have a pane waiting on a signal that is
   // no longer coming, and a pane left holding "queued…" forever is the same
   // silence `_holdAccount` was taught not to leave behind. The run itself may
   // well finish out on the box; there is simply nothing left here to watch it
   // with, so the watch goes with the organization.
   function _abandonJob(job) {
     var message = "That organization is no longer being watched"
-    if (job.kind === "log") {
-      deploymentLogFetched(logRequestKey(job.org, job.serverId, job.siteId,
-                                         job.deploymentId), false, "", message)
-      return
-    }
-    if (Model.isEventJob(job)) { _eventRefused(job, message); return }
-    if (Model.isSiteLogJob(job)) { _siteLogRefused(job, message); return }
-    if (job.kind === "recipes") { _recipesRefused(job, message); return }
-    // Either kind of run: one watch slot, one signal, one farewell.
+    if (_readRefused(job, message)) return
+    // Either kind of run: one watch slot, one signal, one farewell. Kept apart
+    // from the reads above because a hold gives these a different answer —
+    // there the ladder outlives the refusal, and here it does not.
     if (!Model.isRunJob(job)) return
     if (_commandCurrent(job)) {
       _commandWatch = null
@@ -622,19 +714,34 @@ Item {
       if (job.kind === "sweepDone") { _finishRefresh(job.org); continue }
       if (!orgs[job.org]) { _abandonJob(job); continue }
 
+      // Before the charge, deliberately: a kind neither table knows is a
+      // mistake in this file, and the one thing it must not do is cost a
+      // request and come back looking like an answer. It is said out loud and
+      // given the farewell any pane behind it is owed.
+      var path = _pathFor(job)
+      if (path === "") {
+        console.warn("omarchy-forge: unknown job kind \"" + String(job.kind) + "\" — dropped")
+        _abandonJob(job)
+        continue
+      }
+
       _current = job
       _currentStartedMs = Date.now()
       budget.charge(budget.bucketFor(job.account))
-      fetchProcess.command = [cliPath, "api", "--account", job.account, "GET", _pathFor(job)]
+      fetchProcess.command = [cliPath, "api", "--account", job.account, "GET", path]
       fetchProcess.running = true
       return
     }
   }
 
-  // Named rather than defaulted: a kind this doesn't know would otherwise be
-  // sent to the org site list, which answers plausibly and wrongly.
+  // Named rather than defaulted, every one of them: a kind this doesn't know
+  // would otherwise be sent to the org site list, which answers plausibly and
+  // wrongly — charged for, published as a sweep window, or thrown inside the
+  // handler and left the queue stalled. It answers `""` instead, and `_pump`
+  // refuses the job before it costs anything.
   function _pathFor(job) {
     if (job.kind === "servers") return Model.serversPath(job.org, job.cursor)
+    if (job.kind === "sites") return Model.sitesPath(job.org, job.cursor)
     if (job.kind === "serverSites")
       return Model.serverSitesPath(job.org, job.serverId, job.cursor)
     if (job.kind === "log")
@@ -656,7 +763,7 @@ Item {
       return Model.recipeRunListPath(job.org, job.recipeId, job.cursor)
     if (job.kind === "recipeShow")
       return Model.recipeRunLogPath(job.org, job.recipeId, job.commandId)
-    return Model.sitesPath(job.org, job.cursor)
+    return ""
   }
 
   // ------------------------------------------------------------- pagination
@@ -799,18 +906,15 @@ Item {
     queue.drop(function (job) {
       if (budget.bucketFor(job.account) !== bucket) return false
       // A dropped sweep is picked up by the next tick and needs no farewell.
-      // A dropped log job has someone watching an empty pane for an answer
-      // that is no longer coming, so it gets told.
-      if (job.kind === "log")
-        deploymentLogFetched(logRequestKey(job.org, job.serverId, job.siteId, job.deploymentId),
-                             false, "", "Rate limited — try again shortly")
-      if (Model.isEventJob(job)) _eventRefused(job, "Rate limited — try again shortly")
-      if (Model.isSiteLogJob(job)) _siteLogRefused(job, "Rate limited — try again shortly")
-      if (job.kind === "recipes") _recipesRefused(job, "Rate limited — try again shortly")
+      // A dropped read has someone watching an empty pane for an answer that
+      // is no longer coming, so it gets told.
+      //
       // A dropped look at a command is not the end of the run — the hold is
       // this minute's, and the ladder outlives it — so the pane is told to
-      // expect a wait rather than told the watch is over.
-      if (Model.isRunJob(job)) {
+      // expect a wait rather than told the watch is over. Every job in the
+      // bucket goes whether or not it was owed a word.
+      if (!_readRefused(job, "Rate limited — try again shortly")
+          && Model.isRunJob(job)) {
         commandRunUpdated(job.requestKey, true, true, String(job.commandId || ""),
                           "rate limited — looking again shortly", "", "")
         _scheduleCommandPoll()
@@ -973,7 +1077,7 @@ Item {
     var pending = function (job) {
       return job.kind === "serverSites" && job.org === key && job.serverId === id
     }
-    if (queue.contains(pending) || (_current !== null && pending(_current))) return
+    if (_outstanding(pending)) return
 
     var asked = _shallowCopy(_serverSitesAskedAt)
     asked[stamp] = Date.now()
@@ -1019,56 +1123,21 @@ Item {
   // single-flight for every write — a log fetch waiting behind a deploy or a
   // reboot, or answering into `_onAction`, is not what either wants.
   //
-  // It jumps the queue because it belongs to a keypress. A sweep behind it can
-  // afford to arrive a second later; someone staring at a blank pane cannot.
-  // No debounce, either: pressing it again on a deploy still running is a
-  // reasonable thing to want, and the dedupe below already covers the only
-  // case that would waste a request.
+  // No debounce: pressing it again on a deploy still running is a reasonable
+  // thing to want, and `_enqueueRead`'s dedupe already covers the only case
+  // that would waste a request.
   function fetchDeploymentLog(org, serverId, siteId, deploymentId) {
-    var key = String(org)
-    var id = String(deploymentId)
-    var site = String(siteId)
-    var requestKey = logRequestKey(key, serverId, site, id)
-    if (id === "") {
-      deploymentLogFetched(requestKey, false, "", "This site has never deployed")
+    var job = { org: String(org), kind: "log", serverId: String(serverId),
+                siteId: String(siteId), deploymentId: String(deploymentId) }
+    if (job.deploymentId === "") {
+      _readRefused(job, "This site has never deployed")
       return
     }
-
-    var state = orgs[key]
-    if (!state) {
-      deploymentLogFetched(requestKey, false, "", "That organization is no longer being watched")
-      return
-    }
-
-    // Refusals are reported rather than swallowed. `fetchServerSites` can
-    // return silently because the rotation will get there anyway; nothing
-    // comes along later to fill this pane in.
-    var account = state.account || accountForOrg(key)
-    var held = budget.blockedMs(account)
-    if (held > 0) {
-      deploymentLogFetched(requestKey, false, "",
-                           "Rate limited — try again in " + Math.ceil(held / 1000) + "s")
-      return
-    }
-    if (budget.wouldExceed(account, 1)) {
-      deploymentLogFetched(requestKey, false, "", "Too close to the rate limit — try again shortly")
-      return
-    }
-
-    var pending = function (job) {
-      return job.kind === "log" && job.org === key && job.siteId === site
-        && job.deploymentId === id
-    }
-    if (queue.contains(pending) || (_current !== null && pending(_current))) return
-
-    queue.pushFront({ org: key, account: account, kind: "log",
-                      serverId: String(serverId), siteId: site, deploymentId: id,
-                      page: 1, rows: [] })
+    _enqueueRead(job)
   }
 
   function _onLog(job, text) {
     var envelope = Model.parseEnvelope(text)
-    var requestKey = logRequestKey(job.org, job.serverId, job.siteId, job.deploymentId)
 
     // Quiet: see `_applyEnvelope`. Whatever went wrong is this pane's to say.
     if (!_applyEnvelope(job.org, job.account, envelope, true)) {
@@ -1077,114 +1146,47 @@ Item {
       // and site and is still refused here. "Token is missing a scope for this"
       // is true but leaves the reader guessing which, on the one request where
       // the answer is surprising enough to be worth spelling out.
-      var message = envelope.status === 403
+      _readRefused(job, envelope.status === 403
         ? "Your token can't read deploy logs — that needs the site:manage-deploys scope"
-        : Model.envelopeError(envelope)
-      deploymentLogFetched(requestKey, false, "", message)
+        : Model.envelopeError(envelope))
       return
     }
 
-    var data = envelope.body ? envelope.body.data : null
-    var attributes = data ? data.attributes : null
     // A deploy that printed nothing is a real answer and shows as an empty
     // pane; an `output` that isn't there at all is a malformed one.
-    if (!attributes || typeof attributes.output !== "string") {
-      deploymentLogFetched(requestKey, false, "", "Forge returned no output for this deployment")
+    var output = Model.resourceText(envelope.body, "output")
+    if (output === null) {
+      _readRefused(job, "Forge returned no output for this deployment")
       return
     }
     // Handed on unguarded: `Model.logLines` is applied where the string enters
     // a `Text`, which is the boundary the guard is about.
-    deploymentLogFetched(requestKey, true, attributes.output, "")
+    documentFetched(_readRequestKey(job), true, output, "")
   }
 
   // ---------------------------------------------------------- server events
 
-  // The feed and one event's output take the log's road exactly: the same
-  // guards, the same queue-jump, the same rule that a refusal answers. What
-  // differs is the scope — both want only `server:view`, so a read-only token
-  // works here where the deploy log refuses it — and that the feed is a page
-  // with a cursor after it, fetched again on request rather than followed.
+  // The feed and one event's output take the log's road exactly — the same
+  // `_enqueueRead` guards, the same queue-jump, the same rule that a refusal
+  // answers. What differs is the scope — both want only `server:view`, so a
+  // read-only token works here where the deploy log refuses it — and that the
+  // feed is a page with a cursor after it, fetched again on request rather
+  // than followed.
   function fetchServerEvents(org, serverId, cursor) {
-    var key = String(org)
-    var server = String(serverId)
-    var page = String(cursor || "")
-    var refuse = function (message) {
-      serverEventsFetched(eventsRequestKey(key, server), false, [], page, "", message)
-    }
-
-    var state = orgs[key]
-    if (!state) { refuse("That organization is no longer being watched"); return }
-
-    var account = state.account || accountForOrg(key)
-    var held = budget.blockedMs(account)
-    if (held > 0) {
-      refuse("Rate limited — try again in " + Math.ceil(held / 1000) + "s")
-      return
-    }
-    if (budget.wouldExceed(account, 1)) {
-      refuse("Too close to the rate limit — try again shortly")
-      return
-    }
-
-    var pending = function (job) {
-      return job.kind === "events" && job.org === key && job.serverId === server
-        && String(job.cursor || "") === page
-    }
-    if (queue.contains(pending) || (_current !== null && pending(_current))) return
-
-    queue.pushFront({ org: key, account: account, kind: "events",
-                      serverId: server, cursor: page })
+    _enqueueRead({ org: String(org), kind: "events", serverId: String(serverId),
+                   cursor: String(cursor || "") })
   }
 
   function fetchEventOutput(org, serverId, eventId) {
-    var key = String(org)
-    var server = String(serverId)
-    var id = String(eventId)
-    var refuse = function (message) {
-      eventOutputFetched(eventOutputRequestKey(key, server, id), false, "", message)
-    }
-
-    var state = orgs[key]
-    if (!state) { refuse("That organization is no longer being watched"); return }
-
-    var account = state.account || accountForOrg(key)
-    var held = budget.blockedMs(account)
-    if (held > 0) {
-      refuse("Rate limited — try again in " + Math.ceil(held / 1000) + "s")
-      return
-    }
-    if (budget.wouldExceed(account, 1)) {
-      refuse("Too close to the rate limit — try again shortly")
-      return
-    }
-
-    var pending = function (job) {
-      return job.kind === "eventOutput" && job.org === key && job.serverId === server
-        && job.eventId === id
-    }
-    if (queue.contains(pending) || (_current !== null && pending(_current))) return
-
-    queue.pushFront({ org: key, account: account, kind: "eventOutput",
-                      serverId: server, eventId: id })
-  }
-
-  // The two reads share a refusal, the way the command's three do: every drop
-  // site — an unwatched organization, a hold, an error — answers through here
-  // rather than spelling out which signal each kind owes.
-  function _eventRefused(job, message) {
-    if (job.kind === "events")
-      serverEventsFetched(eventsRequestKey(job.org, job.serverId), false, [],
-                          String(job.cursor || ""), "", message)
-    else
-      eventOutputFetched(eventOutputRequestKey(job.org, job.serverId, job.eventId),
-                         false, "", message)
+    _enqueueRead({ org: String(org), kind: "eventOutput",
+                   serverId: String(serverId), eventId: String(eventId) })
   }
 
   // Quiet, like the log's: the refusal is this pane's to say. A 403 here is
   // the surprising kind — `server:view` is the scope every sweep already
   // needs — so it is named, on the chance the token was cut down further.
   function _eventError(job, envelope) {
-    _eventRefused(job, envelope.status === 403
+    _readRefused(job, envelope.status === 403
       ? "Your token can't read server events — that needs the server:view scope"
       : Model.envelopeError(envelope))
   }
@@ -1192,7 +1194,7 @@ Item {
   function _onEvents(job, text) {
     var envelope = Model.parseEnvelope(text)
     if (!_applyEnvelope(job.org, job.account, envelope, true)) { _eventError(job, envelope); return }
-    serverEventsFetched(eventsRequestKey(job.org, job.serverId), true,
+    serverEventsFetched(_readRequestKey(job), true,
                         Model.eventsFrom(envelope.body), String(job.cursor || ""),
                         Model.nextCursor(envelope.body), "")
   }
@@ -1204,38 +1206,7 @@ Item {
   // refusal belongs to that view, and a page the reader asks for rather than a
   // chain this walks.
   function fetchRecipes(org, cursor) {
-    var key = String(org)
-    var page = String(cursor || "")
-    var refuse = function (message) {
-      recipesFetched(recipesRequestKey(key), false, [], page, "", message)
-    }
-
-    var state = orgs[key]
-    if (!state) { refuse("That organization is no longer being watched"); return }
-
-    var account = state.account || accountForOrg(key)
-    var held = budget.blockedMs(account)
-    if (held > 0) {
-      refuse("Rate limited — try again in " + Math.ceil(held / 1000) + "s")
-      return
-    }
-    if (budget.wouldExceed(account, 1)) {
-      refuse("Too close to the rate limit — try again shortly")
-      return
-    }
-
-    var pending = function (job) {
-      return job.kind === "recipes" && job.org === key
-        && String(job.cursor || "") === page
-    }
-    if (queue.contains(pending) || (_current !== null && pending(_current))) return
-
-    queue.pushFront({ org: key, account: account, kind: "recipes", cursor: page })
-  }
-
-  function _recipesRefused(job, message) {
-    recipesFetched(recipesRequestKey(job.org), false, [],
-                   String(job.cursor || ""), "", message)
+    _enqueueRead({ org: String(org), kind: "recipes", cursor: String(cursor || "") })
   }
 
   // Named, and for the deploy log's reason rather than the event feed's:
@@ -1245,12 +1216,12 @@ Item {
   function _onRecipes(job, text) {
     var envelope = Model.parseEnvelope(text)
     if (!_applyEnvelope(job.org, job.account, envelope, true)) {
-      _recipesRefused(job, envelope.status === 403
+      _readRefused(job, envelope.status === 403
         ? "Your token can't list recipes — that needs the recipe:view scope"
         : Model.envelopeError(envelope))
       return
     }
-    recipesFetched(recipesRequestKey(job.org), true,
+    recipesFetched(_readRequestKey(job), true,
                    Model.recipesFrom(envelope.body), String(job.cursor || ""),
                    Model.nextCursor(envelope.body), "")
   }
@@ -1258,66 +1229,34 @@ Item {
   function _onEventOutput(job, text) {
     var envelope = Model.parseEnvelope(text)
     if (!_applyEnvelope(job.org, job.account, envelope, true)) { _eventError(job, envelope); return }
-    var data = envelope.body ? envelope.body.data : null
-    var attributes = data ? data.attributes : null
     // As with the log: an event that printed nothing is an empty pane, and an
     // `output` that isn't there at all is a malformed answer.
-    if (!attributes || typeof attributes.output !== "string") {
-      _eventRefused(job, "Forge returned no output for this event")
+    var output = Model.resourceText(envelope.body, "output")
+    if (output === null) {
+      _readRefused(job, "Forge returned no output for this event")
       return
     }
-    eventOutputFetched(eventOutputRequestKey(job.org, job.serverId, job.eventId),
-                       true, attributes.output, "")
+    documentFetched(_readRequestKey(job), true, output, "")
   }
 
   // ---------------------------------------------------------------- site logs
 
-  // The deploy log's road once more: front of the queue because a keypress is
-  // waiting on it, `quiet` because the refusal belongs to the pane, and a
-  // refusal from every drop site rather than silence. Nothing here polls — a
-  // log is a tail Forge cuts at the moment of asking, and `r` on the pane is
-  // how the reader takes another look.
+  // The deploy log's road once more: `_enqueueRead`'s guards, front of the
+  // queue because a keypress is waiting on it, `quiet` because the refusal
+  // belongs to the pane. Nothing here polls — a log is a tail Forge cuts at
+  // the moment of asking, and `r` on the pane is how the reader takes another
+  // look.
   function fetchSiteLog(org, serverId, siteId, kind) {
-    var key = String(org)
-    var server = String(serverId)
-    var site = String(siteId)
-    var log = String(kind)
-    var refuse = function (message) {
-      siteLogFetched(siteLogRequestKey(key, server, site, log), false, "", message)
-    }
-
+    var job = { org: String(org), kind: "siteLog", serverId: String(serverId),
+                siteId: String(siteId), log: String(kind) }
     // Checked here rather than trusted from the row: a kind outside the three
     // would reach Forge as a 404, which reads on the pane like the site is
     // gone rather than like the request was wrong.
-    if (!Model.isSiteLogKind(log)) { refuse("There is no such log"); return }
-
-    var state = orgs[key]
-    if (!state) { refuse("That organization is no longer being watched"); return }
-
-    var account = state.account || accountForOrg(key)
-    var held = budget.blockedMs(account)
-    if (held > 0) {
-      refuse("Rate limited — try again in " + Math.ceil(held / 1000) + "s")
+    if (!Model.isSiteLogKind(job.log)) {
+      _readRefused(job, "There is no such log")
       return
     }
-    if (budget.wouldExceed(account, 1)) {
-      refuse("Too close to the rate limit — try again shortly")
-      return
-    }
-
-    var pending = function (job) {
-      return job.kind === "siteLog" && job.org === key && job.siteId === site
-        && job.log === log
-    }
-    if (queue.contains(pending) || (_current !== null && pending(_current))) return
-
-    queue.pushFront({ org: key, account: account, kind: "siteLog",
-                      serverId: server, siteId: site, log: log })
-  }
-
-  function _siteLogRefused(job, message) {
-    siteLogFetched(siteLogRequestKey(job.org, job.serverId, job.siteId, job.log),
-                   false, "", message)
+    _enqueueRead(job)
   }
 
   function _onSiteLog(job, text) {
@@ -1327,21 +1266,19 @@ Item {
       // *clears* a log — so a token kept to `server:view` reads every server
       // and site and is still refused here, the deploy log's situation with a
       // different scope on the sign.
-      _siteLogRefused(job, envelope.status === 403
+      _readRefused(job, envelope.status === 403
         ? "Your token can't read site logs — that needs the server:manage-logs scope"
         : Model.envelopeError(envelope))
       return
     }
-    var data = envelope.body ? envelope.body.data : null
-    var attributes = data ? data.attributes : null
     // `content` here, where the deploy log and an event both say `output`. An
     // empty log is not an empty string either — see `Model.siteLogContent`.
-    if (!attributes || typeof attributes.content !== "string") {
-      _siteLogRefused(job, "Forge returned no content for this log")
+    var content = Model.resourceText(envelope.body, "content")
+    if (content === null) {
+      _readRefused(job, "Forge returned no content for this log")
       return
     }
-    siteLogFetched(siteLogRequestKey(job.org, job.serverId, job.siteId, job.log),
-                   true, Model.siteLogContent(attributes.content), "")
+    documentFetched(_readRequestKey(job), true, Model.siteLogContent(content), "")
   }
 
   function _finishRefresh(org) {
@@ -1858,7 +1795,7 @@ Item {
     var pending = function (job) {
       return job.requestKey === key && Model.isRunJob(job)
     }
-    if (queue.contains(pending) || (_current !== null && pending(_current))) return
+    if (_outstanding(pending)) return
 
     // A hold is not a reason to give up on the run — it is on the box either
     // way — so the pane is told how long and the ladder carries on. Same for
@@ -1992,8 +1929,7 @@ Item {
     var envelope = _commandAnswer(job, text)
     if (!envelope) return
 
-    var data = envelope.body ? envelope.body.data : null
-    _afterCommandState(job, data ? data.attributes : null)
+    _afterCommandState(job, Model.resourceAttributes(envelope.body))
   }
 
   // Where both looks land: either it is still going, and the ladder gets
@@ -2025,12 +1961,11 @@ Item {
     var envelope = _commandAnswer(job, text)
     if (!envelope) return
 
-    var data = envelope.body ? envelope.body.data : null
-    var attributes = data ? data.attributes : null
     // An empty string is a real answer here — plenty of commands print
     // nothing — so only a missing field is a failure to report. The watch stays
     // for it: an answer this shape is worth asking about again, and `r` is how.
-    if (!attributes || typeof attributes.output !== "string") {
+    var output = Model.resourceText(envelope.body, "output")
+    if (output === null) {
       commandRunUpdated(job.requestKey, false, false, String(job.commandId || ""),
                         job.header, "", "Forge returned no output for this command")
       return
@@ -2040,7 +1975,7 @@ Item {
     _commandWatch = null
     commandTimer.stop()
     commandRunUpdated(job.requestKey, true, false, String(job.commandId || ""),
-                      job.header, attributes.output, "")
+                      job.header, output, "")
   }
 
   // The recipe's find. Same shape as the command's, different evidence — see
@@ -2087,8 +2022,7 @@ Item {
     var envelope = _commandAnswer(job, text)
     if (!envelope) return
 
-    var data = envelope.body ? envelope.body.data : null
-    _afterRecipeState(job, data ? data.attributes : null)
+    _afterRecipeState(job, Model.resourceAttributes(envelope.body))
   }
 
   // Where both recipe looks land. The command's equivalent is deliberately
@@ -2271,22 +2205,31 @@ Item {
                                 body: null, error: "The Forge helper timed out" })
       }
       root._current = null
-      if (job) {
-        if (job.kind === "servers") root._onServers(job, text)
-        else if (job.kind === "serverSites") root._onServerSites(job, text)
-        else if (job.kind === "log") root._onLog(job, text)
-        else if (job.kind === "commandFind") root._onCommandFind(job, text)
-        else if (job.kind === "commandShow") root._onCommandShow(job, text)
-        else if (job.kind === "commandOutput") root._onCommandOutput(job, text)
-        else if (job.kind === "events") root._onEvents(job, text)
-        else if (job.kind === "eventOutput") root._onEventOutput(job, text)
-        else if (job.kind === "siteLog") root._onSiteLog(job, text)
-        else if (job.kind === "recipes") root._onRecipes(job, text)
-        else if (job.kind === "recipeFind") root._onRecipeFind(job, text)
-        else if (job.kind === "recipeShow") root._onRecipeShow(job, text)
-        else root._onSites(job, text)
+      // `_pathFor`'s twin, and named for the same reason. The pump is in a
+      // `finally` because a handler that throws would otherwise take the queue
+      // down with it — every later job left sitting until something else
+      // happens to push.
+      try {
+        if (job) {
+          if (job.kind === "servers") root._onServers(job, text)
+          else if (job.kind === "sites") root._onSites(job, text)
+          else if (job.kind === "serverSites") root._onServerSites(job, text)
+          else if (job.kind === "log") root._onLog(job, text)
+          else if (job.kind === "commandFind") root._onCommandFind(job, text)
+          else if (job.kind === "commandShow") root._onCommandShow(job, text)
+          else if (job.kind === "commandOutput") root._onCommandOutput(job, text)
+          else if (job.kind === "events") root._onEvents(job, text)
+          else if (job.kind === "eventOutput") root._onEventOutput(job, text)
+          else if (job.kind === "siteLog") root._onSiteLog(job, text)
+          else if (job.kind === "recipes") root._onRecipes(job, text)
+          else if (job.kind === "recipeFind") root._onRecipeFind(job, text)
+          else if (job.kind === "recipeShow") root._onRecipeShow(job, text)
+          else console.warn("omarchy-forge: no handler for job kind \""
+                            + String(job.kind) + "\" — answer dropped")
+        }
+      } finally {
+        root._pump()
       }
-      root._pump()
     }
   }
 

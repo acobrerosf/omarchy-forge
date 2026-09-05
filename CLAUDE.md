@@ -91,8 +91,14 @@ without changing both); `_applyEnvelope`'s `quiet` flag exists so a 403 on a req
 a keypress — the deploy log's, a site log's, a server action's, a maintenance toggle's, all gated
 behind a scope named for writing — is reported on the row or the pane instead of across the
 organization's rows, and for a write it is the job's `scopeMessage` that decides both the wording
-and the quiet; every write goes out on `Service`'s single-flight `actionProcess` via `_startAction`,
-never through the queue, carrying its own method (POST is only the default) and — where its meaning
+and the quiet; every on-demand read enters through `_enqueueRead` and every drop site refuses
+through `_readRefused`, so a sixth read kind is only complete when it has an arm in those and in
+`_readRequestKey` as well as a line in `_pathFor` and one in `onExited` — and `_pathFor` answering
+`""` is what stops a kind missing from it being charged for and sent as the org site list; the
+three document panes answer one signal, `documentFetched`, because only one is ever open and the
+words a failure earns are chosen in the service; every write goes out on `Service`'s single-flight
+`actionProcess` via `_startAction`, never through the queue, carrying its own method (POST is only
+the default) and — where its meaning
 depends on live state, as the maintenance toggle's does — an `armIntent` in its arm key, so a
 refresh landing mid-arm invalidates it instead of retargeting it; a body a *user typed* — only the
 site command's — never rides that argv, and asks for `bodyStdin` instead, which sends it as `api …

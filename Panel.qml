@@ -1430,24 +1430,19 @@ Panel {
       if (!running) root.commandLines = text === "" ? [] : Model.logLines(text)
     }
 
-    // Filtered the same way and for the same reason: the service answers the
-    // session, and only the screen that asked has a pane waiting for it.
-    function onDeploymentLogFetched(requestKey, ok, text, message) {
+    // Every document pane's answer — a deploy log's, a site log's, an event's
+    // output — filtered the same way and for the same reason: the service
+    // answers the session, and only the screen that asked has a pane waiting
+    // for it. One handler because there is one pane: the three are never open
+    // at once, their keys differ in shape so a stale one cannot be mistaken
+    // for this one's, and the words a failure deserves were chosen by the
+    // service, which is the half that saw the status.
+    function onDocumentFetched(requestKey, ok, text, message) {
       if (root.logRequestKey !== requestKey) return
       root.logLoading = false
       // The guard runs here, where the string is about to enter a Text — the
       // boundary it exists for. It also splits, because splitting a log the
       // guard has not seen is how an escape sequence gets to survive one.
-      root.logLines = ok ? Model.logLines(text) : []
-      root.logError = ok ? "" : String(message || "Could not read the log")
-    }
-
-    // A site log lands in the same three properties, guarded by the same key —
-    // the two panes are never open at once, and the key's shape differs, so a
-    // stale deploy log's answer cannot be mistaken for this one's.
-    function onSiteLogFetched(requestKey, ok, text, message) {
-      if (root.logRequestKey !== requestKey) return
-      root.logLoading = false
       root.logLines = ok ? Model.logLines(text) : []
       root.logError = ok ? "" : String(message || "Could not read the log")
     }
@@ -1485,17 +1480,6 @@ Panel {
       root.recipesError = ""
       root.recipes = cursor === "" ? recipes : root.recipes.concat(recipes)
       root.recipesCursor = String(nextCursor || "")
-    }
-
-    // An event's output lands in the same three properties, guarded by the same
-    // key, for the site log's reason: the three document panes are never open at
-    // once and their keys differ in shape, so one pane's answer cannot be
-    // mistaken for another's.
-    function onEventOutputFetched(requestKey, ok, text, message) {
-      if (root.logRequestKey !== requestKey) return
-      root.logLoading = false
-      root.logLines = ok ? Model.logLines(text) : []
-      root.logError = ok ? "" : String(message || "Could not read the event")
     }
 
     // Saving is the one thing here that touches the filesystem, so where it

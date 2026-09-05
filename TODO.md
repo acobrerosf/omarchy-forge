@@ -23,7 +23,7 @@ other or to delete the copy, never to add a third place that synchronises them.
 Two findings change what the user sees (2b's badge, 3c's flash) and are marked. The rest are
 invisible, which is what makes them safe to do in a batch.
 
-### 1. Panel — one pane state, one arm-key rule
+### 1. Panel — one pane state, one arm-key rule — **done** (`2e24685`)
 
 **1a. `eventOutput*` is the fourth set of pane properties ARCHITECTURE forbids.** *(high, small)*
 `Panel.qml` 93-96 declares `eventOutputRequestKey/Lines/Error/Loading` beside the deploy log's
@@ -51,7 +51,8 @@ set, `onDeploymentLogFetched`, `onSiteLogFetched` and `onEventOutputFetched` are
 handlers behind three signals. `Service.qml` 79-83 justifies the separate `siteLogFetched` by "a
 shared handler would have to ask which it was answering" — but the panel's handlers never ask,
 because the 403 wording is chosen in the service's `_on*`. One `documentFetched` signal would
-leave one handler. Only worth it if 2a is being done in the same pass.
+leave one handler. Only worth it if 2a is being done in the same pass. — **taken in slice 2**:
+one `documentFetched`, one `onDocumentFetched`, and the recorded justification rewritten.
 
 **1b. One `actionRow(...)` constructor; make `armKey !== ""` mean "this row writes".**
 *(medium-high, small)* The rule — row key is `prefix + action.id`, arm key is the subject's key
@@ -99,7 +100,7 @@ and the bar button's switch 1564-1573 — which agree today and are one edit fro
 `serverRoute` property and a `Model.badgeForHealth(health)`; the hero's `ForgeIcon.badge`
 1822-1825 is then an identity ternary and becomes `badge: root.heroTone`.
 
-### 2. Service, read path — one road, and a dispatch that cannot miss
+### 2. Service, read path — one road, and a dispatch that cannot miss — **done**
 
 **2a. One enqueue helper and one refusal dispatcher for the five on-demand reads.**
 *(high, small-medium)* `fetchDeploymentLog` 1037-1056, `fetchServerEvents` 1115-1127,
@@ -300,7 +301,8 @@ coercions byte-identical.
 
 Do them in the order above: 1 is Panel-only and touches no contract, 2 and 3 are Service-only and
 independent of each other, 4 changes what is drawn and wants its own look, 5 is the helper. Within
-4, do 4a before 4b — the latter reads `accountErrorFor`.
+4, do 4a before 4b — the latter reads `accountErrorFor`. Slices 1 and 2 are done; **3 is next**,
+and it is independent of everything left.
 
 Verification is the usual: `./lint` for the file, `omarchy restart shell` (not `rescanPlugins`,
 for anything in `Service.qml`), `journalctl -t omarchy-shell -f`, then walk the affected keys by

@@ -182,8 +182,8 @@ organization that stopped being watched, while `actionProcess` is single-flight 
 answers into `_onAction`. It is pushed to the *front*: a sweep behind it can afford to land a
 second later, and someone staring at an empty pane cannot.
 
-Two things about it differ from every other job. It answers through a signal
-(`deploymentLogFetched`) rather than into `orgs`, for the reason `deployFinished` does — the answer
+Two things about it differ from every other job. It answers through a signal (`documentFetched`)
+rather than into `orgs`, for the reason `deployFinished` does — the answer
 belongs to the one screen that asked, and tens of kilobytes have no business in a property every
 panel re-reads. And it passes `quiet` to `_applyEnvelope`, which suppresses the per-organization
 error writes and nothing else. Forge gates deploy output behind `site:manage-deploys`, the scope
@@ -192,13 +192,35 @@ keypress would paint "Token is missing a scope for this" across rows that are pe
 The account-level bookkeeping still runs either way — whether there is a token, what the rate
 headers said, the hold a 429 imposes — because those are true whichever request found them.
 
-A refusal is always reported. `fetchServerSites` can return silently because the rotation reaches
-that server anyway; nothing comes along later to fill this pane in, so a hold, a ceiling, and the
-jobs a 429 drops out of the queue each answer the signal instead of vanishing.
+**One road for all five on-demand reads.** The deploy log, a server's event feed, one event's
+output, the organization's recipes and a site's own log are the same request with different words
+on it, and what groups them is not the repetition but the rule: each has a pane or a view waiting
+on a signal, so every way the request can fail to happen owes it an answer. `fetchServerSites` can
+return silently because the rotation reaches that server anyway; nothing comes along later to fill
+a pane in.
+
+Three functions hold that rule, and no entry point re-states it. `_enqueueRead(job)` runs the
+guards in the order that matters — the organization is gone, the account is held, the ceiling is
+too close, the same request is already outstanding — refusing on the first three and returning
+silently on the fourth, then pushing to the front of the queue. `_readRequestKey(job)` builds the
+key the answer will carry, which is also what makes two asks the same ask, so the dedupe and the
+answer cannot drift apart. `_readRefused(job, message)` is the registry every drop site consults —
+an entry guard, `_abandonJob`, `_holdAccount`, an error on the wire — and it reports whether it
+recognised the kind, which is how `_holdAccount` tells a read it has answered from a run look it
+still owes a different word. Adding a sixth read means an arm in each of those three, a line in
+`_pathFor`, and a line in `onExited`; nothing else in the file has to be found and edited.
+
+The three document reads — a deploy log, a site log, an event's output — answer one signal,
+`documentFetched`. One rather than three because there is one pane: only one is ever open, the
+three key shapes cannot be mistaken for each other, and the wording each failure deserves is
+already chosen in the service, by the handler that saw the status. The panel therefore never has
+to ask which it is answering, which is what a second signal would have been for. The event feed
+and the recipe list keep signals of their own, because rows and a cursor are a different answer
+from a document.
 
 **A server's events are the deploy log twice.** `GET .../servers/{server}/events` and
-`.../events/{event}/output` take exactly that road — front of the queue, `quiet`, a refusal
-through `_eventRefused` from every drop site — and differ from it in two ways that both point the
+`.../events/{event}/output` take exactly that road — `_enqueueRead`, front of the queue, `quiet`,
+a refusal from every drop site — and differ from it in two ways that both point the
 other direction. The scope is `server:view`, the one every sweep already needs, so a read-only
 token that is refused the deploy log is *not* refused here; the 403 is still named on the pane,
 because a token cut down further than the sweep can live with is the surprising case. And the
@@ -214,9 +236,10 @@ otherwise arm a deploy of whichever site the event mentioned.
 
 **A site's own logs are the same road a third time.** `GET .../sites/{site}/logs/{kind}` for the
 three kinds `Model.siteLogKinds` names — the application log and nginx's two — front of the queue,
-`quiet`, `_siteLogRefused` from every drop site. Three differences, all small and all sharp. The
-text arrives in `data.attributes.content` where the deploy log and an event both say `output`, so
-the handler cannot be shared with either. An empty log is not an empty string: Forge answers with
+`quiet`, a refusal from every drop site. Three differences, all small and all sharp. The
+text arrives in `data.attributes.content` where the deploy log and an event both say `output` — one
+argument to `Model.resourceText`, but a handler each, because what follows the read differs. An
+empty log is not an empty string: Forge answers with
 the single line `=== Empty log file ===`, which the pane would render as the log's first line, so
 `Model.siteLogContent` turns exactly that sentence into `""` and lets the pane's own empty text
 say it. And the scope is `server:manage-logs` — Forge's name for "clear a log" — so a read sits
@@ -233,10 +256,23 @@ rule was written for the site log, and both halves of the prediction had come tr
 was the log's with the names swapped, called back to back with it at every site, and its arms in
 `paneLines`/`paneLoading`/`paneError` were dead weight in three ternaries.
 
+The one signal is the same observation on the service's side of the boundary. Three pane states
+that could never differ were answered by three signals whose handlers could never differ either,
+and the fold went the same way: `documentFetched`, one handler on the panel, the key still telling
+the routes apart.
+
 **A command run is the deploy log's shape, four times over.** `POST .../commands` is a write and
 goes out on `actionProcess` like every other; everything after it is reads, and they go through the
 queue for the reasons above. Three job kinds — `commandFind`, `commandShow`, `commandOutput` — each
 named in `_pathFor` rather than defaulted, each answering the one signal `commandRunUpdated`.
+
+Named rather than defaulted is the rule for *every* kind, and `_pathFor` enforces it by answering
+`""` for one it does not know. `_pump` asks before it charges the budget, so an unrecognised kind
+is warned about and abandoned rather than paid for and sent to the org site list, which would
+answer plausibly and wrongly — published as a sweep window if the job carried `rows`, and throwing
+inside the handler if it did not, which used to leave the queue stalled because the pump was after
+the dispatch. `onExited` names the same kinds and warns on a miss, and its pump sits in a `finally`
+so no handler can stall the queue by throwing again.
 
 Two things make it more than a log fetch with a different path.
 

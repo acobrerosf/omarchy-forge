@@ -1330,6 +1330,25 @@ function nextCursor(body) {
   return cursor ? String(cursor) : ""
 }
 
+// A single-resource answer, unwrapped once rather than at every handler. The
+// deploy log, an event's output, a site log and a command's output are all one
+// `{id, type, attributes}` with one field worth reading, and every other
+// JSON:API shape this plugin reads is already unwrapped here.
+function resourceAttributes(body) {
+  var data = body ? body.data : null
+  return data && data.attributes ? data.attributes : null
+}
+
+// That resource's `field` as a string, or `null` when the resource or the
+// field is not there. The distinction is the whole point: an empty string is a
+// real answer — a deploy that printed nothing — where a missing field is a
+// malformed one, and only the second is worth reporting.
+function resourceText(body, field) {
+  var attributes = resourceAttributes(body)
+  var value = attributes ? attributes[field] : null
+  return typeof value === "string" ? value : null
+}
+
 function serversPath(org, cursor) {
   return pagedPath("/orgs/" + encode(org) + "/servers?sort=name", cursor)
 }
@@ -1508,18 +1527,6 @@ function isRecipeRunJob(job) {
 // one slot and one signal, so the drop sites ask this rather than the two.
 function isRunJob(job) {
   return isCommandJob(job) || isRecipeRunJob(job)
-}
-
-// The two event reads, on the same terms and for the same reason.
-function isEventJob(job) {
-  var kind = job ? String(job.kind || "") : ""
-  return kind === "events" || kind === "eventOutput"
-}
-
-// And the site log read, which is one kind but asks the same question at the
-// same three drop sites.
-function isSiteLogJob(job) {
-  return (job ? String(job.kind || "") : "") === "siteLog"
 }
 
 // The API never hands out a web link, so the dashboard address is a template
