@@ -223,11 +223,15 @@ say it. And the scope is `server:manage-logs` — Forge's name for "clear a log"
 behind a scope named for a write, the deploy log's situation with a different word on the sign;
 the 403 is named on the pane for the same reason.
 
-The panel does *not* give this pane its own state. It reads and writes the deploy log's
-`logRequestKey`/`logLines`/`logError`/`logLoading`, because only one pane is ever open — `popView`
-clears the log on every pop, and `paneLines` falls through to it — and what tells a `siteLog` route
-from a `log` route is the route kind, the request key's shape and the words. A fourth set of
-properties would have to be cleared in the same places and could never hold a different value.
+The panel does *not* give this pane its own state, and neither does an event's output. Both read
+and write the deploy log's `logRequestKey`/`logLines`/`logError`/`logLoading`, because only one pane
+is ever open — `popView` clears it on every pop, and `paneLines` falls through to it — and what
+tells the three routes apart is the route kind, the request key's shape and the words. A second or
+third set of properties would have to be cleared in the same places and could never hold a
+different value. The event output had such a set until it was folded in: the feed landed before this
+rule was written for the site log, and both halves of the prediction had come true — its `clear*`
+was the log's with the names swapped, called back to back with it at every site, and its arms in
+`paneLines`/`paneLoading`/`paneError` were dead weight in three ternaries.
 
 **A command run is the deploy log's shape, four times over.** `POST .../commands` is a write and
 goes out on `actionProcess` like every other; everything after it is reads, and they go through the
@@ -598,6 +602,12 @@ its mouse area is larger than the glyph — a caption-sized mark is not a target
 A view's rows go through `Model.rowView` like every other row, as `kind: "action"`. Only an action
 that writes carries an `actionKey` — that is what `armedKey` and `busyActionKey` compare against,
 and handing it to `Open in Forge` as well would light up the whole list on one pending action.
+
+Every such row is built by `Panel.actionRow`, which is where the rule below lives. It is also what
+makes `armKey !== ""` mean "this row writes", and so what `runWriteAction`'s refusal to send an
+unarmed row rests on, and what lets `runAction` dispatch every write through one `default` arm
+instead of enumerating their ids. Adding a write is a Model entry with `armable` and a `path`; it is
+not a case in that switch.
 
 Its value differs by action, and has to. Deploy declares `armsSubject`, so it arms on the *site's*
 key: the tree's row for that site reports the same deploy and must light up with it. Everything

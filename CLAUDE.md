@@ -99,10 +99,13 @@ site command's — never rides that argv, and asks for `bodyStdin` instead, whic
 POST <path> -` and writes it to the helper's stdin on `started`; a site or server name reaching a
 *path* (a saved deploy log's, site log's, command output's, event output's or recipe output's
 filename — that last one carries two names) goes through `Model.safeFileName`, which is the
-separator guard the other three don't cover; a site log reads and writes the *deploy log's* panel
-state rather than owning a fourth set, because only one pane is ever
-open and `popView` already clears that one — what tells the two apart is the route kind, the request
-key and the words; the command watch that polls a run to its end lives on `Service` and not on
+separator guard the other three don't cover; a site log and an event's output read and write the
+*deploy log's* panel state rather than owning a set each, because only one pane is ever open and
+`popView` already clears that one — what tells the three apart is the route kind, the request key
+and the words; every `kind: "action"` row is built by `Panel.actionRow`, so a non-empty `armKey`
+means "this row writes" — which is what `runWriteAction` refuses on, and what lets `runAction` send
+every write through one `default` arm rather than naming their ids; the command watch that polls a
+run to its end lives on `Service` and not on
 `Panel`, for the reason the sweep does — a timer in a bar widget runs once per monitor — and it says
 nothing when the run turns terminal, because announcing that while the output request is still in
 flight leaves the pane finished with no lines, which renders as "printed nothing"; that watch ends

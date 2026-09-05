@@ -953,6 +953,26 @@ function serverTone(state) {
   return "idle"
 }
 
+// Health, in the badge vocabulary `ForgeIcon` draws. Here rather than at the
+// two places that ask — the bar button and the panel's hero — because two
+// copies of one table are one edit from disagreeing about what the same
+// organization is.
+//
+// `maintenance` gets its own value rather than folding into `warn`, which is
+// spoken for by the two below it: the icon draws this one hollow, the way the
+// rows do.
+function badgeForHealth(health) {
+  switch (health) {
+  case "bad": return "bad"
+  case "busy": return "busy"
+  case "maintenance": return "maintenance"
+  case "setup":
+  case "error":
+    return "warn"
+  }
+  return "none"
+}
+
 function deploymentLabel(status) {
   var value = String(status || "").toLowerCase()
   if (value === "") return "never deployed"
@@ -1023,13 +1043,12 @@ function rowView(row, ctx) {
       tone: "idle",
       depth: 0,
       showChevron: false,
-      // The key the arm and the send are reported on. Only an action that
-      // writes carries one: handing it to `Open in Forge` as well would light
-      // up the whole list on one pending action. In the site view it is the
-      // site's own key, because the tree's site row reports the same deploy and
-      // has to light up with it; in the server view it is the row's, because
-      // two of the four rows send to the same endpoint and only the one that
-      // was pressed should say so.
+      // The key the arm and the send are reported on. Which key that is — the
+      // subject's for an `armsSubject` action, the row's own plus its
+      // `armIntent` otherwise — is decided by the panel's `actionRow`, which is
+      // also what leaves a non-writing row with no arm key at all. The
+      // `armable` gate here is belt to that constructor's braces: handing a key
+      // to `Open in Forge` would light up the whole list on one pending action.
       actionKey: action.armable === true ? String(c.armKey || "") : "",
       armedText: String(action.armedText || defaultArmedText),
       timeAt: ""

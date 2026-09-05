@@ -68,32 +68,42 @@ Panel {
   readonly property bool runPane: routeKind === "commandOutput"
     || routeKind === "recipeOutput"
 
-  // The log this panel asked for, and what came back. Keyed the same way the
-  // service keys its answer, so two screens with two logs open don't cross.
+  // The routes that are about a *server* rather than a site or the tree: its
+  // own view, its event feed, and the recipe list opened from it. They wear the
+  // server's hero and its crumb, so the question is drawn once here for
+  // `paneRoute`'s reason rather than at each of the five places that asks it.
+  readonly property bool serverRoute: routeKind === "server"
+    || routeKind === "events" || routeKind === "recipes"
+
+  // The document pane's state, whichever document it is showing: a deployment's
+  // log, one of a site's own logs, or an event's output. One set rather than
+  // three, because only one pane is ever open — `popView` clears it on every
+  // pop and `paneLines` falls through to it — and what tells the three apart is
+  // the route kind, the request key's shape and the words. Keyed the same way
+  // the service keys its answer, so two screens with two panes open don't
+  // cross.
   property string logRequestKey: ""
   // The file this screen asked for. `textSaved` is session-wide like every
-  // other service signal, and two monitors both showing a log should not both
+  // other service signal, and two monitors both showing a pane should not both
   // announce one of them saving it.
   property string saveRequestedPath: ""
   property var logLines: []
   property string logError: ""
   property bool logLoading: false
 
-  // A server's event feed and, above it, one event's output. The feed is the
-  // first thing here that stays alive *under* another route — backing out of
-  // an event's output must land on the list it came from, not on an empty one
-  // — which is why `popView` clears it by the kind it popped rather than
-  // unconditionally the way it clears the log. `eventsCursor` is the page
-  // after the one on screen: empty once the feed has been read to its end.
+  // A server's event feed. The output of one of its events is pushed over it as
+  // a pane and rides the `log*` state above; this is the list underneath. The
+  // feed is the first thing here that stays alive *under* another route —
+  // backing out of an event's output must land on the list it came from, not on
+  // an empty one — which is why `popView` clears it by the kind it popped
+  // rather than unconditionally the way it clears the pane. `eventsCursor` is
+  // the page after the one on screen: empty once the feed has been read to its
+  // end.
   property string eventsRequestKey: ""
   property var events: []
   property string eventsCursor: ""
   property string eventsError: ""
   property bool eventsLoading: false
-  property string eventOutputRequestKey: ""
-  property var eventOutputLines: []
-  property string eventOutputError: ""
-  property bool eventOutputLoading: false
   // The event the output pane is about, looked up in the feed under it.
   readonly property var routeEvent: {
     if (routeKind !== "eventOutput" || !route) return null
@@ -281,21 +291,12 @@ Panel {
     // already use — see `Model.siteCommandAction`.
     if (routeKind === "command") {
       if (!routeSite) return []
+      // The typed command rides the arm key as this row's `armIntent` — the
+      // sharper version of the maintenance toggle's case, since this row is
+      // nothing *but* its text. See `actionRow`.
       var send = Model.siteCommandAction(route.org, routeSite, commandText)
-      return [{ kind: "action", org: route.org, serverId: route.serverId,
-                siteId: route.siteId, action: send,
-                // The typed command rides the arm key the way the maintenance
-                // toggle's direction does, and for the sharper version of the
-                // same reason: this row is nothing *but* its text. A keystroke
-                // that lands after enter has armed it — the field keeps focus
-                // for one turn of the event loop, see `stopCommandEditing` —
-                // then lapses the arm instead of retargeting it at a command
-                // the row never named.
-                armKey: route.org + "/" + route.siteId + "/command-run/"
-                  + send.armIntent,
-                // Not the arm key: the cursor is restored by row key, and a row
-                // that changed its identity on every keystroke would lose it.
-                key: route.org + "/" + route.siteId + "/command-run" }]
+      return [actionRow(route.org, route.serverId, route.siteId,
+                        route.org + "/" + route.siteId + "/", send, "")]
     }
     if (routeKind === "site" || routeKind === "server") return actionRows
     if (routeKind === "events") return eventRows
@@ -338,24 +339,8 @@ Panel {
     var prefix = route.org + "/" + (forSite ? route.siteId : route.serverId) + "/"
     var subjectKey = forSite && routeSite ? String(routeSite.key) : ""
     for (var i = 0; i < actions.length; i++)
-      out.push({ kind: "action", org: route.org, serverId: route.serverId,
-                 siteId: forSite ? route.siteId : "", action: actions[i],
-                 // What the arm and the send are reported on, and the action
-                 // says which it wants. Deploy asks for the subject's key,
-                 // because the tree's row for that site reports the same deploy
-                 // and has to light up with it; everything else takes its own
-                 // row's, because rows can send to the same endpoint and only
-                 // the one that was pressed should say so.
-                 //
-                 // `armIntent` is folded in where an action has one. This list
-                 // is rebuilt on every refresh, and the maintenance row's label
-                 // and method are derived from live state — so without it a
-                 // sweep landing inside the arm window would leave the arm
-                 // matching a row that now means the opposite thing.
-                 armKey: actions[i].armsSubject ? subjectKey
-                   : prefix + actions[i].id
-                     + (actions[i].armIntent ? "/" + actions[i].armIntent : ""),
-                 key: prefix + actions[i].id })
+      out.push(actionRow(route.org, route.serverId, forSite ? route.siteId : "",
+                         prefix, actions[i], subjectKey))
     return out
   }
 
@@ -376,11 +361,10 @@ Panel {
                  eventId: events[i].id, event: events[i],
                  key: prefix + "event/" + events[i].id })
     if (eventsCursor !== "")
-      out.push({ kind: "action", org: route.org, serverId: route.serverId, siteId: "",
-                 action: { id: "events-more", hint: "",
+      out.push(actionRow(route.org, route.serverId, "", prefix,
+                         { id: "events-more", hint: "",
                            label: eventsLoading ? "Loading older events…" : "Older events…",
-                           available: true, reason: "" },
-                 armKey: "", key: prefix + "more" })
+                           available: true, reason: "" }, ""))
     return out
   }
 
@@ -394,6 +378,10 @@ Panel {
   // nor the body depends on live state, so a refresh landing inside the arm
   // window rebuilds a row that means exactly what it meant. A recipe deleted
   // under the arm loses its row instead, which `confirmArmed` reports.
+  //
+  // Built here rather than through `actionRow`: these are `kind: "recipe"` rows
+  // and both keys are the *recipe's*, not the action's — every row carries the
+  // same `recipe-run` id, so an action-keyed row would give all of them one key.
   readonly property var recipeRows: {
     var out = []
     if (routeKind !== "recipes") return out
@@ -405,11 +393,10 @@ Panel {
                  armKey: prefix + recipes[i].id,
                  key: prefix + recipes[i].id })
     if (recipesCursor !== "")
-      out.push({ kind: "action", org: route.org, serverId: route.serverId, siteId: "",
-                 action: { id: "recipes-more", hint: "",
+      out.push(actionRow(route.org, route.serverId, "", prefix,
+                         { id: "recipes-more", hint: "",
                            label: recipesLoading ? "Loading more recipes…" : "More recipes…",
-                           available: true, reason: "" },
-                 armKey: "", key: prefix + "more" })
+                           available: true, reason: "" }, ""))
     return out
   }
 
@@ -439,13 +426,12 @@ Panel {
     if (origin !== "") cursorIndex = indexOfRow(origin)
     cursorActive = popped.returnActive === true && rows.length > 0
     disarm()
-    // The log and the command are only ever the top of the stack, so nothing
+    // The pane and the command are only ever the top of the stack, so nothing
     // is lost by clearing them on every pop. The feed is not: an event's
     // output sits over it, and clearing the list on the way back out of the
     // output is what this branch exists to avoid.
     clearLog()
     clearCommand()
-    clearEventOutput()
     if (popped.kind === "events") clearEvents()
     // The recipe list is the feed's situation exactly: a run's output is
     // pushed over it, and backing out of that output has to land on the list
@@ -472,6 +458,35 @@ Panel {
 
   function serverKey(org, serverId) {
     return String(org) + "/" + String(serverId)
+  }
+
+  // One action row, and the arm-key rule in one place. Every `kind: "action"`
+  // row in this file is built here, so what an arm key means is decided once
+  // rather than re-spelled per producer.
+  //
+  // `armKey` is `""` unless the action writes, and that is the invariant
+  // `runWriteAction` rests on: a row with no arm key cannot reach a send. An
+  // action that writes says which key it wants. Deploy declares `armsSubject`,
+  // so it arms on the subject's — the tree's row for that site reports the same
+  // deploy and has to light up with it; everything else arms on its own row's,
+  // because rows can send to the same endpoint and only the one that was
+  // pressed should say so.
+  //
+  // `armIntent` is folded in where an action has one. These lists are rebuilt on
+  // every refresh, and the maintenance row's label and method — and the command
+  // row's whole meaning — are derived from live state, so without it a sweep or
+  // a keystroke landing inside the arm window would leave the arm matching a row
+  // that now means something else.
+  //
+  // The row key is the action's own either way: the cursor is restored by row
+  // key, and a row that changed its identity on every keystroke would lose it.
+  function actionRow(org, serverId, siteId, prefix, action, subjectKey) {
+    var armKey = ""
+    if (action.armable === true)
+      armKey = action.armsSubject ? String(subjectKey || "")
+        : prefix + action.id + (action.armIntent ? "/" + action.armIntent : "")
+    return { kind: "action", org: org, serverId: serverId, siteId: siteId,
+             action: action, armKey: armKey, key: prefix + action.id }
   }
 
   function isOrgExpanded(org) {
@@ -712,18 +727,14 @@ Panel {
       return tone === "bad" ? "bad" : tone === "busy" ? "busy"
         : tone === "warn" ? "maintenance" : "none"
     }
-    if (routeKind === "server" || routeKind === "events"
-        || routeKind === "recipes") {
+    if (serverRoute) {
       var serverTone = routeServer ? Model.serverTone(routeServer.state) : "idle"
       return serverTone === "bad" ? "bad" : serverTone === "busy" ? "busy" : "none"
     }
     // An event has no status for a badge to report — see `Model.eventsFrom`.
     // A recipe run has one, but it is the pane's header that says it.
     if (routeKind === "eventOutput" || routeKind === "recipeOutput") return "none"
-    return health === "bad" ? "bad"
-      : health === "busy" ? "busy"
-      : health === "maintenance" ? "maintenance"
-      : (health === "setup" || health === "error") ? "warn" : "none"
+    return Model.badgeForHealth(health)
   }
 
   readonly property var routeDetails: routeKind === "site" ? Model.siteDetails(routeSite) : []
@@ -814,15 +825,15 @@ Panel {
     case "events-more": fetchEvents(eventsCursor); break
     case "recipes": openRecipes(); break
     case "recipes-more": fetchRecipes(recipesCursor); break
-    case "recipe-run": runWriteAction(row); break
     case "open": openCurrent(); break
     case "forge": openCurrentInForge(); break
     case "ssh": copyCurrentSsh(); break
-    case "maintenance":
-    case "nginx-restart":
-    case "php-reload":
-    case "php-restart":
-    case "reboot": runWriteAction(row); break
+    // Every remaining write, without naming one of them. `actionRow` gives an
+    // arm key to exactly the rows that write, so the row itself says which door
+    // it takes — and a new write is a Model entry with `armable` and a `path`,
+    // not a case added here. The doors above are the ones that are *not* an
+    // ordinary write: they open something, or they page a list.
+    default: if (row.armKey !== "") runWriteAction(row)
     }
   }
 
@@ -846,10 +857,10 @@ Panel {
   // land on should ever be the last press before a server goes down.
   function runWriteAction(row) {
     // `""` is also the disarmed state, so a row with no arm key would match on
-    // its *first* press and send without a confirm. Nothing produces one today
-    // — `runAction`'s availability check is what answers the user for a subject
-    // that has gone from the API, and it blocks the one row that could — but
-    // the two-press guarantee should not rest on that staying true.
+    // its *first* press and send without a confirm. `actionRow` is what makes
+    // that unreachable — a non-writing row has no arm key at all — and this is
+    // the guarantee resting on it rather than on an availability check
+    // elsewhere staying correct.
     if (String(row.armKey) === "") return
     if (armedKey !== row.armKey) {
       arm(row.armKey, String(row.action.confirm || "again"))
@@ -886,6 +897,21 @@ Panel {
     sendWriteAction(row)
   }
 
+  // What opening a run's pane means, in one place. Set before the answer can
+  // arrive: the service says "queued" the moment the 202 lands, and an update
+  // this screen cannot recognise is one it would throw away. `commandId` is in
+  // here because `onCommandRunUpdated` only assigns a non-empty one — leaving
+  // the last run's id standing would name the file `w` writes after the wrong
+  // run.
+  function beginRun(key) {
+    commandRequestKey = key
+    commandLines = []
+    commandError = ""
+    commandHeader = ""
+    commandId = ""
+    commandRunning = true
+  }
+
   // The action carries everything that differs between one write and another —
   // where it goes, how, what to re-read — so this hands the whole entry over
   // rather than sorting it by subject first.
@@ -903,35 +929,19 @@ Panel {
       // spent, the site has gone. The refusal has already been said through
       // `onActionFinished`, and there is no run to watch, so the prompt is left
       // exactly as it was rather than dressed up as one that is running.
-      if (key === "") return
-      // Set before the answer can arrive: the service says "queued" the moment
-      // the 202 lands, and an update this screen cannot recognise is one it
-      // would throw away.
-      commandRequestKey = key
-      commandLines = []
-      commandError = ""
-      commandHeader = ""
-      commandRunning = true
+      if (key !== "") beginRun(key)
       return
     }
     // A recipe run is the command's situation again: a write whose answer is
     // worth waiting for, so it goes out through its own door and the pane that
-    // follows it opens in `onActionFinished`, where the 202 lands.
+    // follows it opens in `onActionFinished`, where the 202 lands. It rides the
+    // command pane's state — one watch, one pane, one set of properties, and so
+    // one reset.
     if (String(row.action.id) === "recipe-run") {
       var runKey = forge.runRecipe(row.org, row.serverId, row.action, row.armKey)
       // Nothing was sent, and the refusal has already been said on the row.
       // The list is left exactly as it was.
-      if (runKey === "") return
-      // Set before the answer can arrive, for the command's reason: the service
-      // says "queued" the moment the 202 lands, and an update this screen
-      // cannot recognise is one it would throw away. The run rides the command
-      // pane's state — one watch, one pane, one set of properties.
-      commandRequestKey = runKey
-      commandLines = []
-      commandError = ""
-      commandHeader = ""
-      commandId = ""
-      commandRunning = true
+      if (runKey !== "") beginRun(runKey)
       return
     }
     forge.sendAction(row.org, row.serverId, row.action, row.armKey)
@@ -973,11 +983,9 @@ Panel {
 
   // ---------------------------------------------------------------- site logs
 
-  // On the deploy log's state rather than a second set of properties: only one
-  // pane is ever open — `popView` clears the log on every pop, and `paneLines`
-  // falls through to it — so a `siteLog` route reading and writing the same
-  // `log*` trio is the shape that already holds. What tells the two apart is
-  // the route kind, the request key, and the words on the pane.
+  // On the document pane's state rather than a set of its own — see
+  // `logRequestKey`. What tells a `siteLog` route from a `log` route is the
+  // route kind, the request key, and the words on the pane.
   function openSiteLog(kind) {
     var row = currentRow()
     var site = currentSite()
@@ -1019,14 +1027,6 @@ Panel {
     recipesCursor = ""
     recipesError = ""
     recipesLoading = false
-  }
-
-  function clearEventOutput() {
-    eventOutputRequestKey = ""
-    saveRequestedPath = ""
-    eventOutputLines = []
-    eventOutputError = ""
-    eventOutputLoading = false
   }
 
   // `e`, and the row in the server view. Resolves the server the way `f` and
@@ -1102,36 +1102,38 @@ Panel {
     }
   }
 
+  // On the document pane's state, the way a site log is and for the same
+  // reason — see `logRequestKey`. The feed underneath keeps its own, because it
+  // is the one list that stays alive under the route pushed over it.
   function openEventOutput(row) {
     if (!row || !forge) return
-    clearEventOutput()
-    eventOutputRequestKey = forge.eventOutputRequestKey(row.org, row.serverId, row.eventId)
-    eventOutputLoading = true
+    clearLog()
+    logRequestKey = forge.eventOutputRequestKey(row.org, row.serverId, row.eventId)
+    logLoading = true
     pushView({ kind: "eventOutput", org: row.org, serverId: row.serverId, eventId: row.eventId })
     forge.fetchEventOutput(row.org, row.serverId, row.eventId)
   }
 
   function refreshEventOutput() {
     if (!forge || routeKind !== "eventOutput") return
-    eventOutputLines = []
-    eventOutputError = ""
-    eventOutputLoading = true
+    logLines = []
+    logError = ""
+    logLoading = true
     forge.fetchEventOutput(route.org, route.serverId, route.eventId)
   }
 
   // ------------------------------------------------------------------ panes
 
   // Which pane's document is on screen, decided once. Five routes share one
-  // `ForgeLogView`, and a five-way ternary in each of its bindings is the
-  // wrong shape for a decision that has to come out the same every time —
-  // which is also why the two that follow a run are folded into `runPane`
-  // first.
-  readonly property var paneLines: runPane ? commandLines
-    : routeKind === "eventOutput" ? eventOutputLines : logLines
-  readonly property bool paneLoading: runPane ? commandRunning
-    : routeKind === "eventOutput" ? eventOutputLoading : logLoading
-  readonly property string paneError: runPane ? commandError
-    : routeKind === "eventOutput" ? eventOutputError : logError
+  // `ForgeLogView` and two sets of state: the two that follow a run, folded
+  // into `runPane`, and the three that read a document, which share `log*` —
+  // so what is left here is one question rather than a five-way ternary in
+  // each of the bindings below.
+  readonly property var paneLines: runPane ? commandLines : logLines
+  readonly property bool paneLoading: runPane ? commandRunning : logLoading
+  readonly property string paneError: runPane ? commandError : logError
+  // The words are what tell the three document panes apart, so these two keep
+  // the route switch the state above no longer needs.
   readonly property string paneLoadingText: runPane
     ? (commandHeader === "" ? "queued…" : commandHeader + "…")
     : routeKind === "eventOutput" ? "Fetching the event's output…" : "Fetching the log…"
@@ -1355,7 +1357,7 @@ Panel {
     // it is stale by then anyway.
     else {
       disarm(); cursorActive = false; navStack = []
-      clearLog(); clearCommand(); clearEventOutput(); clearEvents(); clearRecipes()
+      clearLog(); clearCommand(); clearEvents(); clearRecipes()
     }
   }
 
@@ -1485,11 +1487,15 @@ Panel {
       root.recipesCursor = String(nextCursor || "")
     }
 
+    // An event's output lands in the same three properties, guarded by the same
+    // key, for the site log's reason: the three document panes are never open at
+    // once and their keys differ in shape, so one pane's answer cannot be
+    // mistaken for another's.
     function onEventOutputFetched(requestKey, ok, text, message) {
-      if (root.eventOutputRequestKey !== requestKey) return
-      root.eventOutputLoading = false
-      root.eventOutputLines = ok ? Model.logLines(text) : []
-      root.eventOutputError = ok ? "" : String(message || "Could not read the event")
+      if (root.logRequestKey !== requestKey) return
+      root.logLoading = false
+      root.logLines = ok ? Model.logLines(text) : []
+      root.logError = ok ? "" : String(message || "Could not read the event")
     }
 
     // Saving is the one thing here that touches the filesystem, so where it
@@ -1560,18 +1566,7 @@ Panel {
           color: root.health === "setup" ? Qt.darker(button.bar ? button.bar.barForeground : root.foreground, 1.6)
                                           : (button.bar ? button.bar.barForeground : root.foreground)
           badgeColor: root.health === "busy" ? Color.accent : root.urgent
-          badge: {
-            switch (root.health) {
-            case "bad": return "bad"
-            case "error": return "warn"
-            case "setup": return "warn"
-            case "busy": return "busy"
-            // Its own value rather than `warn`, which is spoken for by the two
-            // above: the icon draws this one hollow, the way the rows do.
-            case "maintenance": return "maintenance"
-            }
-            return "none"
-          }
+          badge: Model.badgeForHealth(root.health)
         }
       }
     }
@@ -1747,11 +1742,9 @@ Panel {
               // is the organization whether or not the tree shows headers for
               // it — and not the server, which the hero right below already
               // names.
-              var aboutServer = root.routeKind === "server" || root.routeKind === "events"
-                || root.routeKind === "recipes"
-              if (root.route && (root.showOrgHeaders || aboutServer))
+              if (root.route && (root.showOrgHeaders || root.serverRoute))
                 parts.push(root.orgLabel(root.route.org))
-              var server = aboutServer ? null
+              var server = root.serverRoute ? null
                 : root.route ? root.serverById(root.route.org, root.route.serverId) : null
               if (server) parts.push(server.name)
               if ((root.routeKind === "log" || root.routeKind === "siteLog") && root.routeSite)
@@ -1787,8 +1780,7 @@ Panel {
                 ? Model.plainText(root.routeEvent ? root.routeEvent.description : "Event")
               : root.routeKind === "recipeOutput"
                 ? Model.plainText(root.routeRecipe ? root.routeRecipe.name : "Recipe")
-              : root.routeKind === "server" || root.routeKind === "events"
-                || root.routeKind === "recipes"
+              : root.serverRoute
                 ? Model.plainText(root.routeServer ? root.routeServer.name : "Server")
                 : root.organizations.length === 1
                   ? Model.plainText(root.orgLabel(root.organizations[0])) : "Forge"
@@ -1798,8 +1790,7 @@ Panel {
                 ? Model.plainText(root.eventMeta(root.routeEvent))
               : root.routeKind === "recipeOutput"
                 ? Model.plainText(root.recipeMeta(root.routeRecipe))
-              : root.routeKind === "server" || root.routeKind === "events"
-                || root.routeKind === "recipes"
+              : root.serverRoute
                 ? Model.plainText(root.routeServer ? Model.serverMeta(root.routeServer) : "")
                 : Model.plainText(root.summary)
             detail: root.routeSite
@@ -1807,8 +1798,7 @@ Panel {
               : root.routeKind === "eventOutput"
                 ? (root.routeEvent && root.routeEvent.createdAt
                    ? Model.relativeTime(root.routeEvent.createdAt, root.nowMs) : "")
-              : root.routeKind === "server" || root.routeKind === "events"
-                || root.routeKind === "recipes" || root.routeKind === "recipeOutput"
+              : root.serverRoute || root.routeKind === "recipeOutput"
                 ? root.serverDetailLine(root.routeServer)
                 : root.refreshing ? "refreshing…"
                                   : Model.relativeMs(root.lastRefreshMs, root.nowMs)
@@ -1819,10 +1809,9 @@ Panel {
                 iconSize: Style.font.display
                 color: root.foreground
                 badgeColor: root.heroTone === "busy" ? root.busyColor : root.urgent
-                badge: root.heroTone === "bad" ? "bad"
-                     : root.heroTone === "busy" ? "busy"
-                     : root.heroTone === "maintenance" ? "maintenance"
-                     : root.heroTone === "warn" ? "warn" : "none"
+                // `heroTone` is already in the badge vocabulary — see
+                // `Model.badgeForHealth`, which is where it comes from.
+                badge: root.heroTone
               }
             }
           }
@@ -2073,9 +2062,9 @@ Panel {
             // a request for as much as the screen will give.
             height: visible ? Style.space(460) : 0
 
-            // Three panes, one Item: which one is a matter of which route is
+            // Five panes, one Item: which one is a matter of which route is
             // up, decided once on the root — see `paneLines`. The header is
-            // the command run's alone: it is the one pane with a state line.
+            // the run's alone: it is the one pane with a state line.
             lines: root.paneLines
             loading: root.paneLoading
             error: root.paneError
