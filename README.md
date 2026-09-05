@@ -29,11 +29,15 @@ Tick these scopes:
 | `server:manage-logs` | read a site's application and nginx logs |
 | `server:manage-services` | restart nginx or PHP-FPM, reboot a server |
 | `site:manage-commands` | run a command on a site, toggle maintenance mode |
+| `recipe:view` | list the organization's recipes and follow a run |
+| `recipe:manage` | run a recipe on a server |
 
 The first three are the minimum. Leave the rest off and the widget is read-only — everything that
-would change something says which scope it wanted instead of failing quietly. The other four are
-named for what they let you change; deployment logs and site logs are reads that Forge files under
-them anyway, so a strictly read-only token is refused those two and told which scope it wanted.
+would change something says which scope it wanted instead of failing quietly. The rest are named
+for what they let you change, with two exceptions in each direction: deployment logs and site logs
+are reads that Forge files under a write scope anyway, so a strictly read-only token is refused
+those two and told which scope it wanted; and `recipe:view` is a genuine read scope, wanted for
+the recipe list and for following a run that `recipe:manage` started.
 
 **3. Add the token.** Click **Set up Forge** in the panel, or run:
 
@@ -84,7 +88,7 @@ commit. A server whose site starts failing unfolds itself once.
 | `s` | copy an `ssh forge@…` command for the server |
 | `r` | refresh now |
 | `a` | add an organization |
-| `Y` | confirm a reboot or a command that enter has armed |
+| `Y` | confirm a reboot, a command or a recipe that enter has armed |
 | esc | back one level, or close |
 
 Anything that changes something takes **two presses**: the first arms the row and says so, the
@@ -127,13 +131,13 @@ answering 500. An empty log says so rather than showing Forge's placeholder line
 Site logs need the `server:manage-logs` scope. That is Forge's name for it and it reads like a
 write scope, because the same scope clears them; a token without it is told so on the pane.
 
-| Key | In a log, a command's output, or an event's output |
+| Key | In a log, or a command's, a recipe's or an event's output |
 |---|---|
 | `j` `k` or ↑ ↓ | scroll |
 | `g` / `G` | top / bottom |
 | `c` | copy the whole thing |
 | `w` | save it to `~/Downloads/` — the panel says where it landed |
-| `r` | look at a site log, a command run or an event's output again |
+| `r` | look at a site log, a command or recipe run, or an event's output again |
 | `h` or esc | back |
 
 ### A server
@@ -147,6 +151,7 @@ Press `l` on an unfolded server, or click the ⚙ on any server row.
 | **Restart PHP-FPM** | the harder version |
 | **Reboot server** | enter to arm, capital `Y` to send |
 | **Server events** | what Forge has done to the server, newest first — also `e` from any row |
+| **Run a recipe** | the organization's saved scripts; enter arms one, `Y` runs it here |
 
 Forge does all of this asynchronously, so the answer is "requested" — what changed shows up in the
 next refresh.
@@ -162,6 +167,22 @@ reason usually is.
 Forge records what an event did and what it printed, **not whether it succeeded** — there is no
 status on an event, so the feed has no red rows. Open the output to find out. Reading events needs
 only the `server:view` scope, so unlike deployment logs this works on a read-only token.
+
+#### Recipes
+
+A recipe is a shell script saved in your Forge organization. **Run a recipe** lists the ones this
+organization has; enter arms one and `Y` runs it, on the server whose view you opened the list
+from — one server at a time, which is the difference between this and the dashboard. The output
+arrives when the run finishes, in the same pane as a deployment log and with the same keys.
+
+The row says who the recipe runs as, `root` or `forge`, and its first line. It will not arm on a
+server that is not ready, and says which instead. Nothing here can edit or create a recipe: this
+runs what is already written, and the dashboard is where writing it belongs.
+
+Forge answers the run with no id to follow, so the widget recognises the run afterwards in the
+recipe's own list of runs — by the server, and by being newer than the last one it followed. That
+list has no sort and pages 30 at a time, so a recipe with a long history is searched three pages
+deep before a look gives up and tries again.
 
 ### Notifications
 
@@ -211,7 +232,8 @@ including its own dashboard in a browser tab.
 A refresh costs **two requests per organization**, whatever your server count, and that figure
 doesn't change with the number of monitors. Opening a deployment log is one more, and so is a site
 log, and so is a server's event feed — one per page of thirty, and one for each event's output you
-open. Running a command costs about a dozen, spread over a hundred seconds.
+open, and one per page of the recipe list. Running a command costs about a dozen, spread over a
+hundred seconds, and running a recipe costs the same.
 
 The widget keeps a budget per account and backs off before it runs out, telling you on the row
 rather than failing silently. If Forge refuses anyway, the panel says "rate limited" and everything
@@ -276,7 +298,11 @@ reaches, and which is the default. Tokens are never in there.
 - **The server list stops at 150 rows** and says so rather than quietly showing a prefix. Sites are
   not capped — past 150 they are checked in rotation.
 - **A command run has no history and no partial output.** You see the run you just started, and its
-  output arrives when it finishes.
+  output arrives when it finishes. A recipe run is the same, and adds one of its own: it goes to
+  one server at a time, where the dashboard can send a recipe to several at once.
+- **A recipe run is recognised, not received.** Forge's answer to starting one carries no id, so
+  the run is found afterwards in the recipe's run list — three pages of thirty deep. A recipe with
+  more than ninety runs on record can outrun that, and the pane says it is still looking.
 - **Logs need a scope named for writing.** Forge gates deployment output behind
   `site:manage-deploys` and a site's own logs behind `server:manage-logs`, the scope that clears
   them. That is Forge's choice, not this plugin's — a strictly read-only token can watch a

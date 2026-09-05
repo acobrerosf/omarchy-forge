@@ -9,21 +9,14 @@ Everything below was checked against the v2 OpenAPI spec
 
 ## Features
 
-### 1. Recipes
-
-`GET /orgs/{org}/recipes` and `POST /orgs/{org}/recipes/{recipe}/runs`, scopes
-`recipe:view` / `recipe:manage`. Run a saved script across servers from the bar.
-Real value for people who already keep recipes; nothing at all for people who
-don't, which is why it sits below the rest.
-
-### 2. Monitors and heartbeats
+### 1. Monitors and heartbeats
 
 `GET .../servers/{server}/monitors` (scope `server:view`) and the site
 `heartbeats` endpoints. Forge's own alerting, surfaced in the bar. Would need
 its own idea of what "unhealthy" means on top of the four tones we have, so
 it is a bigger design question than it looks.
 
-### 3. The rest of the services
+### 2. The rest of the services
 
 Done: nginx restart, PHP-FPM reload and restart, and server reboot behind a
 `Y` confirm, in a server view reached with `l`. What that left out, in the order
@@ -46,7 +39,10 @@ it might be worth having:
 
 ## Not planned
 
-Server creation and deletion, databases and backups, DNS and certificates,
-firewall rules, teams and roles, storage providers, PHP version management,
-nginx template editing. All in the API; all things where a bar widget is a worse
+Running a recipe on several servers at once — the API takes a list, the bar
+takes one server, and a multi-select is a worse thing to build here than the
+two presses it would save. Creating or editing a recipe, and Forge's own
+`/forge-recipes`. Server creation and deletion, databases and backups, DNS and
+certificates, firewall rules, teams and roles, storage providers, PHP version
+management, nginx template editing. All in the API; all things where a bar widget is a worse
 place to do the work than the dashboard, and where a mistake is expensive.

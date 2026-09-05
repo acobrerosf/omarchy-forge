@@ -280,6 +280,53 @@ The scopes split across those four paths, which no other endpoint here does: the
 run it was not allowed to start, and the 403 belongs on the row that sent rather than on the pane
 that reads.
 
+**A recipe run is the command run with the find on the other side.** `POST
+.../recipes/{recipe}/runs` answers 202 with no body, the same as a command, so the run is
+recognised rather than received — and everything downstream is shared rather than mirrored. There
+is one watch slot for the session, because the invariant it rests on is single-flight writes, and
+that is as true of a recipe as of a command; the slot carries a `kind`, and `commandRunUpdated`
+fits field for field with the log's id where the command's id goes. So `stopCommandWatch`,
+`refreshCommand`, `_scheduleCommandPoll`, `_commandFailed` and the panel's whole pane are untouched
+by it. What a recipe changes is four things.
+
+The **evidence** is thinner. A recipe log has no text to match on and no `created_at` — it has a
+`server_id`, and a run this widget sends goes to exactly one server. So `Model.recipeRunFrom` takes
+the right server, then the same two floors in the same two flavours: `started_at` is the generous
+one, Forge's clock against this machine's, and it is *null* until the run leaves the queue, which
+is the ordinary state of a log a second after sending, so a null passes. The id floor is the exact
+one, and it is what separates this run from the user's own previous run of the same recipe on the
+same server — `_lastRecipeRun`, the command's `_lastRun` with an id in place of a timestamp.
+
+The **order is not knowable**, so the reader does not depend on it. This endpoint takes no `sort`:
+it answers 200 to `sort=-id` and to `sort=nonsense` alike, where `/servers` refuses an unknown one
+with a 400 naming what it takes — so the parameter is not read at all (verified live). Two things
+follow. `recipeRunFrom` takes the highest matching id on the page rather than the first row, so
+neither order can fool it. And the watch *walks* the cursor when a page holds no candidate, up to
+`recipeFindPages`, because Forge's other cursor lists default to oldest first — the event feed's
+does — which would otherwise put a new run beyond page one for any recipe with a history. The walk
+leaves through `_pollCommand` like every other look, so the hold and the ceiling still gate it, and
+it resets to the first page whenever a look gives up: by the next one, the run Forge had not
+written down may be there.
+
+There is **no output stage**. `GET .../runs/{log}` carries the `output` with the state, so a
+terminal show *is* the landing — which is why `_afterRecipeState` says the run is over and fills the
+pane in one breath where `_afterCommandState` deliberately stays silent. The id it reports comes off
+the watch rather than the job, because a run recognised as already finished lands there from the
+find, whose job was sent before there was an id to carry.
+
+And the **scopes** split the way the command's do, one word further: the POST wants
+`recipe:manage`, the reads want `recipe:view`. But `recipe:view` is a scope no sweep already needs,
+unlike the `server:view` a command's reads want — so the recipe *list* is in the deploy log's
+situation rather than the event feed's, and a deliberately read-only token is refused it and told
+which scope it wanted, on the view, quietly.
+
+The list itself is the event feed a second time: front of the queue, `quiet`, `meta.next_cursor`
+handed back on `recipesFetched` as a row the reader presses rather than a chain the service walks,
+and a route that stays alive *under* the pane pushed over it — so `popView` clears it by the kind it
+popped, and `openRecipes` refuses to push over a pane or the prompt. It is pushed rather than
+`replaceView`d, unlike the command prompt: a prompt that has run is an invitation to run it twice,
+and a list is not.
+
 **Writes don't go through it.** A deploy, a service restart, a reboot and a maintenance toggle all
 go out on `actionProcess`, which is single-flight: one press cannot become two requests, and the
 answer arrives at `_onAction` rather than in the middle of a sweep. What the queue would have done
@@ -456,14 +503,21 @@ different `rows`.
 
 `navStack` holds what has been pushed over the tree; `route` is its top. `rows` switches on it:
 nothing pushed is the tree, a `site` or `server` route is that subject's actions, an `events` route
-is a server's feed, and a `log`, `siteLog`, `commandOutput` or `eventOutput` route is empty because
-a pane is not a list — `paneRoute` is the four of them together, drawn once rather than at each of
+is a server's feed, a `recipes` route is the organization's recipes, and a `log`, `siteLog`,
+`commandOutput`, `eventOutput` or `recipeOutput` route is empty because a pane is not a list —
+`paneRoute` is the five of them together, drawn once rather than at each of
 the half-dozen places that has to know, and the pane's document, loading flag and empty text are
 chosen once on the root (`paneLines` and its siblings) for the same reason. A `command` route is one
 row, the send, built from what has been typed. Everything downstream is untouched — one cursor, one
 delegate, one key handler, one clamp in `onRowsChanged` — which is the point. The server view cost
 exactly what that predicted: a branch in `actionRows`, a `runAction` case, and no new navigation
 model.
+
+`runPane` is a second such line, drawn for the same reason one level down: `commandOutput` and
+`recipeOutput` follow a *run* rather than read a document, so they share the pane state, the header,
+the `r` key and every binding that reads them — one watch, one pane, one set of properties. What
+tells them apart is the route kind, the request key's shape and the words, which is the rule a site
+log already follows against the deploy log's.
 
 The event feed is the first route that keeps state *under* another: an event's output is pushed
 over the list it was chosen from, and backing out has to land on that list, not on an empty one.

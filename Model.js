@@ -380,6 +380,35 @@ function eventsFrom(body) {
   })
 }
 
+// -------------------------------------------------------------------- recipes
+
+// An organization's saved scripts, flattened. The `script` itself is not kept:
+// nothing draws it, and a recipe is a whole shell program — tens of kilobytes
+// of it in a property every panel re-reads is the deploy log's mistake made at
+// rest. The first line is kept instead, which is what a row can show.
+//
+// Sorted here for `sortSites`'s reason and then some: this endpoint takes no
+// `sort` parameter at all, so the order Forge sends is the only one there is.
+function recipesFrom(body) {
+  var out = []
+  var data = body && Array.isArray(body.data) ? body.data : []
+  for (var i = 0; i < data.length; i++) {
+    var resource = data[i]
+    var a = resource.attributes || {}
+    var script = String(a.script || "")
+    out.push({
+      id: String(resource.id),
+      name: String(a.name || "recipe"),
+      user: String(a.user || ""),
+      firstLine: script.split("\n")[0].trim(),
+      updatedAt: a.updated_at ? String(a.updated_at) : ""
+    })
+  }
+  return out.sort(function (x, y) {
+    return x.name.localeCompare(y.name)
+  })
+}
+
 // ------------------------------------------------------------- site actions
 
 // The three logs Forge keeps for a site, in the order the view lists them: the
@@ -620,6 +649,106 @@ function commandFrom(body, sent, sinceMs, afterMs) {
   return null
 }
 
+// Running one of the organization's recipes on one server. The body is decided
+// here rather than typed, so unlike the site command it rides the argv the way
+// the maintenance toggle's does — there is nothing in it a user wrote.
+//
+// `Y` rather than two presses, on the reboot's reasoning and more of it: a
+// recipe is an arbitrary script, usually run as root, and this widget cannot
+// show what is in it. No `armIntent`: neither the path nor the body depends on
+// live state, so a refresh landing inside the arm window rebuilds a row that
+// means exactly what it meant — and a recipe deleted under the arm loses its
+// row entirely, which `confirmArmed` already reports.
+function recipeRunAction(org, server, recipe) {
+  var state = server ? String(server.state) : "unknown"
+  var ready = state === "ready"
+  // Forge takes the server as a number. An id that is not one would reach the
+  // API as `null` inside the array, so the row refuses instead of sending it.
+  var serverId = server ? parseInt(server.id, 10) : NaN
+  var addressable = !!recipe && isFinite(serverId)
+  var available = addressable && ready
+  return { id: "recipe-run", label: recipe ? String(recipe.name) : "",
+           hint: "", armable: true, confirm: "Y",
+           available: available,
+           reason: available ? "" : !addressable ? "not listed" : serverStateLabel(state),
+           armedText: "press Y to run on " + (server ? String(server.name) : "this server"),
+           // Forge answers 202 and goes off to the box; the pane that opens
+           // next is what says how it went.
+           done: "Recipe run requested",
+           method: "POST",
+           scopeMessage: "Your token can't run recipes — that needs the "
+             + "recipe:manage scope",
+           recipeId: recipe ? String(recipe.id) : "",
+           path: addressable ? recipeRunsPath(org, recipe.id) : "",
+           body: addressable ? { servers: [serverId] } : null }
+}
+
+// -------------------------------------------------------------- recipe runs
+
+// Forge's four, split the one way the pane cares about — the same shape the
+// command's status has, minus `timeout`, which a recipe cannot report.
+function recipeRunIsTerminal(status) {
+  var value = String(status || "")
+  return value === "finished" || value === "failed"
+}
+
+// The line above the output, on `commandStateFrom`'s terms: the state word
+// leads, so `commandHeaderBad` reads a recipe's header as well as a command's,
+// and everything after it is added only when it is there. A recipe log carries
+// no `duration` of its own, so the two timestamps make one — and only when
+// both parse, because a run still on the box has no `finished_at` at all.
+function recipeRunStateFrom(attributes) {
+  var attrs = attributes || {}
+  var status = String(attrs.status || "")
+  var parts = [status === "" ? "unknown" : status]
+  var started = Date.parse(String(attrs.started_at || ""))
+  var finished = Date.parse(String(attrs.finished_at || ""))
+  if (!isNaN(started) && !isNaN(finished) && finished >= started)
+    parts.push(Math.max(1, Math.round((finished - started) / 1000)) + "s")
+  return { running: !recipeRunIsTerminal(status), status: status,
+           bad: status === "failed",
+           header: parts.join(" · ") }
+}
+
+// Which row of the recipe's run list is the run that was just sent. Forge
+// answers this POST 202 with no body either, so this is `commandFrom`'s job
+// with different evidence — and the evidence is thinner, because a recipe log
+// has no text to match on and no `created_at`. What it has instead is a
+// `server_id`, and a run this widget sends goes to exactly one server.
+//
+// So: the right server, then the same two floors the command uses, in the same
+// two flavours. `started_at` is the generous one — Forge's clock against this
+// machine's — and it is null until the run leaves the queue, which is the
+// ordinary state of a log a second after sending, so a null passes. The id
+// floor is the exact one: it separates this run from the user's own previous
+// run of the same recipe on the same server, which is what reading a failure
+// and running it again is, and it compares two Forge ids with no skew in it.
+//
+// The highest id wins rather than the first row, because the order this list
+// comes back in is not documented and not verified — see ARCHITECTURE.md.
+function recipeRunFrom(body, serverId, sinceMs, afterId) {
+  var rows = body && body.data ? body.data : []
+  var server = Number(serverId)
+  var floor = Number(afterId || 0)
+  var skewFloor = Number(sinceMs || 0) - commandClockSkewMs
+  var best = null
+  for (var i = 0; i < rows.length; i++) {
+    var attrs = rows[i].attributes || {}
+    if (Number(attrs.server_id) !== server) continue
+    var id = Number(rows[i].id)
+    if (!isFinite(id) || id <= floor) continue
+    // Not started yet is not evidence against it — that is what a run waiting
+    // in Forge's queue looks like, and it is the state this arrives in.
+    var startedAt = String(attrs.started_at || "")
+    if (startedAt !== "") {
+      var started = Date.parse(startedAt)
+      if (!isNaN(started) && started < skewFloor) continue
+    }
+    if (!best || id > Number(best.id)) best = { id: String(rows[i].id), attributes: attrs }
+  }
+  return best
+}
+
 // ----------------------------------------------------------- server actions
 
 // Which PHP pool a PHP action would act on. Forge runs one FPM pool per version
@@ -706,6 +835,12 @@ function serverActions(org, server) {
     // Always available: an unreachable server is exactly the one whose feed is
     // worth reading, and a read is what the row is.
     { id: "events", label: "Server events", hint: "e", available: true, reason: "" },
+    // A door rather than a write: what it opens is the organization's recipe
+    // list, and the row pressed there is the one that sends. Always available
+    // for the list's sake — the recipes are the organization's, so there are
+    // some to read even when this server is in no state to run one, and the
+    // row there says so.
+    { id: "recipes", label: "Run a recipe…", hint: "", available: true, reason: "" },
     { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
     { id: "ssh", label: "Copy ssh command", hint: "s",
       available: ssh !== "", reason: ssh !== "" ? "" : "no public IP" }
@@ -834,7 +969,7 @@ function deploymentLabel(status) {
 // come through here too, so every view draws with the same delegate.
 //
 // ctx: { server, site, orgLabel, orgHealth, orgSummary, siteCount,
-//        showOrgHeaders, action, event }
+//        showOrgHeaders, action, event, recipe, armKey }
 //
 // Nothing here may touch a QML type, so the result carries `depth` rather than
 // a pixel indent and `tone` rather than a colour — ForgeRow owns the metrics
@@ -939,6 +1074,35 @@ function rowView(row, ctx) {
       actionKey: "",
       armedText: "",
       timeAt: String(event.createdAt || "")
+    }
+  }
+
+  // A recipe row is an action wearing a list row's clothes: it carries the
+  // send's arm key the way an action row in a view does, but its label is the
+  // recipe's name and its detail says what running it would mean here — who it
+  // runs as and what its first line is, or why this server can't take it.
+  //
+  // No `timeAt`. The only timestamp a recipe has is when it was last edited,
+  // and in the column a site's deploy time occupies that would read as when it
+  // last ran — a different fact, and one this row does not know.
+  if (kind === "recipe") {
+    var recipe = c.recipe || {}
+    var recipeAction = c.action || {}
+    var about = []
+    if (recipe.user) about.push("as " + String(recipe.user))
+    if (recipe.firstLine) about.push(String(recipe.firstLine))
+    return {
+      kind: kind,
+      label: String(recipe.name || ""),
+      detail: recipeAction.available === false
+        ? String(recipeAction.reason || "") : about.join(" · "),
+      status: "",
+      tone: "idle",
+      depth: 0,
+      showChevron: false,
+      actionKey: recipeAction.armable === true ? String(c.armKey || "") : "",
+      armedText: String(recipeAction.armedText || defaultArmedText),
+      timeAt: ""
     }
   }
 
@@ -1266,6 +1430,42 @@ function commandOutputPath(org, serverId, siteId, commandId) {
   return commandPath(org, serverId, siteId, commandId) + "/output"
 }
 
+// An organization's recipes, and one recipe's runs. The scopes split across
+// these the way the command's do: the POST wants `recipe:manage`, the three
+// reads want `recipe:view`. Unlike the command's reads, though, `recipe:view`
+// is a scope no sweep already needs — so this is the deploy log's situation
+// rather than the event feed's, and a deliberately read-only token can be
+// refused the list. The service names that 403 on the view.
+function recipesPath(org, cursor) {
+  return pagedPath("/orgs/" + encode(org) + "/recipes", cursor)
+}
+
+// The POST target, and so deliberately unpaged — a `page[size]` on a write is
+// noise at best. `recipeRunListPath` is the same address as a read.
+function recipeRunsPath(org, recipeId) {
+  return "/orgs/" + encode(org) + "/recipes/" + encode(recipeId) + "/runs"
+}
+
+// The run being looked for is the one just sent, so newest first is what this
+// wants — and this endpoint has no `sort` to ask for it with. It answers 200
+// to any `sort` at all, where `/servers` refuses an unknown one with a 400 and
+// the list of what it takes, so the parameter is not read here: `sort=-id` and
+// `sort=nonsense` are the same request. Verified live, 2026-09-05.
+//
+// Two things follow, and both live in the reader rather than the URL.
+// `recipeRunFrom` takes the highest matching id on the page instead of the
+// first row, so neither order can fool it; and the watch walks the cursor when
+// a page holds no candidate, because Forge's other cursor lists default to
+// *oldest* first — the event feed's does, verified — which would otherwise put
+// a new run beyond page one for any recipe with a history.
+function recipeRunListPath(org, recipeId, cursor) {
+  return pagedPath(recipeRunsPath(org, recipeId), cursor)
+}
+
+function recipeRunLogPath(org, recipeId, logId) {
+  return recipeRunsPath(org, recipeId) + "/" + encode(logId)
+}
+
 // The three reads above, as a question a queued job can be asked. Named here
 // beside the paths they take rather than spelled out at each of the places in
 // the service that has to recognise one — a job dropped without an answer is a
@@ -1274,6 +1474,21 @@ function isCommandJob(job) {
   var kind = job ? String(job.kind || "") : ""
   return kind === "commandFind" || kind === "commandShow"
     || kind === "commandOutput"
+}
+
+// The two reads a recipe run's watch makes. Deliberately *not* grouped with
+// the recipe list below: these answer `commandRunUpdated` and the list answers
+// `recipesFetched`, so a drop site that treated them alike would send a pane's
+// farewell to a view or the other way round.
+function isRecipeRunJob(job) {
+  var kind = job ? String(job.kind || "") : ""
+  return kind === "recipeFind" || kind === "recipeShow"
+}
+
+// What the run watch is following, whichever kind of run it is. The watch is
+// one slot and one signal, so the drop sites ask this rather than the two.
+function isRunJob(job) {
+  return isCommandJob(job) || isRecipeRunJob(job)
 }
 
 // The two event reads, on the same terms and for the same reason.
@@ -1429,6 +1644,13 @@ function commandFileName(siteName, commandId) {
 // is not reachable from here.
 function eventFileName(serverName, eventId) {
   return "forge-" + safeFileName(serverName) + "-event-" + safeFileName(eventId) + ".log"
+}
+
+// Two API strings and an id in one path, so all three go through the guard —
+// a recipe is named by whoever wrote it, and nothing else here has checked it.
+function recipeFileName(serverName, recipeName, logId) {
+  return "forge-" + safeFileName(serverName) + "-recipe-"
+    + safeFileName(recipeName) + "-" + safeFileName(logId) + ".out"
 }
 
 // A site log's file. The kind goes through the guard with the name even though

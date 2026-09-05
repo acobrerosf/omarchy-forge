@@ -97,9 +97,10 @@ depends on live state, as the maintenance toggle's does — an `armIntent` in it
 refresh landing mid-arm invalidates it instead of retargeting it; a body a *user typed* — only the
 site command's — never rides that argv, and asks for `bodyStdin` instead, which sends it as `api …
 POST <path> -` and writes it to the helper's stdin on `started`; a site or server name reaching a
-*path* (a saved deploy log's, site log's, command output's or event output's filename) goes through
-`Model.safeFileName`, which is the separator guard the other three don't cover; a site log reads and
-writes the *deploy log's* panel state rather than owning a fourth set, because only one pane is ever
+*path* (a saved deploy log's, site log's, command output's, event output's or recipe output's
+filename — that last one carries two names) goes through `Model.safeFileName`, which is the
+separator guard the other three don't cover; a site log reads and writes the *deploy log's* panel
+state rather than owning a fourth set, because only one pane is ever
 open and `popView` already clears that one — what tells the two apart is the route kind, the request
 key and the words; the command watch that polls a run to its end lives on `Service` and not on
 `Panel`, for the reason the sweep does — a timer in a bar widget runs once per monitor — and it says
@@ -108,8 +109,17 @@ flight leaves the pane finished with no lines, which renders as "printed nothing
 on exactly three things — the output landing, the pane closing, the next run displacing it — and
 never on a refusal, since the run is on the box whatever a look at it came back with and dropping
 the watch leaves `r` pointing at nothing (`_commandFailed` reports and reschedules instead), while
-anything that *does* end one owes the pane a farewell — the displaced key in `_startCommandWatch`, a
-dropped read in `_holdAccount` or `_abandonJob`; the command prompt is the one place that sets
+anything that *does* end one owes the pane a farewell — the displaced key in `_displaceWatch`, a
+dropped read in `_holdAccount` or `_abandonJob`; a recipe run shares that one watch rather than
+mirroring it — one slot carrying a `kind`, one signal, one pane state — so `Model.isRunJob` is what
+the drop sites ask and the recipe *list*, which answers `recipesFetched` instead, is deliberately
+not in it; its find walks the run list's cursor up to `recipeFindPages`, because that endpoint
+reads no `sort` at all (it answers 200 to any, where `/servers` 400s an unknown one) and Forge's
+cursor lists default to oldest first, and the walk leaves through `_pollCommand` like every other
+look so the hold still gates it; its terminal show carries the output, so unlike the command's
+there is no output stage and the state that ends the run is the text that fills the pane, reported
+with the id off the *watch* rather than the job, which a run found already finished would not have;
+the command prompt is the one place that sets
 `PanelKeyCatcher.blocked`, and `stopCommandEditing` clears it *deferred* on purpose, or the enter
 that arms goes on to reach `onActivateRequested` and un-arms the row it just armed; and the event
 feed is the one route that stays alive *under* another (its output pane), which is why `popView`

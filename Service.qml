@@ -109,6 +109,27 @@ Item {
       + "@" + String(sentAtMs)
   }
 
+  // The organization's recipes, on the event feed's terms: a keypress asked,
+  // the answer is rows, and a refusal is always reported. Keyed by the
+  // organization alone — recipes are the organization's, not the server's, and
+  // the same list opened from two of its servers is the same list.
+  signal recipesFetched(string requestKey, bool ok, var recipes, string cursor,
+                        string nextCursor, string message)
+
+  function recipesRequestKey(org) {
+    return String(org) + "/recipes"
+  }
+
+  // A recipe run is followed on `commandRunUpdated` rather than a signal of its
+  // own: there is one watch slot for the session, and every field of that
+  // signal fits — `commandId` carries the run log's id, `header` its state
+  // line. What keeps the two apart is this key's shape, which no command key
+  // can collide with. The send time again, for `commandRequestKey`'s reason.
+  function recipeRequestKey(org, serverId, recipeId, sentAtMs) {
+    return String(org) + "/" + String(serverId) + "/recipe:" + String(recipeId)
+      + "@" + String(sentAtMs)
+  }
+
   readonly property string pluginDir: String(Qt.resolvedUrl("."))
     .replace(/^file:\/\//, "")
     .replace(/\/$/, "")
@@ -577,7 +598,9 @@ Item {
     }
     if (Model.isEventJob(job)) { _eventRefused(job, message); return }
     if (Model.isSiteLogJob(job)) { _siteLogRefused(job, message); return }
-    if (!Model.isCommandJob(job)) return
+    if (job.kind === "recipes") { _recipesRefused(job, message); return }
+    // Either kind of run: one watch slot, one signal, one farewell.
+    if (!Model.isRunJob(job)) return
     if (_commandCurrent(job)) {
       _commandWatch = null
       commandTimer.stop()
@@ -628,6 +651,11 @@ Item {
       return Model.eventOutputPath(job.org, job.serverId, job.eventId)
     if (job.kind === "siteLog")
       return Model.siteLogPath(job.org, job.serverId, job.siteId, job.log)
+    if (job.kind === "recipes") return Model.recipesPath(job.org, job.cursor)
+    if (job.kind === "recipeFind")
+      return Model.recipeRunListPath(job.org, job.recipeId, job.cursor)
+    if (job.kind === "recipeShow")
+      return Model.recipeRunLogPath(job.org, job.recipeId, job.commandId)
     return Model.sitesPath(job.org, job.cursor)
   }
 
@@ -778,10 +806,11 @@ Item {
                              false, "", "Rate limited — try again shortly")
       if (Model.isEventJob(job)) _eventRefused(job, "Rate limited — try again shortly")
       if (Model.isSiteLogJob(job)) _siteLogRefused(job, "Rate limited — try again shortly")
+      if (job.kind === "recipes") _recipesRefused(job, "Rate limited — try again shortly")
       // A dropped look at a command is not the end of the run — the hold is
       // this minute's, and the ladder outlives it — so the pane is told to
       // expect a wait rather than told the watch is over.
-      if (Model.isCommandJob(job)) {
+      if (Model.isRunJob(job)) {
         commandRunUpdated(job.requestKey, true, true, String(job.commandId || ""),
                           "rate limited — looking again shortly", "", "")
         _scheduleCommandPoll()
@@ -1168,6 +1197,64 @@ Item {
                         Model.nextCursor(envelope.body), "")
   }
 
+  // ------------------------------------------------------------------ recipes
+
+  // The organization's recipe list, on the event feed's road: front of the
+  // queue because someone is looking at an empty view, `quiet` because the
+  // refusal belongs to that view, and a page the reader asks for rather than a
+  // chain this walks.
+  function fetchRecipes(org, cursor) {
+    var key = String(org)
+    var page = String(cursor || "")
+    var refuse = function (message) {
+      recipesFetched(recipesRequestKey(key), false, [], page, "", message)
+    }
+
+    var state = orgs[key]
+    if (!state) { refuse("That organization is no longer being watched"); return }
+
+    var account = state.account || accountForOrg(key)
+    var held = budget.blockedMs(account)
+    if (held > 0) {
+      refuse("Rate limited — try again in " + Math.ceil(held / 1000) + "s")
+      return
+    }
+    if (budget.wouldExceed(account, 1)) {
+      refuse("Too close to the rate limit — try again shortly")
+      return
+    }
+
+    var pending = function (job) {
+      return job.kind === "recipes" && job.org === key
+        && String(job.cursor || "") === page
+    }
+    if (queue.contains(pending) || (_current !== null && pending(_current))) return
+
+    queue.pushFront({ org: key, account: account, kind: "recipes", cursor: page })
+  }
+
+  function _recipesRefused(job, message) {
+    recipesFetched(recipesRequestKey(job.org), false, [],
+                   String(job.cursor || ""), "", message)
+  }
+
+  // Named, and for the deploy log's reason rather than the event feed's:
+  // `recipe:view` is a scope no sweep needs, so a deliberately read-only token
+  // is refused here and told which scope it wanted. Quiet, so that refusal
+  // stays on this view instead of painting the organization's rows.
+  function _onRecipes(job, text) {
+    var envelope = Model.parseEnvelope(text)
+    if (!_applyEnvelope(job.org, job.account, envelope, true)) {
+      _recipesRefused(job, envelope.status === 403
+        ? "Your token can't list recipes — that needs the recipe:view scope"
+        : Model.envelopeError(envelope))
+      return
+    }
+    recipesFetched(recipesRequestKey(job.org), true,
+                   Model.recipesFrom(envelope.body), String(job.cursor || ""),
+                   Model.nextCursor(envelope.body), "")
+  }
+
   function _onEventOutput(job, text) {
     var envelope = Model.parseEnvelope(text)
     if (!_applyEnvelope(job.org, job.account, envelope, true)) { _eventError(job, envelope); return }
@@ -1483,6 +1570,35 @@ Item {
     return started ? requestKey : ""
   }
 
+  // A recipe run, on `runSiteCommand`'s terms and for the same reason: the 202
+  // carries no body, so the run has to be recognised afterwards, and the key
+  // its updates will arrive on is minted here because the panel needs it before
+  // the first one can land. Answers `""` when nothing was sent, so the panel
+  // does not open a pane onto a run that does not exist.
+  //
+  // Unlike the command's, this body is decided in `Model.recipeRunAction` and
+  // never typed, so it rides the argv the maintenance toggle's does — there is
+  // nothing in it a user wrote.
+  function runRecipe(org, serverId, action, key) {
+    if (!action || !action.path || String(org) === "") {
+      actionFinished(String(key), false, "That server is no longer listed")
+      return ""
+    }
+    var sentAtMs = Date.now()
+    var requestKey = recipeRequestKey(org, serverId, action.recipeId, sentAtMs)
+    var started = _startAction(
+      { org: String(org), serverId: String(serverId),
+        recipeId: String(action.recipeId), kind: "recipe",
+        key: String(key), path: String(action.path),
+        method: String(action.method || "POST"),
+        body: action.body || null,
+        sentAtMs: sentAtMs, requestKey: requestKey,
+        done: String(action.done || "Sent"),
+        scopeMessage: String(action.scopeMessage || ""),
+        settleSites: false, refetchSites: false, refetchOrg: false })
+    return started ? requestKey : ""
+  }
+
   function _onAction(text) {
     var envelope = Model.parseEnvelope(text)
     var job = _action
@@ -1512,6 +1628,11 @@ Item {
     // resource back, this hands back nothing — so the run has to be found
     // before it can be followed. That is the watch's first look.
     if (job.kind === "command") { _startCommandWatch(job); return }
+
+    // The same again, and for the same reason: a recipe's 202 carries no body
+    // either. Nothing to re-read afterwards — a recipe changes whatever its
+    // script changes, none of which the sweep reads.
+    if (job.kind === "recipe") { _startRecipeWatch(job); return }
 
     // Forge does all of this asynchronously — every one of these endpoints
     // answers 202 — so what changed only shows a moment later. Look again
@@ -1598,6 +1719,13 @@ Item {
   // not finished by then is not something to keep a poll alive for, and `r`
   // starts the ladder over for anyone still watching.
   readonly property var commandPollLadder: [3, 3, 5, 5, 8, 8, 13, 13, 21, 21]
+
+  // How far a recipe's find will walk before giving that look up. Forge pages
+  // this list 30 at a time whatever `page[size]` asks for and offers no sort,
+  // so a recipe with a history can hold the new run past the first page. Three
+  // pages is 90 rows, and the walk is only ever paid while the run has not
+  // been recognised — once it has, every look after it addresses the id.
+  readonly property int recipeFindPages: 3
   property var _commandWatch: null
 
   // The last run this session recognised, and which command on which site it
@@ -1608,22 +1736,62 @@ Item {
   // the run a new one can be confused with is the one before it.
   property var _lastRun: null
 
+  // The same floor for a recipe run, and the same reason: running a recipe
+  // again after reading its failure is the ordinary retry, and without this the
+  // find would recognise the previous run as the new one. A recipe log carries
+  // no text to tell two apart, so what is kept is the *id* of the last run this
+  // session adopted for the recipe-and-server it was on.
+  property var _lastRecipeRun: null
+
   function _runSite(job) {
     return String(job.org) + "/" + String(job.serverId) + "/" + String(job.siteId)
   }
 
-  function _startCommandWatch(job) {
-    // There is one watch for the session and a second run displaces it, so the
-    // pane that was following the old one has to be told — two monitors is all
-    // it takes, since the service is shared and the panels are not. Without
-    // this it sits on "running…" with no lines and a `r` that answers nothing.
+  // There is one watch for the session and a new run displaces whatever it was
+  // following, so the pane left behind has to be told — two monitors is all it
+  // takes, since the service is shared and the panels are not. Without this it
+  // sits on "running…" with no lines and an `r` that answers nothing.
+  function _displaceWatch(job) {
     if (_commandWatch && _commandWatch.requestKey !== job.requestKey)
       commandRunUpdated(_commandWatch.requestKey, false, false,
                         _commandWatch.commandId, "", "",
-                        "Stopped following this run — another command was started")
+                        "Stopped following this run — another run was started")
     commandTimer.stop()
+  }
+
+  // A recipe's watch, the command's with a different find. The floor is an id
+  // rather than a timestamp — see `Model.recipeRunFrom` — and it is carried on
+  // the watch the way `afterMs` is, so every look asks the same question.
+  function _startRecipeWatch(job) {
+    _displaceWatch(job)
+    var run = _recipeRun(job)
+    _commandWatch = { kind: "recipe", org: job.org, account: job.account,
+                      serverId: job.serverId, recipeId: job.recipeId,
+                      run: run, sentAtMs: job.sentAtMs,
+                      afterId: _lastRecipeRun && _lastRecipeRun.run === run
+                        ? _lastRecipeRun.id : 0,
+                      requestKey: job.requestKey, commandId: "",
+                      // Where the walk over the run list has got to, and how
+                      // far it has gone. Reset every time a look gives up, so
+                      // the next one starts from the first page — by then the
+                      // run Forge had not written down may be there.
+                      findCursor: "", findPage: 0,
+                      stage: "follow", header: "", step: 0 }
+    // Before the first look, for `_startCommandWatch`'s reason: the pane opens
+    // reading "queued" rather than sitting blank until a request comes back.
+    commandRunUpdated(job.requestKey, true, true, "", "queued", "", "")
+    _pollCommand()
+  }
+
+  // Which recipe on which server, which is the pair a run can be confused with.
+  function _recipeRun(job) {
+    return String(job.org) + "/" + String(job.serverId) + "/" + String(job.recipeId)
+  }
+
+  function _startCommandWatch(job) {
+    _displaceWatch(job)
     var site = _runSite(job)
-    _commandWatch = { org: job.org, account: job.account,
+    _commandWatch = { kind: "command", org: job.org, account: job.account,
                       serverId: job.serverId, siteId: job.siteId,
                       site: site, sent: job.sent, sentAtMs: job.sentAtMs,
                       // Only the same text on the same site can be mistaken for
@@ -1680,11 +1848,15 @@ Item {
     // it, it is addressed directly — one row of JSON instead of five, and no
     // chance of adopting a different run with the same text. Once it is over,
     // there is one thing left to ask for.
-    var kind = watch.stage === "output" ? "commandOutput"
-      : watch.commandId === "" ? "commandFind" : "commandShow"
+    // A recipe has one read fewer: its show carries the output, so a terminal
+    // one *is* the landing and there is no third stage to reach.
+    var kind = watch.kind === "recipe"
+      ? (watch.commandId === "" ? "recipeFind" : "recipeShow")
+      : watch.stage === "output" ? "commandOutput"
+        : watch.commandId === "" ? "commandFind" : "commandShow"
     var key = watch.requestKey
     var pending = function (job) {
-      return job.requestKey === key && Model.isCommandJob(job)
+      return job.requestKey === key && Model.isRunJob(job)
     }
     if (queue.contains(pending) || (_current !== null && pending(_current))) return
 
@@ -1707,8 +1879,13 @@ Item {
       return
     }
 
+    // `commandId` is the id of the run being followed, whichever kind of run
+    // that is — a command's, or a recipe log's. The fields the other kind does
+    // not use ride along as `undefined`, which `_pathFor` never reaches.
     queue.pushFront({ org: watch.org, account: watch.account, kind: kind,
                       serverId: watch.serverId, siteId: watch.siteId,
+                      recipeId: watch.recipeId, afterId: watch.afterId,
+                      cursor: watch.findCursor,
                       commandId: watch.commandId, sent: watch.sent,
                       sentAtMs: watch.sentAtMs, afterMs: watch.afterMs,
                       header: watch.header, requestKey: key })
@@ -1740,7 +1917,9 @@ Item {
   // the 403 here reads differently from the one the send earns.
   function _commandRefused(job, envelope) {
     var message = envelope.status === 403
-      ? "Your token can't read command runs — that needs the server:view scope"
+      ? (Model.isRecipeRunJob(job)
+         ? "Your token can't read recipe runs — that needs the recipe:view scope"
+         : "Your token can't read command runs — that needs the server:view scope")
       : Model.envelopeError(envelope)
     commandRunUpdated(job.requestKey, false, false, String(job.commandId || ""),
                       "", "", message)
@@ -1862,6 +2041,82 @@ Item {
     commandTimer.stop()
     commandRunUpdated(job.requestKey, true, false, String(job.commandId || ""),
                       job.header, attributes.output, "")
+  }
+
+  // The recipe's find. Same shape as the command's, different evidence — see
+  // `Model.recipeRunFrom` — and the same answer when there is nothing yet:
+  // Forge has not written the log down, which is ordinary in the first second
+  // or two, so it is another look rather than an error.
+  function _onRecipeFind(job, text) {
+    var envelope = _commandAnswer(job, text)
+    if (!envelope) return
+
+    var found = Model.recipeRunFrom(envelope.body, job.serverId, job.sentAtMs,
+                                    job.afterId)
+    if (!found) {
+      // Not on this page. Either Forge has not written the run down yet, which
+      // is ordinary in the first second or two, or it is further along a list
+      // that has no sort to bring it to the front. So walk — through
+      // `_pollCommand`, which is the one place that charges the budget and
+      // knows about the hold — and only so far.
+      var next = Model.nextCursor(envelope.body)
+      var page = Number(_commandWatch.findPage || 0) + 1
+      if (next !== "" && page < recipeFindPages) {
+        _commandWatch = _commandCopy({ findCursor: next, findPage: page })
+        commandRunUpdated(job.requestKey, true, true, "", "looking", "", "")
+        _pollCommand()
+        return
+      }
+      // Out of pages, or out of list. The next look starts over from the
+      // first page rather than from where this one stopped.
+      _commandWatch = _commandCopy({ findCursor: "", findPage: 0 })
+      commandRunUpdated(job.requestKey, true, true, "", "queued", "", "")
+      _scheduleCommandPoll()
+      return
+    }
+    // Kept for the next run of this recipe on this server, which is the one
+    // thing that could be mistaken for this one. See `_lastRecipeRun`.
+    _lastRecipeRun = { run: _commandWatch.run, id: Number(found.id) }
+    // The walk is over — every look from here addresses the id — so the cursor
+    // goes back to nothing rather than being left pointing mid-list.
+    _commandWatch = _commandCopy({ commandId: found.id, findCursor: "", findPage: 0 })
+    _afterRecipeState(job, found.attributes)
+  }
+
+  function _onRecipeShow(job, text) {
+    var envelope = _commandAnswer(job, text)
+    if (!envelope) return
+
+    var data = envelope.body ? envelope.body.data : null
+    _afterRecipeState(job, data ? data.attributes : null)
+  }
+
+  // Where both recipe looks land. The command's equivalent is deliberately
+  // silent when the run turns terminal, because the output is still a request
+  // away and a finished pane with no lines reads as "printed nothing". Here it
+  // is not: a recipe log carries its own `output`, so the state that ends the
+  // run and the text that fills the pane arrive together, and this is the
+  // landing that ends the watch.
+  function _afterRecipeState(job, attributes) {
+    var state = Model.recipeRunStateFrom(attributes)
+    // The watch's id rather than the job's: a run recognised as *already*
+    // finished lands here from the find, whose job was sent before there was
+    // an id to carry. It names the file `w` writes, so an empty one is a file
+    // named after nothing.
+    var logId = String(_commandWatch.commandId || "")
+    if (state.running) {
+      commandRunUpdated(job.requestKey, true, true, logId, state.header, "", "")
+      _scheduleCommandPoll()
+      return
+    }
+    // A recipe that printed nothing is a real answer — the empty string is
+    // what lets the pane say so — and a null `output` is Forge saying it has
+    // none to give, which for a run that failed before it started is the truth.
+    var output = attributes ? attributes.output : null
+    _commandWatch = null
+    commandTimer.stop()
+    commandRunUpdated(job.requestKey, true, false, logId, state.header,
+                      typeof output === "string" ? output : "", "")
   }
 
   // ---------------------------------------------------------------- actions
@@ -2026,6 +2281,9 @@ Item {
         else if (job.kind === "events") root._onEvents(job, text)
         else if (job.kind === "eventOutput") root._onEventOutput(job, text)
         else if (job.kind === "siteLog") root._onSiteLog(job, text)
+        else if (job.kind === "recipes") root._onRecipes(job, text)
+        else if (job.kind === "recipeFind") root._onRecipeFind(job, text)
+        else if (job.kind === "recipeShow") root._onRecipeShow(job, text)
         else root._onSites(job, text)
       }
       root._pump()

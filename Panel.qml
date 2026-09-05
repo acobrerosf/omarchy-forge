@@ -58,6 +58,15 @@ Panel {
   // rather than at each of the places that has to know.
   readonly property bool paneRoute: routeKind === "log" || routeKind === "commandOutput"
     || routeKind === "eventOutput" || routeKind === "siteLog"
+    || routeKind === "recipeOutput"
+
+  // The two panes that follow a *run* rather than read a document. They share
+  // the state below and every binding that reads it, because there is one watch
+  // for the session and only one pane can be open on it — what tells them apart
+  // is the route kind, the request key's shape and the words. Drawn once here
+  // for `paneRoute`'s reason.
+  readonly property bool runPane: routeKind === "commandOutput"
+    || routeKind === "recipeOutput"
 
   // The log this panel asked for, and what came back. Keyed the same way the
   // service keys its answer, so two screens with two logs open don't cross.
@@ -90,6 +99,24 @@ Panel {
     if (routeKind !== "eventOutput" || !route) return null
     for (var i = 0; i < events.length; i++)
       if (events[i].id === String(route.eventId)) return events[i]
+    return null
+  }
+
+  // The organization's recipes, and the run one of them turns into. The list is
+  // the feed's shape in every way that matters — a page the reader asks for, a
+  // route that stays alive under the pane pushed over it, and so cleared by the
+  // kind `popView` popped rather than unconditionally. The run itself has no
+  // state here: it rides the command pane's, below.
+  property string recipesRequestKey: ""
+  property var recipes: []
+  property string recipesCursor: ""
+  property string recipesError: ""
+  property bool recipesLoading: false
+  // The recipe the output pane is about, looked up in the list under it.
+  readonly property var routeRecipe: {
+    if (routeKind !== "recipeOutput" || !route) return null
+    for (var i = 0; i < recipes.length; i++)
+      if (recipes[i].id === String(route.recipeId)) return recipes[i]
     return null
   }
 
@@ -272,6 +299,7 @@ Panel {
     }
     if (routeKind === "site" || routeKind === "server") return actionRows
     if (routeKind === "events") return eventRows
+    if (routeKind === "recipes") return recipeRows
 
     var out = []
     for (var o = 0; o < organizations.length; o++) {
@@ -356,6 +384,35 @@ Panel {
     return out
   }
 
+  // The recipe list's rows, on the feed's terms — one per recipe, a last row
+  // for the next page — with one difference that matters: every row here is a
+  // *write*. Each carries the action that would send it, built against the
+  // server the view was opened from, so arming, the confirm line and the
+  // refusal all go through the machinery the other writes already use.
+  //
+  // The arm key is the row's own and carries no `armIntent`: neither the path
+  // nor the body depends on live state, so a refresh landing inside the arm
+  // window rebuilds a row that means exactly what it meant. A recipe deleted
+  // under the arm loses its row instead, which `confirmArmed` reports.
+  readonly property var recipeRows: {
+    var out = []
+    if (routeKind !== "recipes") return out
+    var prefix = route.org + "/" + route.serverId + "/recipe/"
+    for (var i = 0; i < recipes.length; i++)
+      out.push({ kind: "recipe", org: route.org, serverId: route.serverId,
+                 recipeId: recipes[i].id, recipe: recipes[i],
+                 action: Model.recipeRunAction(route.org, routeServer, recipes[i]),
+                 armKey: prefix + recipes[i].id,
+                 key: prefix + recipes[i].id })
+    if (recipesCursor !== "")
+      out.push({ kind: "action", org: route.org, serverId: route.serverId, siteId: "",
+                 action: { id: "recipes-more", hint: "",
+                           label: recipesLoading ? "Loading more recipes…" : "More recipes…",
+                           available: true, reason: "" },
+                 armKey: "", key: prefix + "more" })
+    return out
+  }
+
   // The row the view was opened from rides the view, so backing out lands on
   // it rather than on the top of whatever list is underneath — which for a
   // feed of thirty events read one at a time is the difference between
@@ -390,6 +447,10 @@ Panel {
     clearCommand()
     clearEventOutput()
     if (popped.kind === "events") clearEvents()
+    // The recipe list is the feed's situation exactly: a run's output is
+    // pushed over it, and backing out of that output has to land on the list
+    // it was chosen from.
+    if (popped.kind === "recipes") clearRecipes()
     return true
   }
 
@@ -460,6 +521,9 @@ Panel {
     if (row.kind === "action")
       return Model.rowView(row, { action: row.action, armKey: row.armKey })
     if (row.kind === "event") return Model.rowView(row, { event: row.event })
+    if (row.kind === "recipe")
+      return Model.rowView(row, { recipe: row.recipe, action: row.action,
+                                  armKey: row.armKey })
     var isOrg = row.kind === "org"
     return Model.rowView(row, {
       server: isOrg ? null : serverById(row.org, row.serverId),
@@ -524,7 +588,10 @@ Panel {
       if (opening && forge) forge.fetchServerSites(row.org, row.serverId)
       return
     }
-    if (row.kind === "action") { runAction(row); return }
+    // A recipe row carries an action like an action row does, so it takes the
+    // same door — which is also what puts it behind `runAction`'s availability
+    // check when the server is in no state to run one.
+    if (row.kind === "action" || row.kind === "recipe") { runAction(row); return }
     if (row.kind === "event") { openEventOutput(row); return }
     if (!siteFor(row)) { say("That site is no longer listed"); return }
     pushView({ kind: "site", org: row.org, serverId: row.serverId, siteId: row.siteId })
@@ -627,6 +694,16 @@ Panel {
     return parts.join(" · ")
   }
 
+  // The same three facts for a recipe: who it runs as, and the server it is
+  // running on — which the pane's own hero is the only place that says.
+  function recipeMeta(recipe) {
+    if (!recipe) return ""
+    var parts = []
+    if (recipe.user) parts.push("as " + recipe.user)
+    if (routeServer) parts.push(routeServer.name)
+    return parts.join(" · ")
+  }
+
   // The badge follows whatever the hero is about, so in a site view it reports
   // that site rather than the health of everything being watched.
   readonly property string heroTone: {
@@ -635,12 +712,14 @@ Panel {
       return tone === "bad" ? "bad" : tone === "busy" ? "busy"
         : tone === "warn" ? "maintenance" : "none"
     }
-    if (routeKind === "server" || routeKind === "events") {
+    if (routeKind === "server" || routeKind === "events"
+        || routeKind === "recipes") {
       var serverTone = routeServer ? Model.serverTone(routeServer.state) : "idle"
       return serverTone === "bad" ? "bad" : serverTone === "busy" ? "busy" : "none"
     }
     // An event has no status for a badge to report — see `Model.eventsFrom`.
-    if (routeKind === "eventOutput") return "none"
+    // A recipe run has one, but it is the pane's header that says it.
+    if (routeKind === "eventOutput" || routeKind === "recipeOutput") return "none"
     return health === "bad" ? "bad"
       : health === "busy" ? "busy"
       : health === "maintenance" ? "maintenance"
@@ -660,8 +739,7 @@ Panel {
   readonly property string hintText: {
     if (routeKind === "log")
       return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [h] back"
-    if (routeKind === "commandOutput" || routeKind === "eventOutput"
-        || routeKind === "siteLog")
+    if (runPane || routeKind === "eventOutput" || routeKind === "siteLog")
       return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [r] look again · [h] back"
     if (routeKind === "events")
       return "[enter] output · [r] refresh · [h] back"
@@ -673,6 +751,12 @@ Panel {
         : armedKey !== "" ? "[Y] run · [enter] edit again · [h] back"
         : "[enter] arm · [h] back"
     var row = cursorActive ? currentRow() : null
+    // Every row here sends, so the confirm key is the line — except the last
+    // one, which only fetches the next page.
+    if (routeKind === "recipes")
+      return row && row.kind === "recipe"
+        ? "[enter] arm · [Y] run · [h] back"
+        : "[enter] open · [r] refresh · [h] back"
     if (routeKind === "site" || routeKind === "server") {
       // The confirm key is worth naming on the one row that wants it, and
       // nowhere else — on `Restart nginx` it would only be a puzzle.
@@ -728,6 +812,9 @@ Panel {
     case "log": openLog(); break
     case "events": openServerEvents(); break
     case "events-more": fetchEvents(eventsCursor); break
+    case "recipes": openRecipes(); break
+    case "recipes-more": fetchRecipes(recipesCursor); break
+    case "recipe-run": runWriteAction(row); break
     case "open": openCurrent(); break
     case "forge": openCurrentInForge(); break
     case "ssh": copyCurrentSsh(); break
@@ -827,6 +914,26 @@ Panel {
       commandRunning = true
       return
     }
+    // A recipe run is the command's situation again: a write whose answer is
+    // worth waiting for, so it goes out through its own door and the pane that
+    // follows it opens in `onActionFinished`, where the 202 lands.
+    if (String(row.action.id) === "recipe-run") {
+      var runKey = forge.runRecipe(row.org, row.serverId, row.action, row.armKey)
+      // Nothing was sent, and the refusal has already been said on the row.
+      // The list is left exactly as it was.
+      if (runKey === "") return
+      // Set before the answer can arrive, for the command's reason: the service
+      // says "queued" the moment the 202 lands, and an update this screen
+      // cannot recognise is one it would throw away. The run rides the command
+      // pane's state — one watch, one pane, one set of properties.
+      commandRequestKey = runKey
+      commandLines = []
+      commandError = ""
+      commandHeader = ""
+      commandId = ""
+      commandRunning = true
+      return
+    }
     forge.sendAction(row.org, row.serverId, row.action, row.armKey)
   }
 
@@ -906,6 +1013,14 @@ Panel {
     eventsLoading = false
   }
 
+  function clearRecipes() {
+    recipesRequestKey = ""
+    recipes = []
+    recipesCursor = ""
+    recipesError = ""
+    recipesLoading = false
+  }
+
   function clearEventOutput() {
     eventOutputRequestKey = ""
     saveRequestedPath = ""
@@ -943,6 +1058,50 @@ Panel {
     forge.fetchServerEvents(route.org, route.serverId, cursor)
   }
 
+  // The same refusals the feed makes, and for the same reason: a view pushed
+  // over a pane or the prompt would be cleared on the way back out by the pop
+  // that clears those — taking the pane's text or the typed command with it.
+  //
+  // The recipes are the organization's, but the *run* is this server's, so the
+  // route carries the server the view was opened from and every row is built
+  // against it.
+  function openRecipes() {
+    if (paneRoute || routeKind === "recipes" || routeKind === "command") return
+    var server = currentServer()
+    if (!server || !forge) return
+    var org = currentOrg()
+    clearRecipes()
+    pushView({ kind: "recipes", org: org, serverId: server.id })
+    fetchRecipes("")
+  }
+
+  function fetchRecipes(cursor) {
+    if (!forge || routeKind !== "recipes") return
+    recipesRequestKey = forge.recipesRequestKey(route.org)
+    recipesLoading = true
+    if (cursor === "") { recipesError = ""; recipesCursor = "" }
+    forge.fetchRecipes(route.org, cursor)
+  }
+
+  // The list has sent, so the pane that follows the run is pushed *over* it —
+  // not in place of it, the way the command prompt is replaced. A prompt that
+  // has run is an invitation to run it twice; a recipe list is not, and backing
+  // out onto it lands on the recipe that was run.
+  //
+  // The row is found by the key that was sent rather than by the cursor: the
+  // send and the answer are a round trip, and nothing stops the cursor moving
+  // in between.
+  function openRecipeOutput(armKey) {
+    if (routeKind !== "recipes") return
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
+      if (row.kind !== "recipe" || row.armKey !== armKey) continue
+      pushView({ kind: "recipeOutput", org: row.org, serverId: row.serverId,
+                 recipeId: row.recipeId })
+      return
+    }
+  }
+
   function openEventOutput(row) {
     if (!row || !forge) return
     clearEventOutput()
@@ -962,20 +1121,23 @@ Panel {
 
   // ------------------------------------------------------------------ panes
 
-  // Which pane's document is on screen, decided once. Three panes share one
-  // `ForgeLogView`, and a three-way ternary in each of its bindings is the
-  // wrong shape for a decision that has to come out the same every time.
-  readonly property var paneLines: routeKind === "commandOutput" ? commandLines
+  // Which pane's document is on screen, decided once. Five routes share one
+  // `ForgeLogView`, and a five-way ternary in each of its bindings is the
+  // wrong shape for a decision that has to come out the same every time —
+  // which is also why the two that follow a run are folded into `runPane`
+  // first.
+  readonly property var paneLines: runPane ? commandLines
     : routeKind === "eventOutput" ? eventOutputLines : logLines
-  readonly property bool paneLoading: routeKind === "commandOutput" ? commandRunning
+  readonly property bool paneLoading: runPane ? commandRunning
     : routeKind === "eventOutput" ? eventOutputLoading : logLoading
-  readonly property string paneError: routeKind === "commandOutput" ? commandError
+  readonly property string paneError: runPane ? commandError
     : routeKind === "eventOutput" ? eventOutputError : logError
-  readonly property string paneLoadingText: routeKind === "commandOutput"
+  readonly property string paneLoadingText: runPane
     ? (commandHeader === "" ? "queued…" : commandHeader + "…")
     : routeKind === "eventOutput" ? "Fetching the event's output…" : "Fetching the log…"
   readonly property string paneEmptyText: routeKind === "commandOutput"
     ? "This command printed nothing."
+    : routeKind === "recipeOutput" ? "This recipe printed nothing."
     : routeKind === "eventOutput" ? "This event printed nothing."
     : routeKind === "siteLog" ? "This log is empty."
     : "This deployment printed nothing."
@@ -999,6 +1161,9 @@ Panel {
     saveRequestedPath = forge.downloadDir() + "/"
       + (routeKind === "commandOutput"
          ? Model.commandFileName(name, commandId)
+         : routeKind === "recipeOutput"
+           ? Model.recipeFileName(routeServer ? routeServer.name : "",
+                                  routeRecipe ? routeRecipe.name : "", commandId)
          : routeKind === "eventOutput"
            ? Model.eventFileName(routeServer ? routeServer.name : "", route.eventId)
            : routeKind === "siteLog"
@@ -1190,7 +1355,7 @@ Panel {
     // it is stale by then anyway.
     else {
       disarm(); cursorActive = false; navStack = []
-      clearLog(); clearCommand(); clearEventOutput(); clearEvents()
+      clearLog(); clearCommand(); clearEventOutput(); clearEvents(); clearRecipes()
     }
   }
 
@@ -1228,10 +1393,14 @@ Panel {
       if (root.actionRequestedKey !== key) return
       root.actionRequestedKey = ""
       root.say(message)
+      // The list sent, so it gains the pane that follows the run — over it
+      // rather than in place of it, which is `openRecipeOutput`'s to explain.
+      if (ok && root.routeKind === "recipes") { root.openRecipeOutput(key); return }
       // The send was accepted, so the prompt has done its job and the pane that
       // follows the run takes its place. A refusal — no scope, rate limited —
       // leaves the prompt standing with the text still in it, which is what
-      // makes trying again after fixing the token one keypress.
+      // makes trying again after fixing the token one keypress. A refused
+      // recipe leaves its list standing for the same reason.
       if (!ok || root.routeKind !== "command") return
       root.openCommandOutput()
     }
@@ -1297,6 +1466,23 @@ Panel {
       root.eventsError = ""
       root.events = cursor === "" ? events : root.events.concat(events)
       root.eventsCursor = String(nextCursor || "")
+    }
+
+    // The feed's handler again. A failed *first* page is the view's error,
+    // because there is nothing else on screen to say it; a failed continuation
+    // flashes instead, because the rows already there are still true.
+    function onRecipesFetched(requestKey, ok, recipes, cursor, nextCursor, message) {
+      if (root.recipesRequestKey !== requestKey) return
+      root.recipesLoading = false
+      if (!ok) {
+        var why = String(message || "Could not read the recipes")
+        if (cursor === "" || root.recipes.length === 0) root.recipesError = why
+        else root.say(why)
+        return
+      }
+      root.recipesError = ""
+      root.recipes = cursor === "" ? recipes : root.recipes.concat(recipes)
+      root.recipesCursor = String(nextCursor || "")
     }
 
     function onEventOutputFetched(requestKey, ok, text, message) {
@@ -1487,10 +1673,12 @@ Panel {
         // everything being watched: the one thing on screen is the one thing
         // worth re-reading, and the ladder that was following it has stopped.
         case "r":
-          if (root.routeKind === "commandOutput") root.refreshCommandRun()
+          // Both run panes take the same look: one watch, one key.
+          if (root.runPane) root.refreshCommandRun()
           else if (root.routeKind === "eventOutput") root.refreshEventOutput()
           else if (root.routeKind === "siteLog") root.refreshSiteLog()
           else if (root.routeKind === "events") root.fetchEvents("")
+          else if (root.routeKind === "recipes") root.fetchRecipes("")
           else root.refresh()
           break
         case "e": root.openServerEvents(); break
@@ -1560,6 +1748,7 @@ Panel {
               // it — and not the server, which the hero right below already
               // names.
               var aboutServer = root.routeKind === "server" || root.routeKind === "events"
+                || root.routeKind === "recipes"
               if (root.route && (root.showOrgHeaders || aboutServer))
                 parts.push(root.orgLabel(root.route.org))
               var server = aboutServer ? null
@@ -1589,11 +1778,17 @@ Panel {
             // The feed is about the server, so it wears the server's hero;
             // an event's output is about that event, and gets its three
             // facts — what, for whom, when — in the same three slots.
+            // A recipe run's pane is about the recipe, and about the server it
+            // is running on — which is the one thing an event's output does not
+            // have to say, because there the server is the whole subject.
             title: root.routeSite
               ? Model.plainText(root.routeSite.name)
               : root.routeKind === "eventOutput"
                 ? Model.plainText(root.routeEvent ? root.routeEvent.description : "Event")
+              : root.routeKind === "recipeOutput"
+                ? Model.plainText(root.routeRecipe ? root.routeRecipe.name : "Recipe")
               : root.routeKind === "server" || root.routeKind === "events"
+                || root.routeKind === "recipes"
                 ? Model.plainText(root.routeServer ? root.routeServer.name : "Server")
                 : root.organizations.length === 1
                   ? Model.plainText(root.orgLabel(root.organizations[0])) : "Forge"
@@ -1601,7 +1796,10 @@ Panel {
               ? Model.plainText(root.siteMeta(root.routeSite))
               : root.routeKind === "eventOutput"
                 ? Model.plainText(root.eventMeta(root.routeEvent))
+              : root.routeKind === "recipeOutput"
+                ? Model.plainText(root.recipeMeta(root.routeRecipe))
               : root.routeKind === "server" || root.routeKind === "events"
+                || root.routeKind === "recipes"
                 ? Model.plainText(root.routeServer ? Model.serverMeta(root.routeServer) : "")
                 : Model.plainText(root.summary)
             detail: root.routeSite
@@ -1610,6 +1808,7 @@ Panel {
                 ? (root.routeEvent && root.routeEvent.createdAt
                    ? Model.relativeTime(root.routeEvent.createdAt, root.nowMs) : "")
               : root.routeKind === "server" || root.routeKind === "events"
+                || root.routeKind === "recipes" || root.routeKind === "recipeOutput"
                 ? root.serverDetailLine(root.routeServer)
                 : root.refreshing ? "refreshing…"
                                   : Model.relativeMs(root.lastRefreshMs, root.nowMs)
@@ -1732,6 +1931,7 @@ Panel {
               visible: root.routeKind !== "command"
               text: root.routeKind === "site" || root.routeKind === "server" ? "ACTIONS"
                 : root.routeKind === "events" ? "EVENTS"
+                : root.routeKind === "recipes" ? "RECIPES"
                 : root.showOrgHeaders ? "ORGANIZATIONS" : "SERVERS"
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -1758,7 +1958,9 @@ Panel {
                 tone: rowItem.view.tone
                 depth: rowItem.view.depth
                 showChevron: rowItem.view.showChevron
-                showDot: rowItem.modelData.kind !== "action" && rowItem.modelData.kind !== "event"
+                showDot: rowItem.modelData.kind !== "action"
+                  && rowItem.modelData.kind !== "event"
+                  && rowItem.modelData.kind !== "recipe"
                 showActions: rowItem.modelData.kind === "server"
                 expanded: rowItem.modelData.kind === "org"
                   ? root.isOrgExpanded(rowItem.modelData.org)
@@ -1879,10 +2081,8 @@ Panel {
             error: root.paneError
             loadingText: root.paneLoadingText
             emptyText: root.paneEmptyText
-            header: root.routeKind === "commandOutput" && !root.commandRunning
-              ? root.commandHeader : ""
-            headerBad: root.routeKind === "commandOutput"
-              && Model.commandHeaderBad(root.commandHeader)
+            header: root.runPane && !root.commandRunning ? root.commandHeader : ""
+            headerBad: root.runPane && Model.commandHeaderBad(root.commandHeader)
             foreground: root.foreground
             badColor: root.badColor
             fontFamily: root.fontFamily
@@ -1920,6 +2120,24 @@ Panel {
             text: root.eventsLoading ? "Fetching events…"
               : root.eventsError !== "" ? root.eventsError
               : "No events recorded for this server."
+          }
+
+          // The same three, one route over. "None" is a real answer here too:
+          // recipes are something an organization has to have written, and
+          // plenty never do — which is the whole reason this feature sits
+          // where it does rather than in the bar.
+          Text {
+            width: parent.width
+            visible: root.routeKind === "recipes" && root.rows.length === 0
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            color: root.recipesError !== "" ? root.badColor : root.foreground
+            opacity: root.recipesError !== "" ? 0.9 : 0.55
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            text: root.recipesLoading ? "Fetching recipes…"
+              : root.recipesError !== "" ? root.recipesError
+              : "No recipes in this organization."
           }
         }
       }
@@ -1967,7 +2185,8 @@ Panel {
           width: parent.width
           // The feed keeps its footer while empty: `[h] back` is the one key
           // that matters on a list that is still loading or came back refused.
-          visible: root.rows.length > 0 || root.paneRoute || root.routeKind === "events"
+          visible: root.rows.length > 0 || root.paneRoute
+            || root.routeKind === "events" || root.routeKind === "recipes"
           wrapMode: Text.WordWrap
           textFormat: Text.PlainText
           color: root.foreground
