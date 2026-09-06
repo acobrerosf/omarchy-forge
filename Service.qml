@@ -147,16 +147,17 @@ Item {
 
   // ------------------------------------------------------- account state
 
-  // Whether a token is there and whether Forge accepts it are facts about an
-  // account, not about an organization, so three orgs behind one bad token
-  // report one problem. See ARCHITECTURE.md.
+  // Whether there is a token is a fact about an account, not about an
+  // organization, so three orgs behind one missing token report one problem.
+  // It is the *only* credential fact kept here: what Forge said about a token
+  // it rejected is reported per organization, because a 403 on one
+  // organization says nothing about the next. See ARCHITECTURE.md.
   //
-  // name → {hasToken: bool|undefined, rateRemaining: int, error: string}
+  // name → {hasToken: bool|undefined}
   property var accountStates: ({})
 
   function accountState(name) {
-    return accountStates[String(name)]
-      || ({ hasToken: undefined, rateRemaining: -1, error: "" })
+    return accountStates[String(name)] || ({ hasToken: undefined })
   }
 
   function accountLabel(name) {
@@ -293,9 +294,8 @@ Item {
       if (state.account !== account) {
         state = _shallowCopy(state)
         state.account = account
-        // The old account's verdict says nothing about the new one — and
-        // neither does a site walk started under its credential.
-        state.accountError = ""
+        // The verdict follows the account by construction now, but a site walk
+        // started under the old credential does not.
         state.nextDueMs = 0
         state.siteCursor = ""
         state.sweepSites = []
@@ -360,48 +360,65 @@ Item {
     return null
   }
 
-  function allSites(org) {
-    var out = []
-    var state = orgs[String(org)]
-    if (!state) return out
-    for (var i = 0; i < state.servers.length; i++) {
-      var list = state.sitesByServer[state.servers[i].id]
-      if (list) for (var j = 0; j < list.length; j++) out.push(list[j])
-    }
-    return out
-  }
-
   function serverCount(org) {
     var state = orgs[String(org)]
     return state ? state.servers.length : 0
   }
 
-  // Aggregate health, in the order the bar cares about it: a broken thing
-  // outranks a busy thing, which outranks a quiet one.
+  // The organization's credential verdict, derived rather than stored. One
+  // writer — `_applyEnvelope`, on the account — and one join key, `state.account`,
+  // which only `_reconcile` writes. Kept as a sentence rather than a flag
+  // because every reader wants the words: the panel prints it, `summaryFor`
+  // stands in for the server count with it, and `healthFor` only asks whether
+  // it is empty.
+  function accountErrorFor(org) {
+    var state = orgs[String(org)]
+    if (!state) return ""
+    return accountState(state.account).hasToken === false
+      ? "No token for " + accountLabel(state.account) : ""
+  }
+
+  // Aggregate health for one organization, accumulated through the same rank
+  // table the bar folds *across* organizations with. One precedence, one place:
+  // written as early returns here and as a table there, the two disagreed at
+  // the top — inside an organization `setup` and `error` outranked `bad`, and
+  // across them `bad` outranked both, so the same facts drew a different badge
+  // depending only on how they happened to be split between organizations.
   function healthFor(org) {
     var key = String(org)
     if (key === "") return "setup"
     var state = orgs[key]
     if (!state) return "setup"
-    if (state.accountError !== "") return "setup"
-    if (state.lastError !== "") return "error"
+
+    var worst = "ok"
+    if (accountErrorFor(key) !== "") worst = _worseHealth(worst, "setup")
+    if (state.lastError !== "") worst = _worseHealth(worst, "error")
+
+    // `bad` is the top of the table, so the first one found is the answer and
+    // there is nothing left to accumulate.
     for (var i = 0; i < state.servers.length; i++)
       if (Model.serverTone(state.servers[i].state) === "bad") return "bad"
-    // Both accumulate rather than returning, for the reason `busy` already
-    // did: a site in maintenance three rows up must not hide a failing deploy
-    // further down the list from the bar icon.
-    var busy = false
-    var maintenance = false
-    var all = allSites(key)
-    for (var j = 0; j < all.length; j++) {
-      var tone = Model.siteTone(all[j])
-      if (tone === "bad") return "bad"
-      if (tone === "busy") busy = true
-      if (tone === "warn") maintenance = true
+
+    // Walked per server rather than through a flattened list: nothing else
+    // wanted one, and the sites the panel draws are exactly these.
+    for (var id in state.sitesByServer) {
+      var sites = state.sitesByServer[id]
+      for (var j = 0; j < sites.length; j++) {
+        var tone = Model.siteTone(sites[j])
+        if (tone === "bad") return "bad"
+        // A site in maintenance three rows up must not hide a running deploy
+        // further down, which is what the fold gives for free.
+        if (tone === "busy") worst = _worseHealth(worst, "busy")
+        else if (tone === "warn") worst = _worseHealth(worst, "maintenance")
+      }
     }
-    return busy ? "busy" : maintenance ? "maintenance" : "ok"
+    return worst
   }
 
+  // The precedence, and the only one: inside an organization and across them.
+  // `error` and `setup` sit *below* `bad` deliberately — a credential problem
+  // or a failed request is a reason to look, a server or a deploy that has
+  // actually broken is a reason to act, and the icon judges what it can see.
   function _healthRank(health) {
     switch (health) {
     case "bad": return 5
@@ -414,16 +431,18 @@ Item {
     return 0
   }
 
+  function _worseHealth(worst, health) {
+    return _healthRank(health) > _healthRank(worst) ? health : worst
+  }
+
   // One bar icon stands for every organization the widget shows, so the worst
   // thing among them is what it has to report.
   function healthForList(list) {
     if (needsSetup) return "setup"
     if (!list || list.length === 0) return "setup"
     var worst = "ok"
-    for (var i = 0; i < list.length; i++) {
-      var health = healthFor(list[i])
-      if (_healthRank(health) > _healthRank(worst)) worst = health
-    }
+    for (var i = 0; i < list.length; i++)
+      worst = _worseHealth(worst, healthFor(list[i]))
     return worst
   }
 
@@ -432,11 +451,12 @@ Item {
     if (key === "") return "Not set up"
     var state = orgs[key]
     if (!state) return "Loading…"
-    if (state.accountError !== "") return state.accountError
+    var accountError = accountErrorFor(key)
+    if (accountError !== "") return accountError
     if (state.servers.length === 0) return state.refreshing ? "Loading…" : "No servers"
     var text = Model.pluralize(state.servers.length, "server")
     var config = _config[key]
-    var count = allSites(key).length
+    var count = Model.countSites(state.sitesByServer)
     if (config && config.watchDeployments && count > 0)
       text += " · " + Model.pluralize(count, "site")
     return text
@@ -456,7 +476,7 @@ Item {
       if (!state) { loading = true; continue }
       if (state.refreshing && state.servers.length === 0) loading = true
       servers += state.servers.length
-      sites += allSites(list[i]).length
+      sites += Model.countSites(state.sitesByServer)
       var config = _config[list[i]]
       if (config && config.watchDeployments) watchingSites = true
     }
@@ -658,7 +678,7 @@ Item {
       return
     }
 
-    job.account = state.account || accountForOrg(job.org)
+    job.account = state.account
     var held = budget.blockedMs(job.account)
     if (held > 0) {
       _readRefused(job, "Rate limited — try again in " + Math.ceil(held / 1000) + "s")
@@ -867,10 +887,10 @@ Item {
     // click, and the short look-again after a deploy. `nextDueMs` alone could
     // not hold them: `_reconcile` zeroes it whenever the state file changes.
     // The 429 already left its word in `lastError`, so this says nothing new.
-    if (budget.blockedMs(state.account || accountForOrg(key)) > 0) return
+    if (budget.blockedMs(state.account) > 0) return
     _patch(key, { refreshing: true, note: "" })
-    queue.push({ org: key, account: state.account || accountForOrg(key),
-                 kind: "servers", page: 1, rows: [] })
+    queue.push({ org: key, account: state.account, kind: "servers",
+                 page: 1, rows: [] })
   }
 
   function refreshList(list) {
@@ -895,26 +915,27 @@ Item {
   function _applyEnvelope(org, account, envelope, quiet) {
     tokenKnown = true
 
-    var changes = ({})
-    if (envelope.rateRemaining !== null && envelope.rateRemaining !== undefined)
-      changes.rateRemaining = Number(envelope.rateRemaining)
+    // The account's whole verdict, written once for every kind of answer.
+    // Getting an answer at all — even a bad one — settles the question of
+    // whether there is a token, and a stale `false` would otherwise keep
+    // saying "no token" long after the token was restored, for as long as
+    // anything else kept going wrong. What every organization behind the
+    // account shows for it is derived from here by `accountErrorFor`, never
+    // copied, which is what stops a `quiet` request from setting one without
+    // the other.
+    _patchAccount(account, { hasToken: !_isMissingToken(envelope) })
 
     if (envelope.ok) {
-      changes.hasToken = true
-      changes.error = ""
-      _patchAccount(account, changes)
-      if (org && !quiet) _patch(org, { lastError: "", accountError: "" })
+      if (org && !quiet) _patch(org, { lastError: "" })
       return true
     }
 
     if (_isMissingToken(envelope)) {
-      changes.hasToken = false
-      changes.error = ""
-      _patchAccount(account, changes)
+      // The request never left the machine, so the minute is owed it back.
+      // Nothing is written to the organization: the missing-token line it
+      // shows is the account's, derived.
       budget.refund(budget.bucketFor(account))
-      if (org && !quiet)
-        _patch(org, { lastError: "",
-                      accountError: "No token for " + accountLabel(account) })
+      if (org && !quiet) _patch(org, { lastError: "" })
       return false
     }
 
@@ -923,24 +944,16 @@ Item {
     // told no. This is the choke point every response passes through, so one
     // branch covers the server list, the sweep and a deploy alike.
     if (envelope.status === 429) {
-      changes.hasToken = true
-      _patchAccount(account, changes)
       _holdAccount(account, envelope)
       return false
     }
 
-    // A rejected token is the account's problem too, and worth saying once
-    // rather than once per organization behind it.
-    if (envelope.status === 401 || envelope.status === 403) {
-      changes.hasToken = true
-      changes.error = Model.envelopeError(envelope)
-    }
-    _patchAccount(account, changes)
-    // Getting an answer at all — even a bad one — settles the question of
-    // whether there is a token. Leaving a stale "no token" in place would
-    // outrank the real error and keep saying it long after the token was
-    // restored, for as long as anything else kept going wrong.
-    if (org && !quiet) _patch(org, { lastError: Model.envelopeError(envelope), accountError: "" })
+    // A rejected token is reported per organization, not per account. Forge
+    // scopes membership and permissions to an organization, so a 401 or a 403
+    // on one says nothing about the next — and an account-level verdict blanks
+    // the server list the bar icon judges, which is the same reason the 429
+    // above writes `lastError` rather than a credential fact.
+    if (org && !quiet) _patch(org, { lastError: Model.envelopeError(envelope) })
     return false
   }
 
@@ -974,13 +987,13 @@ Item {
     for (var org in _config) {
       var state = orgs[org]
       if (!state) continue
-      if (budget.bucketFor(state.account || accountForOrg(org)) !== bucket) continue
-      // `lastError`, not `accountError`: an account-level verdict blanks the
-      // server list further down, and the bar icon judges what it can see.
+      if (budget.bucketFor(state.account) !== bucket) continue
+      // The organization's error, not a credential fact: a "no token" verdict
+      // blanks the server list further down, and the bar icon judges what it
+      // can see.
       // The site walk starts over after the hold — its dropped continuation
       // was the only thing that could have advanced the cursor.
-      _patch(org, { lastError: message, accountError: "",
-                    siteCursor: "", sweepSites: [] })
+      _patch(org, { lastError: message, siteCursor: "", sweepSites: [] })
       if (state.refreshing) _finishRefresh(org)
     }
   }
@@ -991,7 +1004,7 @@ Item {
     if (!orgs[org]) return
 
     if (!_applyEnvelope(org, job.account, envelope)) {
-      if (orgs[org].accountError !== "")
+      if (accountErrorFor(org) !== "")
         // An account that can no longer see the servers can't vouch for a
         // half-walked rotation either, so that starts over with it.
         _patch(org, { servers: [], sitesByServer: ({}),
@@ -1029,7 +1042,7 @@ Item {
     // Nothing to group the answer under, so there is nothing to ask for.
     if (orgs[org].servers.length === 0) { _finishRefresh(org); return }
 
-    var account = orgs[org].account || accountForOrg(org)
+    var account = orgs[org].account
     if (budget.wouldExceed(account, 1)) {
       _addNote(org, "Deployment check skipped to stay inside the rate limit")
       _finishRefresh(org)
@@ -1083,8 +1096,7 @@ Item {
     if (more === "") {
       var grouped = Model.groupSitesByServer(swept, state.servers)
       _patch(job.org, { sitesByServer: grouped, siteCursor: "", sweepSites: [],
-                        lastStatus: _announce(job.org, sites, grouped, state, true),
-                        seeded: true })
+                        lastStatus: _announce(job.org, sites, grouped, state, true) })
       return
     }
 
@@ -1094,8 +1106,7 @@ Item {
     _patch(job.org, { sitesByServer: merged,
                       siteCursor: Model.nextCursor(envelope.body),
                       sweepSites: swept,
-                      lastStatus: _announce(job.org, sites, merged, state, false),
-                      seeded: true })
+                      lastStatus: _announce(job.org, sites, merged, state, false) })
     if (more === "budget")
       _addNote(job.org, "Site check paused to stay inside the rate limit — it resumes next refresh")
     else
@@ -1115,7 +1126,7 @@ Item {
     var config = _config[key]
     if (!config || !config.watchDeployments) return
 
-    var account = state.account || accountForOrg(key)
+    var account = state.account
     if (budget.blockedMs(account) > 0) return
     if (budget.wouldExceed(account, 1)) return
 
@@ -1157,8 +1168,7 @@ Item {
       // here at a list position the rotation has already passed would
       // otherwise vanish at the wrap and flap back a rotation later.
       sweepSites: Model.mergeSweepSites(state.sweepSites, sites),
-      lastStatus: _announce(job.org, sites, merged, state, false),
-      seeded: true
+      lastStatus: _announce(job.org, sites, merged, state, false)
     })
   }
 
@@ -1337,7 +1347,7 @@ Item {
     // A hold on the account outlives the configured interval: coming back
     // before the minute resets only spends another refusal. Every path that
     // ends a refresh goes through here, so none of them can undercut it.
-    var held = state ? budget.blockedMs(state.account || accountForOrg(org)) : 0
+    var held = state ? budget.blockedMs(state.account) : 0
     _patch(org, { refreshing: false, nextDueMs: now + Math.max(seconds * 1000, held) })
   }
 
@@ -1348,8 +1358,13 @@ Item {
   // word rather than losing it, and a key leaves the map only when `complete`
   // says the whole organization was seen. That retention is what lets a site
   // that briefly fell out of a window announce its next change exactly once
-  // instead of never. Seeding on the first sweep matters: without it, every
-  // already-failed site would announce itself the moment the shell starts.
+  // instead of never.
+  //
+  // It is also the seed: a site with no entry yet has an `undefined` previous
+  // status, and that is what keeps an already-failed site from announcing
+  // itself the moment the shell starts. The guard rests on this function being
+  // the only writer of `lastStatus` — nothing may fill it in ahead of the
+  // comparison below.
   function _announce(org, observed, published, state, complete) {
     var next
     if (complete) {
@@ -1369,7 +1384,7 @@ Item {
     }
 
     var notify = _config[org] ? _config[org].notifyDeployments : false
-    if (!state.seeded || !notify) return next
+    if (!notify) return next
     for (var k = 0; k < observed.length; k++) {
       var site = observed[k]
       // Dropped at grouping — a site the panel does not draw should not speak.
@@ -1449,7 +1464,10 @@ Item {
       actionFinished(job.key, false, "Still sending the last one")
       return false
     }
-    var account = (orgs[job.org] && orgs[job.org].account) || accountForOrg(job.org)
+    // The one site that still needs the fallback: a write can be sent for an
+    // organization that is not in `orgs` at all — a row pressed as the state
+    // file was being re-read — where there is no `state.account` to join on.
+    var account = orgs[job.org] ? orgs[job.org].account : accountForOrg(job.org)
     // Sending it anyway would only earn another refusal and push the hold out
     // further, so say when it can be pressed again rather than spending it.
     var held = budget.blockedMs(account)
@@ -1889,16 +1907,18 @@ Item {
       return
     }
 
-    // `commandId` is the id of the run being followed, whichever kind of run
-    // that is — a command's, or a recipe log's. The fields the other kind does
-    // not use ride along as `undefined`, which `_pathFor` never reaches.
+    // The job is an *address*, and nothing more: what the queue needs, what
+    // `_pathFor` builds a path from, what a drop site answers on. The evidence
+    // an answer is judged against — what was typed, when, the floor it must
+    // beat, the state the run ended in — stays on the watch, because every
+    // handler that reads it has already been through `_commandCurrent` and so
+    // is holding this very watch. `commandId` is the id of the run being
+    // followed, whichever kind that is. Fields the other kind does not use ride
+    // along as `undefined`, which `_pathFor` never reaches.
     queue.pushFront({ org: watch.org, account: watch.account, kind: kind,
                       serverId: watch.serverId, siteId: watch.siteId,
-                      recipeId: watch.recipeId, afterId: watch.afterId,
-                      cursor: watch.findCursor,
-                      commandId: watch.commandId, sent: watch.sent,
-                      sentAtMs: watch.sentAtMs, afterMs: watch.afterMs,
-                      header: watch.header, requestKey: key })
+                      recipeId: watch.recipeId, cursor: watch.findCursor,
+                      commandId: watch.commandId, requestKey: key })
   }
 
   function _scheduleCommandPoll() {
@@ -1925,6 +1945,13 @@ Item {
   // dropped job has to answer rather than vanish — the same rule the deploy
   // log's guards follow. `server:view` is all any of them wants, which is why
   // the 403 here reads differently from the one the send earns.
+  //
+  // The refusal path is the exception to `_pollCommand`'s rule. Everything
+  // downstream of a successful `_commandAnswer` reads its evidence off the
+  // watch; these say `job.commandId` instead, because a message about a request
+  // that failed should name the run that request was addressed to. The two drop
+  // sites — `_abandonJob` and `_holdAccount` — have the stronger reason: their
+  // watch may be null or another run's entirely.
   function _commandRefused(job, envelope) {
     var message = envelope.status === 403
       ? (Model.isRecipeRunJob(job)
@@ -1982,7 +2009,11 @@ Item {
     var envelope = _commandAnswer(job, text)
     if (!envelope) return
 
-    var found = Model.commandFrom(envelope.body, job.sent, job.sentAtMs, job.afterMs)
+    // The watch, not the job: `_commandAnswer` answered, so this is the run
+    // that was asked about. See `_pollCommand`.
+    var watch = _commandWatch
+    var found = Model.commandFrom(envelope.body, watch.sent, watch.sentAtMs,
+                                  watch.afterMs)
     if (!found) {
       // Forge has not written the run down yet. That is ordinary in the first
       // second or two, so it is another look rather than an error — and the
@@ -1993,7 +2024,7 @@ Item {
     }
     // Kept for the next run of the same command on this site, which is the one
     // thing that could be mistaken for this one. See `_lastRun`.
-    _lastRun = { site: _commandWatch.site, sent: job.sent, madeMs: found.madeMs }
+    _lastRun = { site: watch.site, sent: watch.sent, madeMs: found.madeMs }
     _commandWatch = _commandCopy({ commandId: found.id })
     _afterCommandState(job, found.attributes)
   }
@@ -2034,21 +2065,25 @@ Item {
     var envelope = _commandAnswer(job, text)
     if (!envelope) return
 
+    // Read out before the watch is cleared below: the state the run ended in
+    // was written there by `_afterCommandState`, a ladder step ago.
+    var watch = _commandWatch
+    var logId = String(watch.commandId || "")
+
     // An empty string is a real answer here — plenty of commands print
     // nothing — so only a missing field is a failure to report. The watch stays
     // for it: an answer this shape is worth asking about again, and `r` is how.
     var output = Model.resourceText(envelope.body, "output")
     if (output === null) {
-      commandRunUpdated(job.requestKey, false, false, String(job.commandId || ""),
-                        job.header, "", "Forge returned no output for this command")
+      commandRunUpdated(job.requestKey, false, false, logId, watch.header, "",
+                        "Forge returned no output for this command")
       return
     }
 
     // The run is over and this was the last thing wanted from it.
     _commandWatch = null
     commandTimer.stop()
-    commandRunUpdated(job.requestKey, true, false, String(job.commandId || ""),
-                      job.header, output, "")
+    commandRunUpdated(job.requestKey, true, false, logId, watch.header, output, "")
   }
 
   // The recipe's find. Same shape as the command's, different evidence — see
@@ -2059,8 +2094,9 @@ Item {
     var envelope = _commandAnswer(job, text)
     if (!envelope) return
 
-    var found = Model.recipeRunFrom(envelope.body, job.serverId, job.sentAtMs,
-                                    job.afterId)
+    var watch = _commandWatch
+    var found = Model.recipeRunFrom(envelope.body, job.serverId, watch.sentAtMs,
+                                    watch.afterId)
     if (!found) {
       // Not on this page. Either Forge has not written the run down yet, which
       // is ordinary in the first second or two, or it is further along a list
@@ -2068,7 +2104,7 @@ Item {
       // `_pollCommand`, which is the one place that charges the budget and
       // knows about the hold — and only so far.
       var next = Model.nextCursor(envelope.body)
-      var page = Number(_commandWatch.findPage || 0) + 1
+      var page = Number(watch.findPage || 0) + 1
       if (next !== "" && page < recipeFindPages) {
         _commandWatch = _commandCopy({ findCursor: next, findPage: page })
         commandRunUpdated(job.requestKey, true, true, "", "looking", "", "")
@@ -2084,7 +2120,7 @@ Item {
     }
     // Kept for the next run of this recipe on this server, which is the one
     // thing that could be mistaken for this one. See `_lastRecipeRun`.
-    _lastRecipeRun = { run: _commandWatch.run, id: Number(found.id) }
+    _lastRecipeRun = { run: watch.run, id: Number(found.id) }
     // The walk is over — every look from here addresses the id — so the cursor
     // goes back to nothing rather than being left pointing mid-list.
     _commandWatch = _commandCopy({ commandId: found.id, findCursor: "", findPage: 0 })
@@ -2106,10 +2142,10 @@ Item {
   // landing that ends the watch.
   function _afterRecipeState(job, attributes) {
     var state = Model.recipeRunStateFrom(attributes)
-    // The watch's id rather than the job's: a run recognised as *already*
-    // finished lands here from the find, whose job was sent before there was
-    // an id to carry. It names the file `w` writes, so an empty one is a file
-    // named after nothing.
+    // The watch's id, like every other piece of evidence here: a run recognised
+    // as *already* finished lands from the find, whose job was addressed before
+    // there was an id to carry. It names the file `w` writes, so a job-shaped
+    // one would be a file named after nothing.
     var logId = String(_commandWatch.commandId || "")
     if (state.running) {
       commandRunUpdated(job.requestKey, true, true, logId, state.header, "", "")

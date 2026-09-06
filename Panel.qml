@@ -197,6 +197,12 @@ Panel {
     return forge ? forge.stateFor(org) : Model.emptyState()
   }
 
+  // Derived in the service from the account behind the organization, so it is
+  // asked for rather than read off the state — see `Service.accountErrorFor`.
+  function accountErrorFor(org) {
+    return forge ? forge.accountErrorFor(org) : ""
+  }
+
   function sitesFor(org, serverId) {
     return forge ? forge.sitesFor(org, serverId) : []
   }
@@ -222,8 +228,9 @@ Panel {
     for (var i = 0; i < organizations.length; i++) {
       var org = organizations[i]
       var state = stateFor(org)
-      var isAccount = state.accountError !== ""
-      var text = isAccount ? state.accountError : state.lastError
+      var accountError = accountErrorFor(org)
+      var isAccount = accountError !== ""
+      var text = isAccount ? accountError : state.lastError
       if (text === "") continue
       // A broken account is one problem however many organizations sit behind
       // it, so it collapses to a single line. Anything else is that

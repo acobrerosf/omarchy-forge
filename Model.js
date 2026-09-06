@@ -1166,10 +1166,10 @@ function emptyState() {
     lastError: "",
     note: "",
     lastRefreshMs: 0,
-    // Which credential this organization is polled through, and why it can't
-    // be — a missing token is a fact about the account, not about the org.
+    // Which credential this organization is polled through. Whether that
+    // credential is *there* is the account's fact, not a copy kept here — the
+    // service derives the line an organization shows from it.
     account: "",
-    accountError: "",
     // When the ticker owes this organization its next look.
     nextDueMs: 0,
     // Where the site walk resumes next tick ("" = start over), and everything
@@ -1177,11 +1177,11 @@ function emptyState() {
     // organization from that accumulation.
     siteCursor: "",
     sweepSites: [],
-    // Deployment status per site key as of that site's last observation, and
-    // whether a first sweep has landed — the seeding that keeps an
-    // already-failed site from announcing itself at shell start.
-    lastStatus: {},
-    seeded: false
+    // Deployment status per site key as of that site's last observation. Empty
+    // until the first one lands, which is itself the seed guard: a site with no
+    // previous status announces nothing, so an already-failed one stays quiet
+    // at shell start.
+    lastStatus: {}
   }
 }
 

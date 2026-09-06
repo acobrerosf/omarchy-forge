@@ -166,10 +166,12 @@ program — goes through `Model.externalUrl`.
   declare `required property var modelData` / `required property int index` rather than picking
   them up from the context. Without that the delegate does not build at all. `./lint` catches
   the missing qualifiers; only a shell reload catches the missing `required`.
-- **Notification seeding.** `state.seeded` guards the first sweep so an already-failed site doesn't
-  announce itself at shell start. `lastStatus` is per-site status *as of its last observation* —
-  the site sweep rotates through large orgs one window per tick, so an unobserved site keeps its
-  entry, and keys are pruned only when a rotation wraps. See ARCHITECTURE.md.
+- **Notification seeding.** A site whose previous status is unknown — no entry in `lastStatus`
+  yet — never announces, which is what keeps an already-failed site quiet at shell start. There is
+  no separate flag; the guard rests on `_announce` staying the *only* writer of `lastStatus`, so
+  nothing may fill it in ahead of the comparison. `lastStatus` is per-site status *as of its last
+  observation* — the site sweep rotates through large orgs one window per tick, so an unobserved
+  site keeps its entry, and keys are pruned only when a rotation wraps. See ARCHITECTURE.md.
 - **`manifest.json` is the source of truth for settings.** Its `barWidget.defaults` + `schema` feed
   Setup → Plugins; `Panel.setting(key, fallback)` reads them. Adding a setting means: manifest
   defaults, manifest schema entry, the `setting()` call, the README table, and — if the service

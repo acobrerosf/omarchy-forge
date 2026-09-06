@@ -60,9 +60,20 @@ reached through exactly one account (org slugs are globally unique in Forge, so 
 function).
 
 Everything downstream is keyed by organization while the credential varies: per-org poll state,
-per-org panel rows. But facts about a *credential* — has a token, token rejected, rate remaining —
-belong to the account (`accountStates`), so three organizations behind one bad token report one
-problem, not three.
+per-org panel rows. The one fact about the *credential* — is there a token at all — belongs to the
+account (`accountStates`, `name → {hasToken}`), so three organizations behind one missing token
+report one problem, not three.
+
+It is stored once and **derived** where it is shown: `accountErrorFor(org)` joins through the
+organization's `account`, which only `_reconcile` writes, and produces the "No token for …" line
+the panel prints and `healthFor` reads. Nothing copies it into org state. That is what keeps a
+`quiet` request — a deploy log, a site log, the feed, the recipe list, none of which write to an
+organization — from turning the bar icon to `setup` while the rows behind it still describe a
+healthy organization.
+
+What Forge said about a token it *rejected* is not an account fact and is not kept here. Membership
+and permissions are scoped to an organization, so a 401 or a 403 on one says nothing about the next;
+it is reported as that organization's `lastError`, for the reason the 429 below is.
 
 ## Rate budget
 
@@ -113,7 +124,8 @@ markers going with it are why `_holdAccount` ends those refreshes by hand; `refr
 gate that consults the hold, since `nextDueMs` alone cannot hold anything through a `_reconcile`
 that zeroes it; and `deploy()` refuses with the time remaining rather than spending a request that
 would only push the hold further out. The refusal is reported as the organization's `lastError` —
-`accountError` would read as "not set up" and blank the server list the bar icon judges.
+an account-level "no token" verdict would read as "not set up" and blank the server list the bar
+icon judges.
 
 ## Queue, scheduling, pagination
 
@@ -148,7 +160,9 @@ debounce.
 site's status *as of its last observation*, a partial publish only overwrites the keys it
 observed, and keys are pruned only at a wrap. An unobserved site therefore keeps its last word,
 and a site that briefly fell out of a window announces its next change exactly once instead of
-never.
+never. Its emptiness is also the notification seed — a site with no entry has no previous status
+to differ from, so an already-failed one says nothing at shell start — which is why `_announce`
+has to stay the only writer of it.
 
 A `sweepDone` marker job still trails every sweep, with one remaining duty: closing the refresh
 (`_finishRefresh`) once every site fetch queued ahead of it has landed — including a refresh
@@ -534,6 +548,16 @@ lives in `_siteFact`, and the two public readers are thin over it. `siteStatus` 
 with the tone because the two have to agree; `siteTone` reads the fact directly rather than taking
 `siteStatus().tone`, because `healthFor` walks every site of an organization on every sweep page and
 the label it would throw away costs a lowercase, a regex and an object per site.
+
+**One precedence, `_healthRank`.** `bad > error > setup > busy > maintenance > ok`, and it is the
+same table inside an organization (`healthFor` folds through it) and across them
+(`healthForList`). Two encodings of it disagreed at the top for a while — within an organization
+`setup` and `error` returned early and outranked `bad` — so the same facts drew a different badge
+depending only on how they happened to be split between organizations. `error` and `setup` sit
+*below* `bad` on purpose: a rejected token or a failed request is a reason to look, a server or a
+deploy that has actually broken is a reason to act, and the icon judges what it can see. Only
+`maintenance` below `busy` is the other deliberate one — it is not a thing that has gone wrong.
+`Model.badgeForHealth` is the separate question of how a rank is *drawn*.
 
 `siteStatus` also reports **`timed`** — whether the label is the deployment's, and so whether the
 deployment's timestamp belongs beside it. The hero's `siteDetailLine` joins the two with a `·`, and

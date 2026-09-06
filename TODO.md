@@ -209,7 +209,7 @@ success — worth an answer once failures are reportable. — **taken in the sam
 `textSaved` became `pipeFinished(ticket, ok, message)`, a copy is answered on the same terms as a
 save, and neither says anything until the program it handed the text to has actually run.
 
-### 4. Service, org state — one home per fact, one precedence
+### 4. Service, org state — one home per fact, one precedence — **done**
 
 **4a. Derive the account's verdict; stop copying it into every organization.** *(medium, medium)*
 `accountStates` is declared as `name → {hasToken, rateRemaining, error}` (147-153) and only
@@ -236,6 +236,10 @@ Decide one thing while in there: `_applyEnvelope` 777-778 says a 401/403 is "wor
 rather than once per organization behind it", but the only account-level write it makes is to the
 dead `error` field, and the visible report goes to per-org `lastError` at 788. Either revive the
 field as the account's verdict or correct the comment; today the code does neither.
+— **decided: correct the comment.** Forge scopes membership and permissions per organization, so a
+401 or a 403 on one says nothing about the next, and an account-level verdict blanks the server
+list the bar icon judges — the same reason the 429 branch already writes `lastError`. The account
+keeps `hasToken` and nothing else.
 
 **4b. One health precedence.** *(medium, small — changes what the user sees)* `healthFor` 374-396
 encodes the order inside an organization as early returns (`accountError` → `setup`, `lastError` →
@@ -258,6 +262,10 @@ holding both an error and a failing server moves from the `warn` ring to the urg
 what the documentation already claims happens, so the alternative is equally acceptable — decide
 the other way, and then fix the comment at 826-827 and ARCHITECTURE 115 to say so. What should not
 survive is the code and the prose disagreeing.
+— **decided: fold through `_healthRank`**, which is the direction the prose already claimed, so
+only the code moved. An organization holding both an error and a failing server now draws the
+urgent disc. `allSites` went with the fold — its two remaining callers count with
+`Model.countSites`.
 
 **4c. Delete `seeded`.** *(high that it is redundant, tiny)* `_announce` 1387 guards with
 `if (!state.seeded || !notify)` and then skips any site whose previous status is `undefined`. When
@@ -308,8 +316,8 @@ now build it there.
 
 Do them in the order above: 1 is Panel-only and touches no contract, 2 and 3 are Service-only and
 independent of each other, 4 changes what is drawn and wants its own look, 5 is the helper. Within
-4, do 4a before 4b — the latter reads `accountErrorFor`. Slices 1, 2 and 3 are done; **4 is
-next**, and only the bash half of 5 remains after it.
+4, do 4a before 4b — the latter reads `accountErrorFor`. Slices 1, 2, 3 and 4 are done; **only the
+bash half of 5 remains**.
 
 Verification is the usual: `./lint` for the file, `omarchy restart shell` (not `rescanPlugins`,
 for anything in `Service.qml`), `journalctl -t omarchy-shell -f`, then walk the affected keys by
