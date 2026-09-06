@@ -83,10 +83,11 @@ Panel {
   // the service keys its answer, so two screens with two panes open don't
   // cross.
   property string logRequestKey: ""
-  // The file this screen asked for. `textSaved` is session-wide like every
-  // other service signal, and two monitors both showing a pane should not both
-  // announce one of them saving it.
-  property string saveRequestedPath: ""
+  // The copy or save this screen asked for. `pipeFinished` is session-wide like
+  // every other service signal, and two monitors both showing a pane should not
+  // both announce one of them saving it. A ticket rather than the path, because
+  // a copy has no path and two panes can be saved to the same one.
+  property string pipeTicket: ""
   property var logLines: []
   property string logError: ""
   property bool logLoading: false
@@ -960,7 +961,7 @@ Panel {
 
   function clearLog() {
     logRequestKey = ""
-    saveRequestedPath = ""
+    pipeTicket = ""
     logLines = []
     logError = ""
     logLoading = false
@@ -1147,10 +1148,15 @@ Panel {
   // The two ways what is on screen leaves a pane. Both take the text already
   // there, so neither costs a request — and both go out on stdin rather than
   // in an argv, because a verbose deploy can outgrow what an argument may hold.
+  //
+  // Neither says anything here. The words they would have said ride along and
+  // come back on `pipeFinished`, because until the other program has actually
+  // run there is nothing true to say: `wl-copy` may not be installed at all,
+  // and a "Copied" that wasn't is worse than a flash a moment later.
   function copyPane() {
     if (paneLines.length === 0 || !forge) return
-    forge.copyToClipboard(paneLines.join("\n") + "\n")
-    say("Copied " + Model.pluralize(paneLines.length, "line"))
+    pipeTicket = forge.copyToClipboard(paneLines.join("\n") + "\n",
+                                       "Copied " + Model.pluralize(paneLines.length, "line"))
   }
 
   function savePane() {
@@ -1160,7 +1166,7 @@ Panel {
     // The file is named after the site — or, for an event, the server — which
     // is API data reaching a path. These three are what stop a name being a
     // separator.
-    saveRequestedPath = forge.downloadDir() + "/"
+    var path = forge.downloadDir() + "/"
       + (routeKind === "commandOutput"
          ? Model.commandFileName(name, commandId)
          : routeKind === "recipeOutput"
@@ -1171,7 +1177,7 @@ Panel {
            : routeKind === "siteLog"
              ? Model.siteLogFileName(name, route.log)
              : Model.logFileName(name, route.deploymentId))
-    forge.saveText(paneLines.join("\n") + "\n", saveRequestedPath)
+    pipeTicket = forge.saveText(paneLines.join("\n") + "\n", path)
   }
 
   // ---------------------------------------------------------- run a command
@@ -1313,8 +1319,7 @@ Panel {
     if (!server) return
     var command = Model.sshCommand(server)
     if (command === "") { say("That server has no public IP"); return }
-    if (forge) forge.copyToClipboard(command)
-    say("Copied " + command)
+    if (forge) pipeTicket = forge.copyToClipboard(command, "Copied " + command)
   }
 
   function say(text) {
@@ -1482,11 +1487,12 @@ Panel {
       root.recipesCursor = String(nextCursor || "")
     }
 
-    // Saving is the one thing here that touches the filesystem, so where it
-    // landed — or why it didn't — is worth saying rather than assuming.
-    function onTextSaved(ok, path, message) {
-      if (root.saveRequestedPath !== path) return
-      root.saveRequestedPath = ""
+    // Where a copy or a save landed, or why it didn't. Saying it from here
+    // rather than from the two functions that ask is what makes a failure
+    // reportable at all — `wl-copy` missing, the download directory unwritable.
+    function onPipeFinished(ticket, ok, message) {
+      if (root.pipeTicket !== ticket) return
+      root.pipeTicket = ""
       root.say(message)
     }
   }

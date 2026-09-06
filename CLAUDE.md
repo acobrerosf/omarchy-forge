@@ -93,51 +93,56 @@ behind a scope named for writing — is reported on the row or the pane instead 
 organization's rows, and for a write it is the job's `scopeMessage` that decides both the wording
 and the quiet; every on-demand read enters through `_enqueueRead` and every drop site refuses
 through `_readRefused`, so a sixth read kind is only complete when it has an arm in those and in
-`_readRequestKey` as well as a line in `_pathFor` and one in `onExited` — and `_pathFor` answering
-`""` is what stops a kind missing from it being charged for and sent as the org site list; the
-three document panes answer one signal, `documentFetched`, because only one is ever open and the
+`_readRequestKey` as well as a line in `_pathFor` and one in `_finishFetch` — and `_pathFor`
+answering `""` is what stops a kind missing from it being charged for and sent as the org site list;
+the three document panes answer one signal, `documentFetched`, because only one is ever open and the
 words a failure earns are chosen in the service; every write goes out on `Service`'s single-flight
-`actionProcess` via `_startAction`, never through the queue, carrying its own method (POST is only
-the default) and — where its meaning
-depends on live state, as the maintenance toggle's does — an `armIntent` in its arm key, so a
-refresh landing mid-arm invalidates it instead of retargeting it; a body a *user typed* — only the
-site command's — never rides that argv, and asks for `bodyStdin` instead, which sends it as `api …
-POST <path> -` and writes it to the helper's stdin on `started`; a site or server name reaching a
-*path* (a saved deploy log's, site log's, command output's, event output's or recipe output's
-filename — that last one carries two names) goes through `Model.safeFileName`, which is the
-separator guard the other three don't cover; a site log and an event's output read and write the
-*deploy log's* panel state rather than owning a set each, because only one pane is ever open and
-`popView` already clears that one — what tells the three apart is the route kind, the request key
-and the words; every `kind: "action"` row is built by `Panel.actionRow`, so a non-empty `armKey`
-means "this row writes" — which is what `runWriteAction` refuses on, and what lets `runAction` send
-every write through one `default` arm rather than naming their ids; the command watch that polls a
-run to its end lives on `Service` and not on
-`Panel`, for the reason the sweep does — a timer in a bar widget runs once per monitor — and it says
-nothing when the run turns terminal, because announcing that while the output request is still in
-flight leaves the pane finished with no lines, which renders as "printed nothing"; that watch ends
-on exactly three things — the output landing, the pane closing, the next run displacing it — and
-never on a refusal, since the run is on the box whatever a look at it came back with and dropping
-the watch leaves `r` pointing at nothing (`_commandFailed` reports and reschedules instead), while
-anything that *does* end one owes the pane a farewell — the displaced key in `_displaceWatch`, a
-dropped read in `_holdAccount` or `_abandonJob`; a recipe run shares that one watch rather than
-mirroring it — one slot carrying a `kind`, one signal, one pane state — so `Model.isRunJob` is what
-the drop sites ask and the recipe *list*, which answers `recipesFetched` instead, is deliberately
-not in it; its find walks the run list's cursor up to `recipeFindPages`, because that endpoint
-reads no `sort` at all (it answers 200 to any, where `/servers` 400s an unknown one) and Forge's
-cursor lists default to oldest first, and the walk leaves through `_pollCommand` like every other
-look so the hold still gates it; its terminal show carries the output, so unlike the command's
-there is no output stage and the state that ends the run is the text that fills the pane, reported
-with the id off the *watch* rather than the job, which a run found already finished would not have;
-the command prompt is the one place that sets
-`PanelKeyCatcher.blocked`, and `stopCommandEditing` clears it *deferred* on purpose, or the enter
-that arms goes on to reach `onActivateRequested` and un-arms the row it just armed; and the event
-feed is the one route that stays alive *under* another (its output pane), which is why `popView`
-clears it by the kind it popped where it clears the log and the command unconditionally, and why
-`openServerEvents` refuses to push over a pane or the command prompt; `omarchy-notification-send
---exec` takes a shell *string*, not an argv array — the shell runs it through `bash -lc` on click,
-so an address reaching it must pass `Model.externalUrl` **and** `Util.shellQuote`. Any new address
-that leaves this process — opened, copied, or handed to another program — goes through
-`Model.externalUrl`.
+`actionProcess` via `_startAction`, never through the queue, built by `_writeJob` — the one place a
+`Model` action entry becomes a job, so a new write is an entry and nothing else — carrying its own
+method (POST is only the default) and — where its meaning depends on live state, as the maintenance
+toggle's does — an `armIntent` in its arm key, so a refresh landing mid-arm invalidates it instead
+of retargeting it; a body a *user typed* — only the site command's — never rides that argv, and asks
+for `bodyStdin` instead, which `_writeJob` reads off the entry (so the rule holds by construction,
+not because one wrapper remembered), and which sends it as `api … POST <path> -` and writes it to
+the helper's stdin on `started`; `_action` is the one home of "a write is in flight", with
+`busyActionKey` a binding on it and a watchdog on `_actionStartedMs`, because the helper reads the
+keyring before curl and a locked one hangs past `--max-time`; every `Process` here retires its job
+in one terminal function called from `onExited` *and* `onRunningChanged`, since Quickshell announces
+a binary that could not start on the second signal only, and a job retired on `exited` alone would
+strand whatever waited on it; a site or server name reaching a *path* (a saved deploy log's, site
+log's, command output's, event output's or recipe output's filename — that last one carries two
+names) goes through `Model.safeFileName`, which is the separator guard the other three don't cover;
+a site log and an event's output read and write the *deploy log's* panel state rather than owning a
+set each, because only one pane is ever open and `popView` already clears that one — what tells the
+three apart is the route kind, the request key and the words; every `kind: "action"` row is built by
+`Panel.actionRow`, so a non-empty `armKey` means "this row writes" — which is what `runWriteAction`
+refuses on, and what lets `runAction` send every write through one `default` arm rather than naming
+their ids; the command watch that polls a run to its end lives on `Service` and not on `Panel`, for
+the reason the sweep does — a timer in a bar widget runs once per monitor — and it says nothing when
+the run turns terminal, because announcing that while the output request is still in flight leaves
+the pane finished with no lines, which renders as "printed nothing"; that watch ends on exactly
+three things — the output landing, the pane closing, the next run displacing it — and never on a
+refusal, since the run is on the box whatever a look at it came back with and dropping the watch
+leaves `r` pointing at nothing (`_commandFailed` reports and reschedules instead), while anything
+that *does* end one owes the pane a farewell — the displaced key in `_displaceWatch`, a dropped read
+in `_holdAccount` or `_abandonJob`; a recipe run shares that one watch rather than mirroring it —
+one slot carrying a `kind`, one signal, one pane state — so `Model.isRunJob` is what the drop sites
+ask and the recipe *list*, which answers `recipesFetched` instead, is deliberately not in it; its
+find walks the run list's cursor up to `recipeFindPages`, because that endpoint reads no `sort` at
+all (it answers 200 to any, where `/servers` 400s an unknown one) and Forge's cursor lists default
+to oldest first, and the walk leaves through `_pollCommand` like every other look so the hold still
+gates it; its terminal show carries the output, so unlike the command's there is no output stage and
+the state that ends the run is the text that fills the pane, reported with the id off the *watch*
+rather than the job, which a run found already finished would not have; the command prompt is the
+one place that sets `PanelKeyCatcher.blocked`, and `stopCommandEditing` clears it *deferred* on
+purpose, or the enter that arms goes on to reach `onActivateRequested` and un-arms the row it just
+armed; and the event feed is the one route that stays alive *under* another (its output pane), which
+is why `popView` clears it by the kind it popped where it clears the log and the command
+unconditionally, and why `openServerEvents` refuses to push over a pane or the command prompt;
+`omarchy-notification-send --exec` takes a shell *string*, not an argv array — the shell runs it
+through `bash -lc` on click, so an address reaching it must pass `Model.externalUrl` **and**
+`Util.shellQuote`. Any new address that leaves this process — opened, copied, or handed to another
+program — goes through `Model.externalUrl`.
 
 ### Conventions that matter
 

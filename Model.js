@@ -7,13 +7,23 @@
 // requested relationships arrive alongside the primary data in `included`.
 // This flattens that into plain objects with the fields the panel uses.
 
+// The envelope is the contract between the helper and this process, and the
+// shape of a *failed* one is spelled out wherever something has to answer for
+// the helper instead of it — a reply that wasn't JSON, a request that timed
+// out, a helper that never started. One builder, so those cannot drift from
+// what `envelopeError` and `_applyEnvelope` read. The bash side has its own,
+// in `envelope()`, for the same reason on the other side of the pipe.
+function errorEnvelope(message) {
+  return { ok: false, status: 0, rateRemaining: null, rateReset: null, body: null,
+           error: String(message) }
+}
+
 function parseEnvelope(text) {
   try {
     var parsed = JSON.parse(String(text || ""))
     if (parsed && typeof parsed === "object") return parsed
   } catch (e) {}
-  return { ok: false, status: 0, rateRemaining: null, rateReset: null, body: null,
-           error: "The Forge helper returned something that wasn't JSON" }
+  return errorEnvelope("The Forge helper returned something that wasn't JSON")
 }
 
 function envelopeError(envelope) {

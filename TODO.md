@@ -155,7 +155,7 @@ string or `null`. The handlers stay separate — the `output`/`content` split, t
 sentinel and the three 403 wordings are all deliberate. Fold this into 2a or 5b rather than doing
 it alone.
 
-### 3. Service, write path — one job shape, one in-flight owner
+### 3. Service, write path — one job shape, one in-flight owner — **done**
 
 **3a. One `_writeJob(org, serverId, action, key)`.** *(medium, small)* `sendAction` 1529-1540,
 `runSiteCommand` 1559-1569 and `runRecipe` 1589-1598 each copy a *different* subset of the action
@@ -173,7 +173,7 @@ them a live hole in a documented rule:
   nothing produces and nothing would handle sensibly.
 
 One constructor copying `path`, `method`, `body`, `bodyStdin`, `done`, `scopeMessage`,
-`settleSites` and `refetch` once; `_onAction` reads `job.refetch`. The run wrappers then add only
+`settleSites` and `refetch` once; `_finishAction` reads `job.refetch`. The run wrappers then add only
 what is genuinely theirs — the kind, the subject id, `sentAtMs`, `requestKey` — which is what
 makes visible that they differ by nothing else. `deploy` keeps its hand-built job (it has no
 action entry, and that separation is documented) but takes `refetch: "sites"`.
@@ -205,7 +205,9 @@ One terminal function per process, called from `onExited` and from `onRunningCha
 comes first. Move the pipe's `stdinEnabled` re-arm into `_pumpPipe` before `running = true`, which
 is the shape `_startAction` already uses. Do `actionProcess` after 3b. Related: `copyPane`
 1148-1152 flashes "Copied N lines" before the copy has run, so a failed copy currently reads as a
-success — worth an answer once failures are reportable.
+success — worth an answer once failures are reportable. — **taken in the same slice**:
+`textSaved` became `pipeFinished(ticket, ok, message)`, a copy is answered on the same terms as a
+save, and neither says anything until the program it handed the text to has actually run.
 
 ### 4. Service, org state — one home per fact, one precedence
 
@@ -297,12 +299,17 @@ on the QML side as `parseEnvelope`'s fallback (`Model.js` 15-16) and the watchdo
 it in both branches; add `Model.errorEnvelope(message)` for the two JS sites. Keep the `tonumber?`
 coercions byte-identical.
 
+**Only the bash half is left.** `Model.errorEnvelope` landed in slice 3, which needed a third and a
+fourth synthetic reply — a write that timed out, a helper that could not start — and so would have
+had to hand-write the shape twice more. `parseEnvelope`, both watchdogs and both failed-start paths
+now build it there.
+
 ### Where to start, and what to leave alone
 
 Do them in the order above: 1 is Panel-only and touches no contract, 2 and 3 are Service-only and
 independent of each other, 4 changes what is drawn and wants its own look, 5 is the helper. Within
-4, do 4a before 4b — the latter reads `accountErrorFor`. Slices 1 and 2 are done; **3 is next**,
-and it is independent of everything left.
+4, do 4a before 4b — the latter reads `accountErrorFor`. Slices 1, 2 and 3 are done; **4 is
+next**, and only the bash half of 5 remains after it.
 
 Verification is the usual: `./lint` for the file, `omarchy restart shell` (not `rescanPlugins`,
 for anything in `Service.qml`), `journalctl -t omarchy-shell -f`, then walk the affected keys by

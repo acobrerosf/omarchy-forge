@@ -41,7 +41,11 @@ Item {
   // itself by. One key for the whole session rather than a map, because
   // `actionProcess` is single-flight: a deploy and a reboot cannot both be on
   // their way.
-  property string busyActionKey: ""
+  //
+  // Derived rather than assigned beside `_action`: the job is the one home of
+  // "a write is in flight", and a copy of its key was a second writer to keep
+  // in step by hand. `_action` is reassigned and never mutated, so this fires.
+  readonly property string busyActionKey: _action ? String(_action.key) : ""
 
   signal actionFinished(string key, bool ok, string message)
 
@@ -766,6 +770,50 @@ Item {
     return ""
   }
 
+  // `_pathFor`'s twin, and the reason both are named: a kind in one table and
+  // not the other is the mistake either would otherwise make quietly.
+  //
+  // It is also the first of the three terminal functions, one per `Process`,
+  // and they share a rule worth stating once. Quickshell emits `runningChanged`
+  // *without* `exited` when the binary cannot be started at all — a helper that
+  // has moved, a `wl-copy` that was never installed — so a job retired only in
+  // `onExited` would sit in its slot for the rest of the session with whatever
+  // waited on it never answered. Each is therefore called from both signals,
+  // and each empties its slot before doing anything else: on the ordinary path
+  // `exited` comes first and the `runningChanged` behind it finds nothing to
+  // do, so the null guard at the top is what makes calling twice harmless.
+  function _finishFetch(text) {
+    var job = _current
+    if (!job) return
+    _current = null
+    if (_timedOut) {
+      _timedOut = false
+      text = JSON.stringify(Model.errorEnvelope("The Forge helper timed out"))
+    }
+    // The pump is in a `finally` because a handler that throws would otherwise
+    // take the queue down with it — every later job left sitting until
+    // something else happens to push.
+    try {
+      if (job.kind === "servers") _onServers(job, text)
+      else if (job.kind === "sites") _onSites(job, text)
+      else if (job.kind === "serverSites") _onServerSites(job, text)
+      else if (job.kind === "log") _onLog(job, text)
+      else if (job.kind === "commandFind") _onCommandFind(job, text)
+      else if (job.kind === "commandShow") _onCommandShow(job, text)
+      else if (job.kind === "commandOutput") _onCommandOutput(job, text)
+      else if (job.kind === "events") _onEvents(job, text)
+      else if (job.kind === "eventOutput") _onEventOutput(job, text)
+      else if (job.kind === "siteLog") _onSiteLog(job, text)
+      else if (job.kind === "recipes") _onRecipes(job, text)
+      else if (job.kind === "recipeFind") _onRecipeFind(job, text)
+      else if (job.kind === "recipeShow") _onRecipeShow(job, text)
+      else console.warn("omarchy-forge: no handler for job kind \""
+                        + String(job.kind) + "\" — answer dropped")
+    } finally {
+      _pump()
+    }
+  }
+
   // ------------------------------------------------------------- pagination
 
   // A cursor chain is stopped by a page cap or by the budget ceiling, and a
@@ -1121,7 +1169,7 @@ Item {
   // queue already charges the budget, honours a hold and throws work away for
   // an organization that stopped being watched, and `actionProcess` is
   // single-flight for every write — a log fetch waiting behind a deploy or a
-  // reboot, or answering into `_onAction`, is not what either wants.
+  // reboot, or answering into `_finishAction`, is not what either wants.
   //
   // No debounce: pressing it again on a deploy still running is a reasonable
   // thing to want, and `_enqueueRead`'s dedupe already covers the only case
@@ -1377,10 +1425,17 @@ Item {
 
   // Every write — a deploy, a service restart, a reboot — goes out on
   // `actionProcess` rather than through the queue. It is single-flight, so one
-  // press cannot become two requests, and it answers into `_onAction` rather
+  // press cannot become two requests, and it answers into `_finishAction` rather
   // than into a sweep. What the queue would have done for it, the budget hold
   // and the charge, it therefore has to do here by hand.
   property var _action: null
+  // What `_currentStartedMs` and `_timedOut` are to `fetchProcess`, and for a
+  // watchdog that matters more here: the helper looks the token up in the
+  // keyring *before* curl ever runs, so a locked keyring hangs a write
+  // somewhere `--max-time` cannot reach — and with no watchdog that pinned the
+  // single-flight slot, and every write after it, for the rest of the session.
+  property double _actionStartedMs: 0
+  property bool _actionTimedOut: false
 
   // Answers whether the request went out. Both refusals below are reported to
   // the row either way, but a caller that has state to set up around the send —
@@ -1404,53 +1459,83 @@ Item {
       return false
     }
     job.account = account
+    // The job goes in its slot before the process starts, the order `_pump` and
+    // `_pumpPipe` also use: it is what `onRunningChanged` looks for to tell a
+    // start that failed from one already answered. See `_finishAction`.
     _action = job
-    busyActionKey = job.key
+    _actionStartedMs = Date.now()
     budget.charge(budget.bucketFor(account))
-    // Most bodies reach the helper in argv, unlike the token: they are fixed
-    // action words built in `Model`, not credentials, and the rule the stdin
-    // config exists for is about the one thing that must never appear in a
-    // command line. The helper moves them onto that config for curl's sake.
-    //
-    // A command someone typed is the exception, and asks for `bodyStdin`. It is
-    // not a credential either, but it can quote one, and /proc/<pid>/cmdline is
-    // readable by every process on the machine — so it goes down the pipe the
-    // clipboard and the file writer already use. `-` is the helper's word for
-    // "the body is on stdin"; the write itself happens in `onStarted`, because
-    // there is no stdin to write to until the child exists.
-    //
-    // The method rides the job too. Everything here was a POST until removing
-    // a site's maintenance mode turned out to be a DELETE; the helper passes
-    // whatever it is straight to curl, so this is the only place that knew.
+    // `-` is the helper's word for "the body is on stdin", and the body itself
+    // is written in `onStarted`, because there is no stdin to write to until
+    // the child exists. *Which* bodies travel that way is `_writeJob`'s to say.
     var piped = job.bodyStdin === true && !!job.body
-    actionProcess.stdinBody = piped ? JSON.stringify(job.body) : ""
     actionProcess.stdinEnabled = piped
     actionProcess.command = [cliPath, "api", "--account", account,
                              String(job.method || "POST"), job.path]
       .concat(piped ? ["-"] : job.body ? [JSON.stringify(job.body)] : [])
     actionProcess.running = true
-    return true
+    // Not a bare `true`: a start that failed on the spot has already run
+    // `_finishAction` and emptied the slot, and a caller told the send happened
+    // would open a pane onto a run that does not exist.
+    return _action === job
+  }
+
+  // The one place an action entry becomes a job, and the reason the wrappers
+  // below are wrappers: each of them used to copy its own subset of the entry,
+  // so the job's shape was whatever the caller happened to remember. That is
+  // how `bodyStdin` came to be declared in `Model` on the one action that needs
+  // it and read from nowhere — the command's wrapper hard-coded it instead, so
+  // the rule it exists for held by accident rather than by construction.
+  //
+  // Most bodies reach the helper in argv, unlike the token: they are fixed
+  // action words built in `Model`, not credentials, and the rule the stdin
+  // config exists for is about the one thing that must never appear in a
+  // command line. The helper moves them onto that config for curl's sake.
+  //
+  // A command someone typed is the exception, and asks for `bodyStdin`. It is
+  // not a credential either, but it can quote one, and /proc/<pid>/cmdline is
+  // readable by every process on the machine — so it goes down the pipe the
+  // clipboard and the file writer already use.
+  //
+  // The method rides the job too. Everything here was a POST until removing a
+  // site's maintenance mode turned out to be a DELETE; the helper passes
+  // whatever it is straight to curl, so this is the only place that knew.
+  function _writeJob(org, serverId, action, key) {
+    return { org: String(org), serverId: String(serverId), key: String(key),
+             path: String(action.path),
+             method: String(action.method || "POST"),
+             body: action.body || null,
+             bodyStdin: action.bodyStdin === true,
+             done: String(action.done || "Sent"),
+             scopeMessage: String(action.scopeMessage || ""),
+             settleSites: action.settleSites === true,
+             // As `Model` declares it — `"sites"` or `"org"` — rather than
+             // split into a pair of booleans here and recombined downstream.
+             refetch: String(action.refetch || "") }
   }
 
   // A deploy's 403 is the only one left loud, so it carries no `scopeMessage`:
   // it goes out on the same token and the same scope every sweep already needs,
   // which makes a refusal the organization's business rather than this row's.
+  //
+  // Its job is built by hand because it is reached from a key rather than from
+  // a row of an action list, so there is no entry for `_writeJob` to copy.
   function deploy(org, site) {
     if (!site || String(org) === "") return
     if (!Model.canDeploy(site)) return
     _startAction({ org: String(org), serverId: String(site.serverId),
                    key: String(site.key), body: null,
                    path: Model.deployPath(org, site.serverId, site.id),
-                   done: "Deployment queued", refetchSites: true })
+                   done: "Deployment queued", refetch: "sites" })
   }
 
   // Every other write, whatever its subject. `action` is a `Model.serverActions`
   // or `Model.siteActions` entry, so everything that varies — the path, the
   // body, the method, the 403 wording, what to re-read afterwards — was
   // declared beside the label that describes it rather than assembled here out
-  // of whatever the panel happened to pass. That is what keeps this one
-  // function rather than one per subject: the next write to be added is an
-  // entry in `Model`, not a fourth near-duplicate wrapper.
+  // of whatever the panel happened to pass. `_writeJob` is what copies it, and
+  // is what keeps this one function rather than one per subject: the next write
+  // to be added is an entry in `Model`, not a fourth near-duplicate wrapper.
   //
   // `key` is the row's, not the subject's: rows can send to the same endpoint,
   // and only the one that was pressed should say so.
@@ -1463,18 +1548,7 @@ Item {
       actionFinished(String(key), false, "That is no longer listed")
       return
     }
-    var refetch = String(action.refetch || "")
-    _startAction({ org: String(org), serverId: String(serverId),
-                   key: String(key), path: String(action.path),
-                   // POST is only the default: turning maintenance mode off is
-                   // a DELETE, and the helper passes whatever this is to curl.
-                   method: String(action.method || "POST"),
-                   body: action.body || null,
-                   done: String(action.done || "Sent"),
-                   scopeMessage: String(action.scopeMessage || ""),
-                   settleSites: action.settleSites === true,
-                   refetchSites: refetch === "sites",
-                   refetchOrg: refetch === "org" })
+    _startAction(_writeJob(org, serverId, action, key))
   }
 
   // Running a command is a write like any other, so it goes out on the same
@@ -1493,18 +1567,16 @@ Item {
     }
     var sentAtMs = Date.now()
     var requestKey = commandRequestKey(org, serverId, siteId, sentAtMs)
-    var started = _startAction(
-      { org: String(org), serverId: String(serverId),
-        siteId: String(siteId), kind: "command",
-        key: String(key), path: String(action.path),
-        method: String(action.method || "POST"),
-        body: action.body || null, bodyStdin: true,
-        sent: String(action.body ? action.body.command : ""),
-        sentAtMs: sentAtMs, requestKey: requestKey,
-        done: String(action.done || "Sent"),
-        scopeMessage: String(action.scopeMessage || ""),
-        settleSites: false, refetchSites: false, refetchOrg: false })
-    return started ? requestKey : ""
+    // Only the watch's coordinates are added here. That this body travels on
+    // stdin is `Model.siteCommandAction`'s to declare and `_writeJob`'s to
+    // carry — asserting it here is what let the rule hold by coincidence.
+    var job = _writeJob(org, serverId, action, key)
+    job.kind = "command"
+    job.siteId = String(siteId)
+    job.sent = String(action.body ? action.body.command : "")
+    job.sentAtMs = sentAtMs
+    job.requestKey = requestKey
+    return _startAction(job) ? requestKey : ""
   }
 
   // A recipe run, on `runSiteCommand`'s terms and for the same reason: the 202
@@ -1523,25 +1595,26 @@ Item {
     }
     var sentAtMs = Date.now()
     var requestKey = recipeRequestKey(org, serverId, action.recipeId, sentAtMs)
-    var started = _startAction(
-      { org: String(org), serverId: String(serverId),
-        recipeId: String(action.recipeId), kind: "recipe",
-        key: String(key), path: String(action.path),
-        method: String(action.method || "POST"),
-        body: action.body || null,
-        sentAtMs: sentAtMs, requestKey: requestKey,
-        done: String(action.done || "Sent"),
-        scopeMessage: String(action.scopeMessage || ""),
-        settleSites: false, refetchSites: false, refetchOrg: false })
-    return started ? requestKey : ""
+    var job = _writeJob(org, serverId, action, key)
+    job.kind = "recipe"
+    job.recipeId = String(action.recipeId)
+    job.sentAtMs = sentAtMs
+    job.requestKey = requestKey
+    return _startAction(job) ? requestKey : ""
   }
 
-  function _onAction(text) {
-    var envelope = Model.parseEnvelope(text)
+  // The write's terminal function, on the terms `_finishFetch` sets out: the
+  // slot is emptied first and the null guard is what makes a second call — the
+  // one `onRunningChanged` makes after `onExited` — do nothing.
+  function _finishAction(text) {
     var job = _action
-    _action = null
-    busyActionKey = ""
     if (!job) return
+    _action = null
+    if (_actionTimedOut) {
+      _actionTimedOut = false
+      text = JSON.stringify(Model.errorEnvelope("The Forge helper timed out"))
+    }
+    var envelope = Model.parseEnvelope(text)
 
     // Which refusals are the organization's business and which are this row's
     // is carried by the job rather than decided here. A deploy carries no
@@ -1575,14 +1648,14 @@ Item {
     // answers 202 — so what changed only shows a moment later. Look again
     // shortly rather than making the user wait out a whole refresh interval.
     if (!orgs[job.org]) return
-    if (!job.refetchSites && !job.refetchOrg) return
+    if (job.refetch !== "sites" && job.refetch !== "org") return
     _patch(job.org, { nextDueMs: Date.now() + 6000 })
     // A server's own state arrives with the server list, so pulling the org's
     // refresh forward is all a reboot needs. What a deploy or a maintenance
     // toggle changed rides the *sites* payload, so look at that server
     // directly: under rotation the re-poll only advances the window, which for
     // a large organization will usually be looking somewhere else entirely.
-    if (!job.refetchSites) return
+    if (job.refetch !== "sites") return
     fetchServerSites(job.org, job.serverId, true)
     if (job.settleSites) _armSettle(job.org, job.serverId)
   }
@@ -2074,13 +2147,24 @@ Item {
   //
   // One process, so a second copy arriving mid-write waits rather than
   // clobbering the command of the one in flight.
-  signal textSaved(bool ok, string path, string message)
+  //
+  // What it came to, told to the one screen that asked. Ticketed rather than
+  // keyed by the path: a copy has no path at all, and two monitors saving the
+  // same log would both answer to each other's. The words are minted with the
+  // job — the caller's for a copy, the path's for a save — because whoever
+  // asked knows what it was doing and the answer arrives long after it said so.
+  signal pipeFinished(string ticket, bool ok, string message)
 
   property var _pipeJobs: []
+  property int _pipeSeq: 0
 
+  // Answers the ticket its `pipeFinished` will carry, the way `runSiteCommand`
+  // answers the key its updates will.
   function _pipe(job) {
+    job.ticket = String(++_pipeSeq)
     _pipeJobs = _pipeJobs.concat([job])
     _pumpPipe()
+    return job.ticket
   }
 
   function _pumpPipe() {
@@ -2089,12 +2173,22 @@ Item {
     _pipeJobs = _pipeJobs.slice(1)
     pipeProcess.job = job
     pipeProcess.command = job.command
+    // Armed here rather than re-armed after the last exit, so a start that
+    // never happened cannot leave the next job with no stdin to write to.
+    // `onStarted` turns it off again once it has written, which is what closes
+    // the pipe. Same order as `_startAction`: the slot, then the process.
+    pipeProcess.stdinEnabled = true
     pipeProcess.running = true
   }
 
-  function copyToClipboard(text) {
-    if (!text) return
-    _pipe({ kind: "copy", text: String(text), path: "", command: ["wl-copy"] })
+  // `done` is what to say when it worked, because only the caller knows what it
+  // just handed over — "Copied 412 lines" and "Copied ssh forge@…" are the same
+  // request with different words.
+  function copyToClipboard(text, done) {
+    if (!text) return ""
+    return _pipe({ text: String(text), command: ["wl-copy"],
+                   done: String(done || "Copied"),
+                   failed: "Could not copy — is wl-copy installed?" })
   }
 
   // `mkdir -p` because the download directory is a guess and may not exist yet.
@@ -2103,10 +2197,24 @@ Item {
   // has already been through `Model.safeFileName` on the way here, so it cannot
   // have picked up a separator from a site name.
   function saveText(text, path) {
-    _pipe({ kind: "save", text: String(text || ""), path: String(path),
-            command: ["bash", "-c",
-                      "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"",
-                      "forge-save", String(path)] })
+    return _pipe({ text: String(text || ""),
+                   command: ["bash", "-c",
+                             "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"",
+                             "forge-save", String(path)],
+                   done: "Saved to " + String(path),
+                   failed: "Could not write " + String(path) })
+  }
+
+  // `_finishFetch`'s terms, and the one place a copy or a save is answered.
+  // A start that never happened arrives here with no exit code of its own, so
+  // it is given one that cannot be mistaken for success.
+  function _finishPipe(exitCode) {
+    var job = pipeProcess.job
+    if (!job) return
+    pipeProcess.job = null
+    var ok = exitCode === 0
+    pipeFinished(job.ticket, ok, ok ? job.done : job.failed)
+    _pumpPipe()
   }
 
   function downloadDir() {
@@ -2192,91 +2300,76 @@ Item {
     }
   }
 
+  // The same watchdog for the write path, which needs one more than the read
+  // path does: a hung read stalls the queue, and a hung write pins the only
+  // slot there is — every later write answering "Still sending the last one"
+  // and the row that asked stuck on `sending…` for the rest of the session.
+  // Curl's own `--max-time` does not cover it, because the helper reads the
+  // keyring first and a locked keyring never returns. Killing the child fires
+  // `exited`, so the answer lands on the ordinary path.
+  Timer {
+    interval: 5000
+    repeat: true
+    running: actionProcess.running
+    onTriggered: {
+      if (Date.now() - root._actionStartedMs < root.requestTimeoutMs) return
+      root._actionTimedOut = true
+      actionProcess.running = false
+    }
+  }
+
+  // The three processes below each answer through their terminal function, on
+  // `exited` and again on `runningChanged`. See `_finishFetch` for why both.
+  readonly property string failedToStart: "The Forge helper could not be started"
+
   Process {
     id: fetchProcess
     running: false
     stdout: StdioCollector { id: fetchOut; waitForEnd: true }
-    onExited: {
-      var job = root._current
-      var text = String(fetchOut.text || "")
-      if (root._timedOut) {
-        root._timedOut = false
-        text = JSON.stringify({ ok: false, status: 0, rateRemaining: null, rateReset: null,
-                                body: null, error: "The Forge helper timed out" })
-      }
-      root._current = null
-      // `_pathFor`'s twin, and named for the same reason. The pump is in a
-      // `finally` because a handler that throws would otherwise take the queue
-      // down with it — every later job left sitting until something else
-      // happens to push.
-      try {
-        if (job) {
-          if (job.kind === "servers") root._onServers(job, text)
-          else if (job.kind === "sites") root._onSites(job, text)
-          else if (job.kind === "serverSites") root._onServerSites(job, text)
-          else if (job.kind === "log") root._onLog(job, text)
-          else if (job.kind === "commandFind") root._onCommandFind(job, text)
-          else if (job.kind === "commandShow") root._onCommandShow(job, text)
-          else if (job.kind === "commandOutput") root._onCommandOutput(job, text)
-          else if (job.kind === "events") root._onEvents(job, text)
-          else if (job.kind === "eventOutput") root._onEventOutput(job, text)
-          else if (job.kind === "siteLog") root._onSiteLog(job, text)
-          else if (job.kind === "recipes") root._onRecipes(job, text)
-          else if (job.kind === "recipeFind") root._onRecipeFind(job, text)
-          else if (job.kind === "recipeShow") root._onRecipeShow(job, text)
-          else console.warn("omarchy-forge: no handler for job kind \""
-                            + String(job.kind) + "\" — answer dropped")
-        }
-      } finally {
-        root._pump()
-      }
+    onExited: root._finishFetch(String(fetchOut.text || ""))
+    // A helper that never ran said nothing, so it is given something to say:
+    // the job then fails through its own handler, which is what refuses the
+    // pane behind it and pumps the queue.
+    onRunningChanged: {
+      if (!running && root._current)
+        root._finishFetch(JSON.stringify(Model.errorEnvelope(root.failedToStart)))
     }
   }
 
   Process {
     id: pipeProcess
     property var job: null
-    stdinEnabled: true
-    // Written on `started` rather than before it, because there is no stdin to
-    // write to until the child exists. Disabling stdin is what closes it, and
-    // `wl-copy` and `cat` both read until EOF — without it neither would ever
-    // finish.
+    // Enabled in `_pumpPipe`, before the process starts. Written on `started`
+    // rather than before it, because there is no stdin to write to until the
+    // child exists — and disabling it again is what closes the pipe, which
+    // `wl-copy` and `cat` both wait on: they read until EOF, and without the
+    // close neither would ever finish.
     onStarted: {
       write(job ? job.text : "")
       stdinEnabled = false
     }
-    onExited: function(exitCode) {
-      var finished = pipeProcess.job
-      pipeProcess.job = null
-      // Back on for whatever is next in the queue: `onStarted` turns it off
-      // again once it has written, and a process started without it would have
-      // no stdin to write to at all.
-      pipeProcess.stdinEnabled = true
-
-      if (finished && finished.kind === "save")
-        root.textSaved(exitCode === 0, finished.path,
-                       exitCode === 0 ? "Saved to " + finished.path
-                                      : "Could not write " + finished.path)
-      root._pumpPipe()
-    }
+    onExited: function(exitCode) { root._finishPipe(exitCode) }
+    onRunningChanged: { if (!running && job) root._finishPipe(-1) }
   }
 
   Process {
     id: actionProcess
-    // Set by `_startAction` when the job asked for `bodyStdin`, and written the
-    // moment the child exists — the same dance `pipeProcess` does, and for the
-    // same reason: there is no stdin before `started`, and disabling it again
-    // is what sends the EOF the helper's `cat` is waiting for.
-    property string stdinBody: ""
     running: false
+    // Enabled by `_startAction` when the job asked for `bodyStdin`, and written
+    // the moment the child exists — the same dance `pipeProcess` does, and for
+    // the same reason. The body is read off the job rather than copied here:
+    // `_action` is the one home of the write in flight.
     stdinEnabled: false
     stdout: StdioCollector { id: actionOut; waitForEnd: true }
     onStarted: {
-      if (!stdinEnabled) return
-      write(stdinBody)
-      stdinBody = ""
+      if (!stdinEnabled || !root._action) return
+      write(JSON.stringify(root._action.body))
       stdinEnabled = false
     }
-    onExited: root._onAction(String(actionOut.text || ""))
+    onExited: root._finishAction(String(actionOut.text || ""))
+    onRunningChanged: {
+      if (!running && root._action)
+        root._finishAction(JSON.stringify(Model.errorEnvelope(root.failedToStart)))
+    }
   }
 }

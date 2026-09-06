@@ -160,7 +160,10 @@ A single 5s ticker schedules every org off `nextDueMs` rather than a Timer per o
 watchdog kills only a request that has actually overrun `requestTimeoutMs` (25s, against curl's
 own 15s) — a fixed ticker aborting whatever happened to be in flight would cut healthy requests
 off at random, and an aborted request comes back as an empty reply, which reads downstream as a
-malformed one.
+malformed one. `actionProcess` has the same watchdog on the same timeout, and needs it more: a
+hung read stalls the queue, where a hung write pins the only slot there is. Neither is covered by
+curl's `--max-time`, because the helper reads the keyring *before* curl runs and a locked keyring
+never returns.
 
 **Pagination.** Forge hands out 30 rows at a time and points at the rest with a cursor, so one
 logical list is a chain of requests. The chain is unbounded by nature, so two things stop it: a
@@ -179,7 +182,7 @@ It is pages 2-onward that are discretionary.
 budget's margin was left for. It goes through the queue rather than the deploy path's own process,
 because the queue already charges the budget, honours a hold and throws work away for an
 organization that stopped being watched, while `actionProcess` is single-flight for writes and
-answers into `_onAction`. It is pushed to the *front*: a sweep behind it can afford to land a
+answers into `_finishAction`. It is pushed to the *front*: a sweep behind it can afford to land a
 second later, and someone staring at an empty pane cannot.
 
 Two things about it differ from every other job. It answers through a signal (`documentFetched`)
@@ -369,14 +372,19 @@ and a list is not.
 
 **Writes don't go through it.** A deploy, a service restart, a reboot and a maintenance toggle all
 go out on `actionProcess`, which is single-flight: one press cannot become two requests, and the
-answer arrives at `_onAction` rather than in the middle of a sweep. What the queue would have done
-for them they do by hand — consult the hold, charge the budget — and `_startAction` is the one
-place that does it, so each new kind of write was a job object and a path, not a second code path.
+answer arrives at `_finishAction` rather than in the middle of a sweep. What the queue would have
+done for them they do by hand — consult the hold, charge the budget — and `_startAction` is the one
+place that does it, so each new kind of write is a job object and a path, not a second code path.
+`_action` is the one home of "a write is in flight": `busyActionKey` is a binding on it, the piped
+body is read off it in `onStarted`, and the watchdog dates it with `_actionStartedMs`.
 
 The job carries everything that varies, and all of it is declared in `Model` beside the label that
-describes it — which is what leaves one wrapper rather than one per subject. `Service.sendAction`
-turns any `serverActions`/`siteActions` entry into a job; `Service.deploy` is separate only because
-it is reached from a key rather than from a row of that list:
+describes it. **`Service._writeJob` is the one place an entry becomes a job** — every field below
+is copied there and nowhere else, which is what leaves one wrapper rather than one per subject.
+`Service.sendAction` turns any `serverActions`/`siteActions` entry into one; `runSiteCommand` and
+`runRecipe` take the same job and add only the watch's coordinates; `Service.deploy` builds its own
+by hand, because it is reached from a key rather than from a row of that list and so has no entry
+to copy. The fields:
 
 - a **body** (`{"action":"reboot"}`, the PHP pool's version, `{"status":503}` for maintenance). It
   reaches the helper as an argument — it is not a credential — and the helper hands it to curl down
@@ -392,8 +400,11 @@ it is reached from a key rather than from a row of that list:
   form that matters: **nothing a user typed reaches an argv.** (The maintenance integration's
   optional `secret` and `redirect` are still not offered — not for that reason any more, but
   because a toggle is not a place to type.)
+  Because `_writeJob` is what reads `bodyStdin`, the rule holds by construction rather than by
+  coincidence: it used to be the command's own wrapper that asserted it, so an entry declaring
+  `bodyStdin` and sent through `sendAction` would quietly have ridden the argv instead.
 - a **method**. Everything was a POST until removing a site's maintenance mode turned out to be a
-  DELETE. `_startAction` defaults to POST and the helper passes whatever it is to `curl --request`,
+  DELETE. `_writeJob` defaults to POST and the helper passes whatever it is to `curl --request`,
   so no other layer knows.
 - a **`scopeMessage`**, which decides both the 403 wording *and* whether the envelope is applied
   `quiet` — a job that has one is quiet. Only a deploy has none, and so is the only write left
@@ -417,14 +428,14 @@ move until Forge has finished out on the box. The payload's sibling `status` —
 rather than looking unchanged. `Model.sitesFrom` keeps it for that reason alone.
 
 That is also why the maintenance entry is the one that declares **`settleSites`**. The re-read
-`_onAction` fires goes out immediately, so for a flip it is *guaranteed* to observe the transitional
-`status` — and nothing else is coming for it, because the pulled-forward tick only advances the site
-rotation by one window, which past 150 sites is usually a different server. The toggle disables
-itself while the flip is moving, so without a second look the row would pulse `enabling…` and refuse
-every press until the rotation came back around. `Service._armSettle` gives it one: a timer that
-re-reads that server up to twice more at 8s, and stops the moment no site on it is still flipping.
-A settled toggle therefore costs nothing extra, and a flip that has not landed in 16s is handed back
-to the ordinary refresh rather than polled for.
+`_finishAction` fires goes out immediately, so for a flip it is *guaranteed* to observe the
+transitional `status` — and nothing else is coming for it, because the pulled-forward tick only
+advances the site rotation by one window, which past 150 sites is usually a different server. The
+toggle disables itself while the flip is moving, so without a second look the row would pulse
+`enabling…` and refuse every press until the rotation came back around. `Service._armSettle` gives
+it one: a timer that re-reads that server up to twice more at 8s, and stops the moment no site on it
+is still flipping. A settled toggle therefore costs nothing extra, and a flip that has not landed in
+16s is handed back to the ordinary refresh rather than polled for.
 
 There is a `GET` on the same integration path, under the *read* scope, which would confirm a flip
 directly. It is deliberately unused: a read belongs in the queue rather than on `actionProcess`, so
@@ -437,7 +448,21 @@ reads `orgs`, charges the budget, builds paths through `Model` and drives `fetch
 it into the object would need back-references or a signal indirection and would not be an
 improvement. `_current`, `_currentStartedMs`, `_timedOut` and `requestTimeoutMs` likewise stay at
 root — they describe the in-flight request and pair with `fetchProcess` and the watchdog, not with
-the pending list.
+the pending list. `_action`, `_actionStartedMs` and `_actionTimedOut` are the write path's three,
+for the same reason.
+
+**Every process retires its job on `running`, not only on `exited`.** Quickshell emits
+`runningChanged` *without* `exited` when a binary cannot be started at all — a `wl-copy` that was
+never installed, a helper that has moved. A job retired only in `onExited` therefore sits in its
+slot for the rest of the session with whatever waited on it never answered, and the fetch watchdog
+cannot cover the case either, because `running` is already false. So each of the three processes
+has one terminal function — `_finishFetch`, `_finishPipe`, `_finishAction` — called from both
+signals. Each empties its slot before doing anything else, and the null guard at its top is what
+makes the second call harmless: on the ordinary path `exited` comes first, and the
+`runningChanged` behind it finds the slot already empty (or holding the job the pump has just
+started, with `running` true again). A start that never happened is answered with
+`Model.errorEnvelope`, so it fails through the job's own handler rather than through a second
+code path.
 
 ## Subscriptions
 
@@ -719,10 +744,20 @@ holds rather than something it can be talked into running.
 
 Both the copy and the save hand the text to another program on **stdin**, not in an argv. Linux
 caps one argument at 128KB (`MAX_ARG_STRLEN`) and a verbose deploy log can pass that, so
-`execDetached` would fail with `E2BIG` on exactly the logs worth keeping. `pipeProcess` writes on
-`started` and then sets `stdinEnabled: false`, which is what closes the pipe — `wl-copy` and `cat`
-both read to EOF, and without the close neither would ever exit. Its little job list is unrelated
-to `queue`: nothing here is an API request, so nothing here is charged, held or dropped.
+`execDetached` would fail with `E2BIG` on exactly the logs worth keeping. `_pumpPipe` enables
+stdin before the process starts, `pipeProcess` writes on `started` and then sets
+`stdinEnabled: false`, which is what closes the pipe — `wl-copy` and `cat` both read to EOF, and
+without the close neither would ever exit. (Arming it in `_pumpPipe` rather than re-arming it after
+the previous exit is what leaves a start that never happened unable to strand the job behind it.)
+Its little job list is unrelated to `queue`: nothing here is an API request, so nothing here is
+charged, held or dropped.
+
+Both are also **answered**, on `pipeFinished`, and neither says anything before the other program
+has run: `wl-copy` may not be installed, and a "Copied" that wasn't is worse than a flash a moment
+later. The words ride the job — the caller's for a copy, the path's for a save — because only
+whoever asked knows what it just handed over. The answer is filtered by a **ticket** rather than by
+the path: a copy has no path at all, and two monitors saving the same log would otherwise each
+announce the other's.
 
 That guard runs in `Panel.qml`, not in the service, and `Model.logLines` splits the log in the same
 place. The rule is the one above: a guard belongs where the string crosses the boundary it guards
