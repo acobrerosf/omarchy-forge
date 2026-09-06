@@ -67,6 +67,18 @@ readonly STATE_NORMALIZE='
                                  name:    ((.value.name    // "")        | str)})) }
 '
 
+# Appended to anything that deletes from `.organizations`: a default that no
+# longer resolves moves to whichever organization is left, or to none. Asking
+# whether it still resolves covers both ways it can be orphaned — the default
+# itself removed, or the account holding it — where testing the slug covers
+# only the first. Composed into a filter as a fixed string, never as a value:
+# names still arrive bound, which is the rule state_apply's comment states.
+readonly REPOINT_DEFAULT='
+  if (.organizations[.organization] // null) == null
+  then .organization = ((.organizations | keys_unsorted[0]) // "")
+  else . end
+'
+
 state() {
   { [[ -f $STATE_FILE ]] && cat "$STATE_FILE" || echo '{}'; } | jq "$STATE_NORMALIZE"
 }
@@ -244,20 +256,29 @@ token_clear() {
 # The widget parses exactly that shape, so transport failures and HTTP errors
 # arrive through the same door as a successful response. `rateReset` is seconds
 # from now, not a header value — see rate_reset_seconds.
+#
+# One builder, because the shape is the contract: a sixth argument names a file
+# holding the response body, and without it the body is null. Slurping into the
+# same `$body[0] // null` is what lets an empty 204 and a bodyless failure take
+# the same path.
 
 envelope() {
+  local body_file=${6:-}
+  local -a body_arg=(--argjson body '[]')
+  [[ -z $body_file ]] || body_arg=(--slurpfile body "$body_file")
   jq -n \
     --argjson ok "$1" \
     --argjson status "$2" \
     --arg remaining "$3" \
     --arg reset "$4" \
     --arg error "$5" \
+    "${body_arg[@]}" \
     '{
       ok: $ok,
       status: $status,
       rateRemaining: (if $remaining == "" then null else ($remaining | tonumber? // null) end),
       rateReset: (if $reset == "" then null else ($reset | tonumber? // null) end),
-      body: null,
+      body: ($body[0] // null),
       error: (if $error == "" then null else $error end)
     }'
 }
@@ -351,22 +372,10 @@ api_request() {
     ((status < 400)) && ok=true
 
     # An empty body (204) and a non-JSON body (an HTML page from a proxy) both
-    # have to come back as a valid envelope, so a slurpfile failure degrades to
-    # a null body instead of taking the whole call down.
-    jq -n \
-      --argjson ok "$ok" \
-      --argjson status "$status" \
-      --arg remaining "$remaining" \
-      --arg reset "$reset" \
-      --slurpfile body "$tmp/body" \
-      '{
-        ok: $ok,
-        status: $status,
-        rateRemaining: (if $remaining == "" then null else ($remaining | tonumber? // null) end),
-        rateReset: (if $reset == "" then null else ($reset | tonumber? // null) end),
-        body: ($body[0] // null),
-        error: null
-      }' 2>/dev/null ||
+    # have to come back as a valid envelope. The first call is the one that
+    # slurps, so it is the one that can fail on a body jq cannot parse, and only
+    # its error is silenced — the fallback still owes a message on stderr.
+    envelope "$ok" "$status" "$remaining" "$reset" "" "$tmp/body" 2>/dev/null ||
       envelope "$ok" "$status" "$remaining" "$reset" "HTTP $status with a non-JSON body"
   else
     envelope false 0 "" "" "$(tr -d '\r' <"$tmp/curl_err" | tail -n 1)"
@@ -483,6 +492,24 @@ choose_orgs() {
   for n in $picks; do
     printf '%s\n' "$rows" | sed -n "${n}p" | cut -f1
   done
+}
+
+# Record every chosen slug as watched through `account`, and let the first one
+# become the default organization when there is none. `rows` is remote_orgs'
+# output — "slug<TAB>name" — which is where a slug's display name comes from,
+# and `chosen` is the subset of its slugs. The state write lives here rather
+# than in each caller because a filter that touches `.organization` is exactly
+# the kind of thing that drifts when it is spelled twice.
+watch_orgs() {
+  local account=$1 rows=$2 chosen=$3 slug orgname
+  while read -r slug; do
+    [[ -n $slug ]] || continue
+    orgname=$(printf '%s' "$rows" | awk -F'\t' -v s="$slug" '$1 == s {print $2; exit}')
+    state_apply '.organizations[$s] = {account: $a, name: $n}
+                 | (if .organization == "" then .organization = $s else . end)' \
+      --arg s "$slug" --arg a "$account" --arg n "$orgname"
+    echo "Watching: $slug${orgname:+ — $orgname}"
+  done <<<"$chosen"
 }
 
 # ---------------------------------------------------------------- commands
@@ -620,15 +647,7 @@ EOF
   chosen=$(choose_orgs "$(printf '%s' "$available" | sed '/^$/d')")
   [[ -n ${chosen//[$'\n ']/} ]] || die "no organization chosen"
 
-  local orgname
-  while read -r slug; do
-    [[ -n $slug ]] || continue
-    orgname=$(printf '%s' "$available" | awk -F'\t' -v s="$slug" '$1 == s {print $2; exit}')
-    state_apply '.organizations[$s] = {account: $a, name: $n}
-                 | (if .organization == "" then .organization = $s else . end)' \
-      --arg s "$slug" --arg a "$name" --arg n "$orgname"
-    echo "Watching: $slug${orgname:+ — $orgname}"
-  done <<<"$chosen"
+  watch_orgs "$name" "$available" "$chosen"
 }
 
 # What the panel's setup and "Add organization" buttons run. It is `add` plus a
@@ -768,19 +787,12 @@ cmd_orgs() {
 }
 
 cmd_org_pick() {
-  local account=${1:-$(default_account)} rows chosen slug orgname
+  local account=${1:-$(default_account)} rows chosen
   rows=$(remote_orgs "$account")
   [[ -n ${rows//[$'\n\t ']/} ]] || die "the token on '$account' can't see any organizations"
   chosen=$(choose_orgs "$rows")
   [[ -n ${chosen//[$'\n ']/} ]] || die "no organization chosen"
-  while read -r slug; do
-    [[ -n $slug ]] || continue
-    orgname=$(printf '%s' "$rows" | awk -F'\t' -v s="$slug" '$1 == s {print $2; exit}')
-    state_apply '.organizations[$s] = {account: $a, name: $n}
-                 | (if .organization == "" then .organization = $s else . end)' \
-      --arg s "$slug" --arg a "$account" --arg n "$orgname"
-    echo "Watching: $slug${orgname:+ — $orgname}"
-  done <<<"$chosen"
+  watch_orgs "$account" "$rows" "$chosen"
 }
 
 # Show or set the *default* organization — the one a widget with no override
@@ -814,10 +826,7 @@ cmd_remove() {
   if [[ -n $slug ]]; then
     [[ -n $(account_of_org "$slug") ]] || die "'$slug' is not being watched"
     account=$(account_of_org "$slug")
-    state_apply 'del(.organizations[$s])
-                 | (if .organization == $s
-                    then .organization = ((.organizations | keys_unsorted[0]) // "")
-                    else . end)' --arg s "$slug"
+    state_apply "del(.organizations[\$s]) | $REPOINT_DEFAULT" --arg s "$slug"
     echo "Stopped watching $slug."
     if [[ -z $(orgs_of_account "$account") ]]; then
       echo "Account '$account' now watches nothing."
@@ -829,11 +838,9 @@ cmd_remove() {
   [[ -n $account ]] || die "usage: omarchy-forge remove --account <name>"
   account_exists "$account" || die "no account named '$account'"
   token_clear "$account"
-  state_apply 'del(.accounts[$a])
-               | .organizations = (.organizations | with_entries(select(.value.account != $a)))
-               | (if (.organizations[.organization] // null) == null
-                  then .organization = ((.organizations | keys_unsorted[0]) // "")
-                  else . end)' --arg a "$account"
+  state_apply "del(.accounts[\$a])
+               | .organizations = (.organizations | with_entries(select(.value.account != \$a)))
+               | $REPOINT_DEFAULT" --arg a "$account"
   echo "Removed account '$account', its token, and everything it watched."
 }
 

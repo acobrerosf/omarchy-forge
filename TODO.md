@@ -1,19 +1,21 @@
 # TODO
 
 Ordered by priority: the groundwork that makes the rest affordable, then features we don't have.
-The groundwork came out of a whole-codebase audit and is the urgent half — it is what the
-features below are cheaper to build on top of. Everything under *Features* was checked against
+The groundwork came out of a whole-codebase audit and is now complete — it is what the features
+below are cheaper to build on top of. Everything under *Features* was checked against
 the v2 OpenAPI spec (`https://forge.laravel.com/api/docs.openapi`, 154 paths) and, where it says
 *verified*, against the live API.
 
 ---
 
-## Groundwork — do this first
+## Groundwork — **done**
 
 An audit of every subsystem (2026-09-05, against `fdac3be`) for simplifications in data
 structures, state representation, control flow and ownership. Sixteen findings, grouped below
 into five slices; each slice is one commit on `develop`, lintable and verifiable on its own.
 Line numbers are as of `fdac3be` and will drift — the surrounding names are the real address.
+All five slices have landed; what follows is kept as the record of what each one decided, so a
+decision is not re-opened without seeing why it went the way it did.
 
 One shape recurs and is worth naming once, because ten of the sixteen are instances of it: **a
 fact with two homes and two writers**. Each of those is a pair of representations kept in step
@@ -290,7 +292,7 @@ have every answer handler read evidence off `_commandWatch`; the exception becom
 — `_commandRefused`, `_commandFailed`, `_abandonJob`, `_holdAccount` — must keep reading
 `job.commandId`, because their watch may be null or someone else's.
 
-### 5. Helper and contract
+### 5. Helper and contract — **done**
 
 **5a. One `watch_orgs`, one repoint-the-default fragment.** *(high, tiny)* `cmd_add` 623-631 and
 `cmd_org_pick` 776-783 hold the identical loop — resolve the name with `awk`, `state_apply` the
@@ -307,17 +309,20 @@ on the QML side as `parseEnvelope`'s fallback (`Model.js` 15-16) and the watchdo
 it in both branches; add `Model.errorEnvelope(message)` for the two JS sites. Keep the `tonumber?`
 coercions byte-identical.
 
-**Only the bash half is left.** `Model.errorEnvelope` landed in slice 3, which needed a third and a
-fourth synthetic reply — a write that timed out, a helper that could not start — and so would have
-had to hand-write the shape twice more. `parseEnvelope`, both watchdogs and both failed-start paths
-now build it there.
+`Model.errorEnvelope` landed early, in slice 3, which needed a third and a fourth synthetic
+reply — a write that timed out, a helper that could not start — and so would have had to
+hand-write the shape twice more. `parseEnvelope`, both watchdogs and both failed-start paths
+build it there. The bash half is now done too: `envelope` takes an optional body file, so
+`api_request` builds through it in both branches, and only the slurping call has its stderr
+silenced — the fallback still owes a message. `watch_orgs` holds the loop `cmd_add` and
+`cmd_org_pick` each spelled, and a `REPOINT_DEFAULT` fragment holds the invariant `cmd_remove`
+spelled twice, in the null form that covers both ways a default is orphaned.
 
 ### Where to start, and what to leave alone
 
 Do them in the order above: 1 is Panel-only and touches no contract, 2 and 3 are Service-only and
 independent of each other, 4 changes what is drawn and wants its own look, 5 is the helper. Within
-4, do 4a before 4b — the latter reads `accountErrorFor`. Slices 1, 2, 3 and 4 are done; **only the
-bash half of 5 remains**.
+4, do 4a before 4b — the latter reads `accountErrorFor`. **All five slices are done.**
 
 Verification is the usual: `./lint` for the file, `omarchy restart shell` (not `rescanPlugins`,
 for anything in `Service.qml`), `journalctl -t omarchy-shell -f`, then walk the affected keys by
