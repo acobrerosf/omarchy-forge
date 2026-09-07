@@ -419,6 +419,209 @@ function recipesFrom(body) {
   })
 }
 
+// ------------------------------------------------------------------ monitors
+
+// What Forge watches on a server and whether it is firing. Four metrics, two
+// operators, a threshold: a monitor has no name, so its identity *is* those
+// three, assembled here and nowhere else — the row, and any future crumb, have
+// to spell it the same way.
+var monitorMetrics = {
+  "cpu_load": "CPU load",
+  "disk": "Disk",
+  "free_memory": "Free memory",
+  "used_memory": "Used memory"
+}
+
+// Falls back to the raw type for `siteLogLabel`'s reason: a metric Forge adds
+// later should read as itself rather than vanish from its own row.
+function monitorLabel(monitor) {
+  var m = monitor || {}
+  var metric = monitorMetrics[String(m.type)] || String(m.type || "monitor")
+  var operator = m.operator === "lte" ? "≤" : m.operator === "gte" ? "≥" : ""
+  if (operator === "") return metric
+  return metric + " " + operator + " " + String(m.threshold) + "%"
+}
+
+// `minutes` is how often Forge *evaluates* the monitor, not how long a breach
+// has to last — so the word is "every", and a null means Forge did not say.
+// The notify address goes on the row because this is the only surface a
+// monitor has: no pane, no hero, no detail view to move it to.
+function monitorDetail(monitor) {
+  var m = monitor || {}
+  var parts = []
+  if (m.minutes === 1) parts.push("every minute")
+  else if (m.minutes > 0) parts.push("every " + m.minutes + " min")
+  if (m.notify) parts.push("notifies " + String(m.notify))
+  return parts.join(" · ")
+}
+
+// Two independent axes, and a row can only report one. `status` is the
+// install lifecycle and `state` is the alerting one, so a monitor still being
+// installed has nothing to say about thresholds yet — the lifecycle wins until
+// it settles on `installed`, after which `state` is the whole point of the row.
+//
+// `failed` is toned `bad` rather than `idle`: a monitor that could not be
+// installed is not watching anything, which is worth the same red as one that
+// is firing.
+function monitorStatus(monitor) {
+  var m = monitor || {}
+  var status = String(m.status || "")
+  if (status !== "" && status !== "installed") {
+    return { label: status.replace(/-/g, " "),
+             tone: /ing$/.test(status) ? "busy" : /^failed/.test(status) ? "bad" : "idle" }
+  }
+  var state = String(m.state || "")
+  return { label: state.toLowerCase(),
+           tone: state === "ALERT" ? "bad" : state === "OK" ? "ok" : "idle" }
+}
+
+// The tone alone, for the callers that colour without labelling — the view's
+// hero badge. `siteTone`'s relationship to `siteStatus`, for the same reason.
+function monitorTone(monitor) {
+  return monitorStatus(monitor).tone
+}
+
+// Severity order, imposed here because the API cannot be asked for it: `state`
+// sorts alphabetically, and `ALERT < OK < UNKNOWN` is not severity in either
+// direction. A firing monitor belongs at the top of the list whichever way
+// Forge happened to hand the page over.
+function _monitorRank(monitor) {
+  var tone = monitorTone(monitor)
+  if (tone === "bad") return 0
+  if (tone === "busy") return 1
+  if (tone === "idle") return 2
+  return 3
+}
+
+function monitorsFrom(body) {
+  var out = []
+  var data = body && Array.isArray(body.data) ? body.data : []
+  for (var i = 0; i < data.length; i++) {
+    var resource = data[i]
+    var a = resource.attributes || {}
+    out.push({
+      id: String(resource.id),
+      type: String(a.type || ""),
+      operator: String(a.operator || ""),
+      threshold: Number(a.threshold || 0),
+      // Null is Forge's "no evaluation interval recorded", and 0 is what the
+      // row already treats as nothing to say — so they collapse here rather
+      // than leaving every reader to check for null.
+      minutes: Number(a.minutes || 0),
+      notify: String(a.notify || ""),
+      status: String(a.status || ""),
+      state: String(a.state || ""),
+      stateChangedAt: a.state_changed_at ? String(a.state_changed_at) : ""
+    })
+  }
+  return out.sort(function (x, y) {
+    var rank = _monitorRank(x) - _monitorRank(y)
+    return rank !== 0 ? rank : monitorLabel(x).localeCompare(monitorLabel(y))
+  })
+}
+
+// The worst thing in the list, in the badge vocabulary the hero draws. Only
+// `bad` is worth a badge here: a monitor that is merely installing is not news,
+// and the rows say so themselves.
+function monitorsBadge(monitors) {
+  var list = Array.isArray(monitors) ? monitors : []
+  for (var i = 0; i < list.length; i++)
+    if (monitorTone(list[i]) === "bad") return "bad"
+  return "none"
+}
+
+// ---------------------------------------------------------------- heartbeats
+
+// A site's dead-man switches: something out there is supposed to ping Forge on
+// a schedule, and the heartbeat is `missing` when it stops. Three things make
+// this the thinnest resource here — no timestamps at all, so a row cannot say
+// when it was last seen; no `sort` or `filter` on the endpoint, so the order is
+// imposed below; and a `ping_url` that is *not* kept, because it carries the
+// token that lets anything on the internet mark the site alive. Nothing here
+// draws it, so it does not enter the process.
+var heartbeatFrequencies = {
+  "1": "every minute",
+  "60": "hourly",
+  "1440": "daily",
+  "10080": "weekly"
+}
+
+// Forge's enum is minutes with `-1` meaning "read the cron expression", and it
+// has one member — 312480 — that is neither monthly nor yearly. So the words
+// come from a table for the ones that have names and from arithmetic for the
+// rest, which also covers whatever Forge adds next.
+function heartbeatFrequency(heartbeat) {
+  var h = heartbeat || {}
+  var minutes = Number(h.frequency || 0)
+  if (minutes === -1) return String(h.customFrequency || "on a schedule")
+  var named = heartbeatFrequencies[String(minutes)]
+  if (named) return named
+  if (minutes <= 0) return ""
+  if (minutes % 10080 === 0) return "every " + (minutes / 10080) + " weeks"
+  if (minutes % 1440 === 0) return "every " + (minutes / 1440) + " days"
+  if (minutes % 60 === 0) return "every " + (minutes / 60) + " hours"
+  return "every " + minutes + " min"
+}
+
+function heartbeatDetail(heartbeat) {
+  var h = heartbeat || {}
+  var parts = []
+  var frequency = heartbeatFrequency(h)
+  if (frequency) parts.push(frequency)
+  if (h.gracePeriod > 0) parts.push("grace " + h.gracePeriod + " min")
+  return parts.join(" · ")
+}
+
+// `pending` is a heartbeat that has never been pinged, which is a setup state
+// rather than a failure — it says so without the red one that has gone quiet
+// earns. A null status is Forge declining to answer, which is neither.
+function heartbeatStatus(heartbeat) {
+  var status = String((heartbeat || {}).status || "")
+  if (status === "") return { label: "unknown", tone: "idle" }
+  return { label: status,
+           tone: status === "missing" ? "bad" : status === "beating" ? "ok" : "idle" }
+}
+
+function heartbeatTone(heartbeat) {
+  return heartbeatStatus(heartbeat).tone
+}
+
+function _heartbeatRank(heartbeat) {
+  var status = String((heartbeat || {}).status || "")
+  if (status === "missing") return 0
+  if (status === "pending") return 1
+  if (status === "") return 2
+  return 3
+}
+
+function heartbeatsFrom(body) {
+  var out = []
+  var data = body && Array.isArray(body.data) ? body.data : []
+  for (var i = 0; i < data.length; i++) {
+    var resource = data[i]
+    var a = resource.attributes || {}
+    out.push({
+      id: String(resource.id),
+      name: String(a.name || "heartbeat"),
+      status: a.status ? String(a.status) : "",
+      gracePeriod: Number(a.grace_period || 0),
+      frequency: Number(a.frequency || 0),
+      customFrequency: a.custom_frequency ? String(a.custom_frequency) : ""
+    })
+  }
+  return out.sort(function (x, y) {
+    var rank = _heartbeatRank(x) - _heartbeatRank(y)
+    return rank !== 0 ? rank : x.name.localeCompare(y.name)
+  })
+}
+
+function heartbeatsBadge(heartbeats) {
+  var list = Array.isArray(heartbeats) ? heartbeats : []
+  for (var i = 0; i < list.length; i++)
+    if (heartbeatTone(list[i]) === "bad") return "bad"
+  return "none"
+}
+
 // ------------------------------------------------------------- site actions
 
 // The three logs Forge keeps for a site, in the order the view lists them: the
@@ -465,8 +668,8 @@ function siteLogLabel(kind) {
 // the view teaches the accelerator rather than hiding it. An unavailable
 // action is still listed — a missing "Deployment log" would read as a bug,
 // where one that says "never deployed" answers the question. `armable` marks
-// the two that write: it is what `rowView` hangs the arm key on, and seven of
-// these ten change nothing on a server — `command` is the third that writes,
+// the two that write: it is what `rowView` hangs the arm key on, and eight of
+// these eleven change nothing on a server — `command` is the third that writes,
 // and only because of what the prompt it opens eventually sends.
 //
 // Takes the org because the maintenance toggle sends somewhere, and a path
@@ -538,6 +741,11 @@ function siteActions(org, site) {
     { id: "log", label: "Deployment log", hint: "",
       available: deployed, reason: deployed ? "" : "never deployed" }
   ].concat(logs, [
+    // Forge's own dead-man switches for this site. A read like the logs above
+    // it, and listed even when there are none, because "no heartbeats" is what
+    // someone opening this wants to know.
+    { id: "heartbeats", label: "Heartbeats", hint: "",
+      available: !!site, reason: "not listed" },
     { id: "open", label: "Open site", hint: "o",
       available: url !== "", reason: url !== "" ? "" : "no address" },
     { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
@@ -851,6 +1059,10 @@ function serverActions(org, server) {
     // some to read even when this server is in no state to run one, and the
     // row there says so.
     { id: "recipes", label: "Run a recipe…", hint: "", available: true, reason: "" },
+    // A read, on the event feed's terms and available for its reason: a server
+    // whose CPU monitor is firing is exactly the one worth looking at, and an
+    // empty list is an answer rather than a failure.
+    { id: "monitors", label: "Monitors", hint: "", available: true, reason: "" },
     { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
     { id: "ssh", label: "Copy ssh command", hint: "s",
       available: ssh !== "", reason: ssh !== "" ? "" : "no public IP" }
@@ -999,7 +1211,7 @@ function deploymentLabel(status) {
 // come through here too, so every view draws with the same delegate.
 //
 // ctx: { server, site, orgLabel, orgHealth, orgSummary, siteCount,
-//        showOrgHeaders, action, event, recipe, armKey }
+//        showOrgHeaders, action, event, recipe, monitor, heartbeat, armKey }
 //
 // Nothing here may touch a QML type, so the result carries `depth` rather than
 // a pixel indent and `tone` rather than a colour — ForgeRow owns the metrics
@@ -1131,6 +1343,50 @@ function rowView(row, ctx) {
       showChevron: false,
       actionKey: recipeAction.armable === true ? String(c.armKey || "") : "",
       armedText: String(recipeAction.armedText || defaultArmedText),
+      timeAt: ""
+    }
+  }
+
+  // A monitor row is the one list row here whose dot means something remote:
+  // the tone is Forge's verdict on a threshold, not a lifecycle this widget
+  // drives. `timeAt` is `state_changed_at`, so the column a site uses for "when
+  // it last deployed" says how long this has been firing — which is the first
+  // thing anyone asks of an alert.
+  if (kind === "monitor") {
+    var monitor = c.monitor || {}
+    var reportedMonitor = monitorStatus(monitor)
+    return {
+      kind: kind,
+      label: monitorLabel(monitor),
+      detail: monitorDetail(monitor),
+      status: reportedMonitor.label,
+      tone: reportedMonitor.tone,
+      depth: 0,
+      showChevron: false,
+      actionKey: "",
+      armedText: "",
+      timeAt: String(monitor.stateChangedAt || "")
+    }
+  }
+
+  // A heartbeat row is the monitor's twin with one thing missing: the resource
+  // carries no timestamp of any kind, so the time column stays empty rather
+  // than dating the wrong fact. What it has instead is its schedule, which is
+  // what makes a `missing` legible — "every minute, grace 5 min" says how long
+  // ago something stopped.
+  if (kind === "heartbeat") {
+    var heartbeat = c.heartbeat || {}
+    var reportedHeartbeat = heartbeatStatus(heartbeat)
+    return {
+      kind: kind,
+      label: String(heartbeat.name || ""),
+      detail: heartbeatDetail(heartbeat),
+      status: reportedHeartbeat.label,
+      tone: reportedHeartbeat.tone,
+      depth: 0,
+      showChevron: false,
+      actionKey: "",
+      armedText: "",
       timeAt: ""
     }
   }
@@ -1428,6 +1684,23 @@ function serverEventsPath(org, serverId, cursor) {
 
 function eventOutputPath(org, serverId, eventId) {
   return serverPath(org, serverId) + "/events/" + encode(eventId) + "/output"
+}
+
+// Forge's own alerting: what it watches on a server, and what a site is
+// supposed to be pinging. Both want only `server:view` — the scope every sweep
+// already needs — so they are the event feed's situation rather than the deploy
+// log's, and a read-only token reaches them.
+//
+// Neither sends a `sort`. The monitors endpoint accepts one, but `state` sorts
+// alphabetically and `ALERT < OK < UNKNOWN` is severity in neither direction,
+// so the order is `monitorsFrom`'s to impose; the heartbeats endpoint takes no
+// `sort` or `filter` at all and leaves `heartbeatsFrom` no choice.
+function monitorsPath(org, serverId, cursor) {
+  return pagedPath(serverPath(org, serverId) + "/monitors", cursor)
+}
+
+function heartbeatsPath(org, serverId, siteId, cursor) {
+  return pagedPath(sitePath(org, serverId, siteId) + "/heartbeats", cursor)
 }
 
 // The deploy log, fetched only when someone asks for it. Note the scope: this

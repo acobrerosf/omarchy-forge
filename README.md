@@ -109,7 +109,7 @@ Opening a site gives you its actions and its details, all from data the refresh 
 
 | | |
 |---|---|
-| **Actions** | deploy, toggle maintenance mode, run a command, read the deployment log, read the three site logs, open the site, open it in Forge, copy its ssh command |
+| **Actions** | deploy, toggle maintenance mode, run a command, read the deployment log, read the three site logs, list its heartbeats, open the site, open it in Forge, copy its ssh command |
 | **Details** | PHP version, app type, status, maintenance mode, isolation, zero-downtime, releases kept, aliases, healthcheck |
 
 An action that can't run says why — a site with no repository, or one that has never deployed.
@@ -130,6 +130,19 @@ answering 500. An empty log says so rather than showing Forge's placeholder line
 
 Site logs need the `server:manage-logs` scope. That is Forge's name for it and it reads like a
 write scope, because the same scope clears them; a token without it is told so on the pane.
+
+#### Heartbeats
+
+A heartbeat is a dead-man switch: something out there — a cron job, a queue worker — is supposed to
+ping Forge on a schedule, and Forge raises the alarm when it stops. **Heartbeats** lists the ones
+this site has, worst first, with what each is called, whether it is `beating`, `missing` or still
+`pending`, how often it is expected and how much grace it gets.
+
+Read when you ask and never polled, so `r` looks again. Forge records no timestamps on a heartbeat,
+so a row cannot say when one was last seen — its schedule is what makes a `missing` legible. The
+ping URL is deliberately not shown: it is the credential that marks the site alive, and it belongs
+in the dashboard rather than in a bar widget. Creating and editing heartbeats is the dashboard's
+too; this reads them.
 
 | Key | In a log, or a command's, a recipe's or an event's output |
 |---|---|
@@ -152,6 +165,7 @@ Press `l` on an unfolded server, or click the ⚙ on any server row.
 | **Reboot server** | enter to arm, capital `Y` to send |
 | **Server events** | what Forge has done to the server, newest first — also `e` from any row |
 | **Run a recipe** | the organization's saved scripts; enter arms one, `Y` runs it here |
+| **Monitors** | Forge's own alerts for this server — CPU, disk, memory — and which are firing |
 
 Forge does all of this asynchronously, so the answer is "requested" — what changed shows up in the
 next refresh.
@@ -178,6 +192,17 @@ arrives when the run finishes, in the same pane as a deployment log and with the
 The row says who the recipe runs as, `root` or `forge`, and its first line. It will not arm on a
 server that is not ready, and says which instead. Nothing here can edit or create a recipe: this
 runs what is already written, and the dashboard is where writing it belongs.
+
+#### Monitors
+
+Forge can watch a server's CPU load, disk and memory and alert on a threshold. **Monitors** lists
+what this server is watching — `CPU load ≥ 90%`, `Disk ≥ 80%` — with how often Forge checks it, who
+gets the email, and whether it is firing. A firing monitor is red and says how long it has been
+that way; one Forge is still installing, or failed to install, says that instead.
+
+Read when you ask and never polled, so `r` looks again. Reading them needs only `server:view`, the
+scope the refresh already uses. Creating and deleting monitors stays in the dashboard, where the
+threshold can be thought about.
 
 Forge answers the run with no id to follow, so the widget recognises the run afterwards in the
 recipe's own list of runs — by the server, and by being newer than the last one it followed. That
@@ -232,7 +257,8 @@ including its own dashboard in a browser tab.
 A refresh costs **two requests per organization**, whatever your server count, and that figure
 doesn't change with the number of monitors. Opening a deployment log is one more, and so is a site
 log, and so is a server's event feed — one per page of thirty, and one for each event's output you
-open, and one per page of the recipe list. Running a command costs about a dozen, spread over a
+open, one per page of the recipe list, one per page of a server's monitors and one per page of a
+site's heartbeats. Running a command costs about a dozen, spread over a
 hundred seconds, and running a recipe costs the same.
 
 The widget keeps a budget per account and backs off before it runs out, telling you on the row
@@ -303,6 +329,12 @@ reaches, and which is the default. Tokens are never in there.
 - **A recipe run is recognised, not received.** Forge's answer to starting one carries no id, so
   the run is found afterwards in the recipe's run list — three pages of thirty deep. A recipe with
   more than ninety runs on record can outrun that, and the pane says it is still looking.
+- **Monitors and heartbeats are read, never watched.** Both are on-demand views, so a monitor
+  firing or a heartbeat going missing never changes the bar icon and never raises a notification.
+  Forge offers no organization-wide list of either and no way to attach them to the server or site
+  requests the refresh already makes, so watching them would cost one request per server plus one
+  per site on every tick — a second sweep, against a budget the flat two-per-organization figure
+  above depends on.
 - **Logs need a scope named for writing.** Forge gates deployment output behind
   `site:manage-deploys` and a site's own logs behind `server:manage-logs`, the scope that clears
   them. That is Forge's choice, not this plugin's — a strictly read-only token can watch a

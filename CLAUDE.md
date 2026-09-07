@@ -92,7 +92,7 @@ a keypress — the deploy log's, a site log's, a server action's, a maintenance 
 behind a scope named for writing — is reported on the row or the pane instead of across the
 organization's rows, and for a write it is the job's `scopeMessage` that decides both the wording
 and the quiet; every on-demand read enters through `_enqueueRead` and every drop site refuses
-through `_readRefused`, so a sixth read kind is only complete when it has an arm in those and in
+through `_readRefused`, so a new read kind is only complete when it has an arm in those and in
 `_readRequestKey` as well as a line in `_pathFor` and one in `_finishFetch` — and `_pathFor`
 answering `""` is what stops a kind missing from it being charged for and sent as the org site list;
 the three document panes answer one signal, `documentFetched`, because only one is ever open and the

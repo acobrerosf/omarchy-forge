@@ -69,11 +69,14 @@ Panel {
     || routeKind === "recipeOutput"
 
   // The routes that are about a *server* rather than a site or the tree: its
-  // own view, its event feed, and the recipe list opened from it. They wear the
-  // server's hero and its crumb, so the question is drawn once here for
-  // `paneRoute`'s reason rather than at each of the five places that asks it.
+  // own view, its event feed, the recipe list opened from it, and its monitors.
+  // They wear the server's hero and its crumb, so the question is drawn once
+  // here for `paneRoute`'s reason rather than at each of the five places that
+  // asks it. A site's heartbeats are deliberately not in it: that route carries
+  // a `siteId`, so `routeSite` resolves and the hero is the site's.
   readonly property bool serverRoute: routeKind === "server"
     || routeKind === "events" || routeKind === "recipes"
+    || routeKind === "monitors"
 
   // The document pane's state, whichever document it is showing: a deployment's
   // log, one of a site's own logs, or an event's output. One set rather than
@@ -130,6 +133,26 @@ Panel {
       if (recipes[i].id === String(route.recipeId)) return recipes[i]
     return null
   }
+
+  // A server's monitors and a site's heartbeats — Forge's own alerting, read
+  // when asked and never polled, so this is the only place either is ever seen.
+  // Two sets rather than one: unlike the three document panes, which share
+  // everything a pane has, these hold different rows and are reached from
+  // different subjects, so a shared set would only be two sets with a switch
+  // on top. Both are the feed's shape otherwise — a page the reader asks for,
+  // and a route that can have another pushed over it, so `popView` clears them
+  // by the kind it popped.
+  property string monitorsRequestKey: ""
+  property var monitors: []
+  property string monitorsCursor: ""
+  property string monitorsError: ""
+  property bool monitorsLoading: false
+
+  property string heartbeatsRequestKey: ""
+  property var heartbeats: []
+  property string heartbeatsCursor: ""
+  property string heartbeatsError: ""
+  property bool heartbeatsLoading: false
 
   // The command prompt and the run it turns into. `commandText` is deliberately
   // not remembered between opens: a command that can be recalled is a command
@@ -309,6 +332,8 @@ Panel {
     if (routeKind === "site" || routeKind === "server") return actionRows
     if (routeKind === "events") return eventRows
     if (routeKind === "recipes") return recipeRows
+    if (routeKind === "monitors") return monitorRows
+    if (routeKind === "heartbeats") return heartbeatRows
 
     var out = []
     for (var o = 0; o < organizations.length; o++) {
@@ -408,6 +433,49 @@ Panel {
     return out
   }
 
+  // A server's monitors, on the feed's terms: one row each, the monitor riding
+  // the row the way an event does, and a last row for the next page while
+  // there is one. Nothing here arms — a monitor is created and deleted in the
+  // dashboard, and this widget only reads — so the rows carry no `armKey` and
+  // `activate` refuses them.
+  readonly property var monitorRows: {
+    var out = []
+    if (routeKind !== "monitors") return out
+    var prefix = route.org + "/" + route.serverId + "/"
+    for (var i = 0; i < monitors.length; i++)
+      out.push({ kind: "monitor", org: route.org, serverId: route.serverId,
+                 monitorId: monitors[i].id, monitor: monitors[i],
+                 key: prefix + "monitor/" + monitors[i].id })
+    if (monitorsCursor !== "")
+      out.push(actionRow(route.org, route.serverId, "", prefix,
+                         { id: "monitors-more", hint: "",
+                           label: monitorsLoading ? "Loading more monitors…" : "More monitors…",
+                           available: true, reason: "" }, ""))
+    return out
+  }
+
+  // The same list one level down. The rows carry no `siteId` on purpose, the
+  // way an event row carries none: a site id on a row is what `currentSite`
+  // resolves, so `d` on a heartbeat would arm a deploy from a list that has
+  // nothing to do with deploying. The route carries it, which is what the hero
+  // and `d` read instead.
+  readonly property var heartbeatRows: {
+    var out = []
+    if (routeKind !== "heartbeats") return out
+    var prefix = route.org + "/" + route.serverId + ":" + route.siteId + "/"
+    for (var i = 0; i < heartbeats.length; i++)
+      out.push({ kind: "heartbeat", org: route.org, serverId: route.serverId,
+                 heartbeatId: heartbeats[i].id, heartbeat: heartbeats[i],
+                 key: prefix + "heartbeat/" + heartbeats[i].id })
+    if (heartbeatsCursor !== "")
+      out.push(actionRow(route.org, route.serverId, "", prefix,
+                         { id: "heartbeats-more", hint: "",
+                           label: heartbeatsLoading ? "Loading more heartbeats…"
+                                                    : "More heartbeats…",
+                           available: true, reason: "" }, ""))
+    return out
+  }
+
   // The row the view was opened from rides the view, so backing out lands on
   // it rather than on the top of whatever list is underneath — which for a
   // feed of thirty events read one at a time is the difference between
@@ -445,6 +513,10 @@ Panel {
     // pushed over it, and backing out of that output has to land on the list
     // it was chosen from.
     if (popped.kind === "recipes") clearRecipes()
+    // Both alerting lists are in it too: a feed opened with `e` from either one
+    // is pushed over it, and the pop back has to land on the list intact.
+    if (popped.kind === "monitors") clearMonitors()
+    if (popped.kind === "heartbeats") clearHeartbeats()
     return true
   }
 
@@ -544,6 +616,9 @@ Panel {
     if (row.kind === "action")
       return Model.rowView(row, { action: row.action, armKey: row.armKey })
     if (row.kind === "event") return Model.rowView(row, { event: row.event })
+    if (row.kind === "monitor") return Model.rowView(row, { monitor: row.monitor })
+    if (row.kind === "heartbeat")
+      return Model.rowView(row, { heartbeat: row.heartbeat })
     if (row.kind === "recipe")
       return Model.rowView(row, { recipe: row.recipe, action: row.action,
                                   armKey: row.armKey })
@@ -616,6 +691,11 @@ Panel {
     // check when the server is in no state to run one.
     if (row.kind === "action" || row.kind === "recipe") { runAction(row); return }
     if (row.kind === "event") { openEventOutput(row); return }
+    // Nothing to open and nothing to send: both lists are read-only, and both
+    // say everything they know on the row. The explicit refusal is what keeps
+    // them out of the site fallthrough below, which would either flash "no
+    // longer listed" or push a site view over the list.
+    if (row.kind === "monitor" || row.kind === "heartbeat") return
     if (!siteFor(row)) { say("That site is no longer listed"); return }
     pushView({ kind: "site", org: row.org, serverId: row.serverId, siteId: row.siteId })
   }
@@ -730,6 +810,11 @@ Panel {
   // The badge follows whatever the hero is about, so in a site view it reports
   // that site rather than the health of everything being watched.
   readonly property string heroTone: {
+    // Before the two below it, both of which match these routes: a monitor list
+    // is about its monitors rather than about the server's own reachability,
+    // and whether anything is firing is the whole reason to have opened it.
+    if (routeKind === "monitors") return Model.monitorsBadge(monitors)
+    if (routeKind === "heartbeats") return Model.heartbeatsBadge(heartbeats)
     if (routeSite) {
       var tone = Model.siteTone(routeSite)
       return tone === "bad" ? "bad" : tone === "busy" ? "busy"
@@ -776,6 +861,12 @@ Panel {
       return row && row.kind === "recipe"
         ? "[enter] arm · [Y] run · [h] back"
         : "[enter] open · [r] refresh · [h] back"
+    // Nothing on either list does anything, so the line names what is left —
+    // except on the trailing row, which is the one thing here enter reaches.
+    if (routeKind === "monitors" || routeKind === "heartbeats")
+      return row && row.kind === "action"
+        ? "[enter] more · [r] refresh · [h] back"
+        : "[r] refresh · [h] back"
     if (routeKind === "site" || routeKind === "server") {
       // The confirm key is worth naming on the one row that wants it, and
       // nowhere else — on `Restart nginx` it would only be a puzzle.
@@ -833,6 +924,10 @@ Panel {
     case "events-more": fetchEvents(eventsCursor); break
     case "recipes": openRecipes(); break
     case "recipes-more": fetchRecipes(recipesCursor); break
+    case "monitors": openMonitors(); break
+    case "monitors-more": fetchMonitors(monitorsCursor); break
+    case "heartbeats": openHeartbeats(); break
+    case "heartbeats-more": fetchHeartbeats(heartbeatsCursor); break
     case "open": openCurrent(); break
     case "forge": openCurrentInForge(); break
     case "ssh": copyCurrentSsh(); break
@@ -1037,6 +1132,22 @@ Panel {
     recipesLoading = false
   }
 
+  function clearMonitors() {
+    monitorsRequestKey = ""
+    monitors = []
+    monitorsCursor = ""
+    monitorsError = ""
+    monitorsLoading = false
+  }
+
+  function clearHeartbeats() {
+    heartbeatsRequestKey = ""
+    heartbeats = []
+    heartbeatsCursor = ""
+    heartbeatsError = ""
+    heartbeatsLoading = false
+  }
+
   // `e`, and the row in the server view. Resolves the server the way `f` and
   // `s` do — the row under the cursor, else the view's — so it means the same
   // thing from a site as from its server. Three refusals: from inside a pane
@@ -1089,6 +1200,51 @@ Panel {
     recipesLoading = true
     if (cursor === "") { recipesError = ""; recipesCursor = "" }
     forge.fetchRecipes(route.org, cursor)
+  }
+
+  // The recipe list's refusals, for its reasons: a view pushed over a pane or
+  // the prompt would be cleared on the way back out by the pop that clears
+  // those, taking the pane's text or the typed command with it.
+  function openMonitors() {
+    if (paneRoute || routeKind === "monitors" || routeKind === "command") return
+    var server = currentServer()
+    if (!server || !forge) return
+    var org = currentOrg()
+    clearMonitors()
+    pushView({ kind: "monitors", org: org, serverId: server.id })
+    fetchMonitors("")
+  }
+
+  function fetchMonitors(cursor) {
+    if (!forge || routeKind !== "monitors") return
+    monitorsRequestKey = forge.monitorsRequestKey(route.org, route.serverId)
+    monitorsLoading = true
+    if (cursor === "") { monitorsError = ""; monitorsCursor = "" }
+    forge.fetchMonitors(route.org, route.serverId, cursor)
+  }
+
+  // Resolves the site the way `openLog` does — the row under the cursor, else
+  // the view's — so it means the same thing pressed from the site view as from
+  // the tree, and says so when the site has gone out from under it.
+  function openHeartbeats() {
+    if (paneRoute || routeKind === "heartbeats" || routeKind === "command") return
+    var row = currentRow()
+    if (!row || !forge) return
+    var site = currentSite()
+    if (!site) { say("That site is no longer listed"); return }
+    clearHeartbeats()
+    pushView({ kind: "heartbeats", org: row.org, serverId: row.serverId,
+               siteId: site.id })
+    fetchHeartbeats("")
+  }
+
+  function fetchHeartbeats(cursor) {
+    if (!forge || routeKind !== "heartbeats") return
+    heartbeatsRequestKey = forge.heartbeatsRequestKey(route.org, route.serverId,
+                                                      route.siteId)
+    heartbeatsLoading = true
+    if (cursor === "") { heartbeatsError = ""; heartbeatsCursor = "" }
+    forge.fetchHeartbeats(route.org, route.serverId, route.siteId, cursor)
   }
 
   // The list has sent, so the pane that follows the run is pushed *over* it —
@@ -1370,6 +1526,7 @@ Panel {
     else {
       disarm(); cursorActive = false; navStack = []
       clearLog(); clearCommand(); clearEvents(); clearRecipes()
+      clearMonitors(); clearHeartbeats()
     }
   }
 
@@ -1492,6 +1649,41 @@ Panel {
       root.recipesError = ""
       root.recipes = cursor === "" ? recipes : root.recipes.concat(recipes)
       root.recipesCursor = String(nextCursor || "")
+    }
+
+    // The feed's handler twice over, filtered by key for its reason: the
+    // service answers the session, and only the screen that asked has a list
+    // waiting. A first page replaces, a later one extends — and a page that
+    // failed on top of rows already drawn is said rather than written over
+    // them, because the rows are still true.
+    function onMonitorsFetched(requestKey, ok, monitors, cursor, nextCursor, message) {
+      if (root.monitorsRequestKey !== requestKey) return
+      root.monitorsLoading = false
+      if (!ok) {
+        var whyMonitors = String(message || "Could not read the monitors")
+        if (cursor === "" || root.monitors.length === 0) root.monitorsError = whyMonitors
+        else root.say(whyMonitors)
+        return
+      }
+      root.monitorsError = ""
+      root.monitors = cursor === "" ? monitors : root.monitors.concat(monitors)
+      root.monitorsCursor = String(nextCursor || "")
+    }
+
+    function onHeartbeatsFetched(requestKey, ok, heartbeats, cursor, nextCursor, message) {
+      if (root.heartbeatsRequestKey !== requestKey) return
+      root.heartbeatsLoading = false
+      if (!ok) {
+        var whyHeartbeats = String(message || "Could not read the heartbeats")
+        if (cursor === "" || root.heartbeats.length === 0)
+          root.heartbeatsError = whyHeartbeats
+        else root.say(whyHeartbeats)
+        return
+      }
+      root.heartbeatsError = ""
+      root.heartbeats = cursor === "" ? heartbeats
+                                      : root.heartbeats.concat(heartbeats)
+      root.heartbeatsCursor = String(nextCursor || "")
     }
 
     // Where a copy or a save landed, or why it didn't. Saying it from here
@@ -1671,6 +1863,8 @@ Panel {
           else if (root.routeKind === "siteLog") root.refreshSiteLog()
           else if (root.routeKind === "events") root.fetchEvents("")
           else if (root.routeKind === "recipes") root.fetchRecipes("")
+          else if (root.routeKind === "monitors") root.fetchMonitors("")
+          else if (root.routeKind === "heartbeats") root.fetchHeartbeats("")
           else root.refresh()
           break
         case "e": root.openServerEvents(); break
@@ -1918,6 +2112,8 @@ Panel {
               text: root.routeKind === "site" || root.routeKind === "server" ? "ACTIONS"
                 : root.routeKind === "events" ? "EVENTS"
                 : root.routeKind === "recipes" ? "RECIPES"
+                : root.routeKind === "monitors" ? "MONITORS"
+                : root.routeKind === "heartbeats" ? "HEARTBEATS"
                 : root.showOrgHeaders ? "ORGANIZATIONS" : "SERVERS"
               foreground: root.foreground
               fontFamily: root.fontFamily
@@ -2125,6 +2321,38 @@ Panel {
               : root.recipesError !== "" ? root.recipesError
               : "No recipes in this organization."
           }
+
+          // The same three again for each alerting list. "None" is the ordinary
+          // answer for both — a monitor and a heartbeat are things somebody has
+          // to have set up in the dashboard — so an empty list says so plainly
+          // rather than looking like a request that went missing.
+          Text {
+            width: parent.width
+            visible: root.routeKind === "monitors" && root.rows.length === 0
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            color: root.monitorsError !== "" ? root.badColor : root.foreground
+            opacity: root.monitorsError !== "" ? 0.9 : 0.55
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            text: root.monitorsLoading ? "Fetching monitors…"
+              : root.monitorsError !== "" ? root.monitorsError
+              : "No monitors on this server."
+          }
+
+          Text {
+            width: parent.width
+            visible: root.routeKind === "heartbeats" && root.rows.length === 0
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            color: root.heartbeatsError !== "" ? root.badColor : root.foreground
+            opacity: root.heartbeatsError !== "" ? 0.9 : 0.55
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            text: root.heartbeatsLoading ? "Fetching heartbeats…"
+              : root.heartbeatsError !== "" ? root.heartbeatsError
+              : "No heartbeats on this site."
+          }
         }
       }
 
@@ -2173,6 +2401,7 @@ Panel {
           // that matters on a list that is still loading or came back refused.
           visible: root.rows.length > 0 || root.paneRoute
             || root.routeKind === "events" || root.routeKind === "recipes"
+            || root.routeKind === "monitors" || root.routeKind === "heartbeats"
           wrapMode: Text.WordWrap
           textFormat: Text.PlainText
           color: root.foreground

@@ -10,14 +10,7 @@ the v2 OpenAPI spec (`https://forge.laravel.com/api/docs.openapi`, 154 paths) an
 
 ## Features
 
-### 1. Monitors and heartbeats
-
-`GET .../servers/{server}/monitors` (scope `server:view`) and the site
-`heartbeats` endpoints. Forge's own alerting, surfaced in the bar. Would need
-its own idea of what "unhealthy" means on top of the four tones we have, so
-it is a bigger design question than it looks.
-
-### 2. The rest of the services
+### 1. The rest of the services
 
 Done: nginx restart, PHP-FPM reload and restart, and server reboot behind a
 `Y` confirm, in a server view reached with `l`. What that left out, in the order

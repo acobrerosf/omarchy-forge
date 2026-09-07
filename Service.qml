@@ -127,6 +127,29 @@ Item {
     return String(org) + "/recipes"
   }
 
+  // A server's monitors and a site's heartbeats: Forge's own alerting, on the
+  // event feed's terms — a keypress asked, the answer is rows and a cursor, and
+  // a refusal is always reported. Two signals rather than one, unlike the three
+  // document panes: those share a signal because they share the pane's whole
+  // state, where these two carry different rows into different properties, and
+  // one signal with a kind on it would only move that switch to the panel.
+  signal monitorsFetched(string requestKey, bool ok, var monitors, string cursor,
+                         string nextCursor, string message)
+
+  signal heartbeatsFetched(string requestKey, bool ok, var heartbeats, string cursor,
+                           string nextCursor, string message)
+
+  function monitorsRequestKey(org, serverId) {
+    return String(org) + "/" + String(serverId) + "/monitors"
+  }
+
+  // The site log's colon shape, for its reason: the key has to be unmistakable
+  // for the server-level one above it, and a site id is what tells them apart.
+  function heartbeatsRequestKey(org, serverId, siteId) {
+    return String(org) + "/" + String(serverId) + ":" + String(siteId)
+      + "/heartbeats"
+  }
+
   // A recipe run is followed on `commandRunUpdated` rather than a signal of its
   // own: there is one watch slot for the session, and every field of that
   // signal fits — `commandId` carries the run log's id, `header` its state
@@ -611,13 +634,14 @@ Item {
 
   // ------------------------------------------------------- on-demand reads
 
-  // The five reads a keypress can ask for — a deploy log, a server's event
-  // feed, one event's output, the organization's recipes, a site's own log —
-  // share one road, because what makes them a group is not the repetition but
-  // the rule: each has a pane or a view waiting on a signal, so every way a
-  // request can fail to happen owes it an answer. The three functions below
-  // are that rule in one place. A sixth read kind is complete when it has an
-  // arm in each of them, a line in `_pathFor` and one in `onExited`.
+  // The seven reads a keypress can ask for — a deploy log, a server's event
+  // feed, one event's output, the organization's recipes, a site's own log, a
+  // server's monitors and a site's heartbeats — share one road, because what
+  // makes them a group is not the repetition but the rule: each has a pane or a
+  // view waiting on a signal, so every way a request can fail to happen owes it
+  // an answer. The three functions below are that rule in one place. A new read
+  // kind is complete when it has an arm in each of them, a line in `_pathFor`
+  // and one in `_finishFetch`.
 
   // The key the answer will carry, which is also what makes two asks for the
   // same thing the same ask. Each shape is the one its signal is filtered by
@@ -631,6 +655,9 @@ Item {
     if (job.kind === "recipes") return recipesRequestKey(job.org)
     if (job.kind === "siteLog")
       return siteLogRequestKey(job.org, job.serverId, job.siteId, job.log)
+    if (job.kind === "monitors") return monitorsRequestKey(job.org, job.serverId)
+    if (job.kind === "heartbeats")
+      return heartbeatsRequestKey(job.org, job.serverId, job.siteId)
     return ""
   }
 
@@ -651,6 +678,16 @@ Item {
     if (job.kind === "recipes") {
       recipesFetched(_readRequestKey(job), false, [],
                      String(job.cursor || ""), "", message)
+      return true
+    }
+    if (job.kind === "monitors") {
+      monitorsFetched(_readRequestKey(job), false, [],
+                      String(job.cursor || ""), "", message)
+      return true
+    }
+    if (job.kind === "heartbeats") {
+      heartbeatsFetched(_readRequestKey(job), false, [],
+                        String(job.cursor || ""), "", message)
       return true
     }
     return false
@@ -787,6 +824,10 @@ Item {
       return Model.recipeRunListPath(job.org, job.recipeId, job.cursor)
     if (job.kind === "recipeShow")
       return Model.recipeRunLogPath(job.org, job.recipeId, job.commandId)
+    if (job.kind === "monitors")
+      return Model.monitorsPath(job.org, job.serverId, job.cursor)
+    if (job.kind === "heartbeats")
+      return Model.heartbeatsPath(job.org, job.serverId, job.siteId, job.cursor)
     return ""
   }
 
@@ -827,6 +868,8 @@ Item {
       else if (job.kind === "recipes") _onRecipes(job, text)
       else if (job.kind === "recipeFind") _onRecipeFind(job, text)
       else if (job.kind === "recipeShow") _onRecipeShow(job, text)
+      else if (job.kind === "monitors") _onMonitors(job, text)
+      else if (job.kind === "heartbeats") _onHeartbeats(job, text)
       else console.warn("omarchy-forge: no handler for job kind \""
                         + String(job.kind) + "\" — answer dropped")
     } finally {
@@ -1295,6 +1338,61 @@ Item {
       return
     }
     documentFetched(_readRequestKey(job), true, output, "")
+  }
+
+  // ------------------------------------------ monitors and heartbeats
+
+  // Forge's own alerting, read when someone asks and never polled. Both take
+  // the event feed's road exactly — `_enqueueRead`'s guards, front of the
+  // queue, `quiet`, a refusal from every drop site, a page the reader asks for
+  // rather than a chain this walks.
+  //
+  // Never swept, and that is the design rather than an omission. There is no
+  // organization-level list of either and no `include` that would attach them
+  // to the sweep's two requests, so watching them would cost one request per
+  // server plus one per site, every tick — the O(1) budget ARCHITECTURE.md's
+  // rate section is built on, traded away for a fact nobody is looking at most
+  // of the time. So an alert never reaches the bar icon; it is on the view.
+  function fetchMonitors(org, serverId, cursor) {
+    _enqueueRead({ org: String(org), kind: "monitors", serverId: String(serverId),
+                   cursor: String(cursor || "") })
+  }
+
+  function fetchHeartbeats(org, serverId, siteId, cursor) {
+    _enqueueRead({ org: String(org), kind: "heartbeats", serverId: String(serverId),
+                   siteId: String(siteId), cursor: String(cursor || "") })
+  }
+
+  // The event feed's wording, because it is the event feed's situation: both
+  // want `server:view`, the scope every sweep already needs, so a read-only
+  // token is not refused here — which makes a 403 the surprising kind, worth
+  // naming on the chance the token was cut down further than the sweep needs.
+  function _alertingError(job, envelope, subject) {
+    _readRefused(job, envelope.status === 403
+      ? "Your token can't read " + subject + " — that needs the server:view scope"
+      : Model.envelopeError(envelope))
+  }
+
+  function _onMonitors(job, text) {
+    var envelope = Model.parseEnvelope(text)
+    if (!_applyEnvelope(job.org, job.account, envelope, true)) {
+      _alertingError(job, envelope, "monitors")
+      return
+    }
+    monitorsFetched(_readRequestKey(job), true,
+                    Model.monitorsFrom(envelope.body), String(job.cursor || ""),
+                    Model.nextCursor(envelope.body), "")
+  }
+
+  function _onHeartbeats(job, text) {
+    var envelope = Model.parseEnvelope(text)
+    if (!_applyEnvelope(job.org, job.account, envelope, true)) {
+      _alertingError(job, envelope, "heartbeats")
+      return
+    }
+    heartbeatsFetched(_readRequestKey(job), true,
+                      Model.heartbeatsFrom(envelope.body), String(job.cursor || ""),
+                      Model.nextCursor(envelope.body), "")
   }
 
   // ---------------------------------------------------------------- site logs

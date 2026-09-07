@@ -209,8 +209,9 @@ keypress would paint "Token is missing a scope for this" across rows that are pe
 The account-level bookkeeping still runs either way — whether there is a token, what the rate
 headers said, the hold a 429 imposes — because those are true whichever request found them.
 
-**One road for all five on-demand reads.** The deploy log, a server's event feed, one event's
-output, the organization's recipes and a site's own log are the same request with different words
+**One road for all seven on-demand reads.** The deploy log, a server's event feed, one event's
+output, the organization's recipes, a site's own log, a server's monitors and a site's heartbeats
+are the same request with different words
 on it, and what groups them is not the repetition but the rule: each has a pane or a view waiting
 on a signal, so every way the request can fail to happen owes it an answer. `fetchServerSites` can
 return silently because the rotation reaches that server anyway; nothing comes along later to fill
@@ -224,8 +225,8 @@ key the answer will carry, which is also what makes two asks the same ask, so th
 answer cannot drift apart. `_readRefused(job, message)` is the registry every drop site consults —
 an entry guard, `_abandonJob`, `_holdAccount`, an error on the wire — and it reports whether it
 recognised the kind, which is how `_holdAccount` tells a read it has answered from a run look it
-still owes a different word. Adding a sixth read means an arm in each of those three, a line in
-`_pathFor`, and a line in `onExited`; nothing else in the file has to be found and edited.
+still owes a different word. Adding a read means an arm in each of those three, a line in
+`_pathFor`, and a line in `_finishFetch`; nothing else in the file has to be found and edited.
 
 The three document reads — a deploy log, a site log, an event's output — answer one signal,
 `documentFetched`. One rather than three because there is one pane: only one is ever open, the
@@ -262,6 +263,29 @@ the single line `=== Empty log file ===`, which the pane would render as the log
 say it. And the scope is `server:manage-logs` — Forge's name for "clear a log" — so a read sits
 behind a scope named for a write, the deploy log's situation with a different word on the sign;
 the 403 is named on the pane for the same reason.
+
+**Forge's own alerting takes the feed's road, and stops there.** `GET
+.../servers/{server}/monitors` and `.../sites/{site}/heartbeats` are the event feed a fourth and
+fifth time — front of the queue, `quiet`, a refusal from every drop site, a page the reader asks
+for rather than a chain the service walks — and both want `server:view`, so like the feed they
+work on a read-only token and name a 403 on the view anyway.
+
+What is worth writing down is why neither is *swept*. There is no organization-level list of
+either, and no `include` on the servers or sites request that would carry them: the sites
+`include` enum stops at `server, tags, latestDeployment, securityRules, redirectRules`, and the
+servers endpoint takes no `include` at all. So watching them would cost one request per server
+plus one per site, every tick — which is the flat cost-of-2 above traded away for a fact that is
+almost always unchanged. They are therefore read when someone opens the view, and an alert never
+reaches the bar icon: `healthFor` does not know about them, and neither does `_announce`.
+
+Two smaller decisions follow from the payloads. Neither request sends a `sort`. The monitors
+endpoint accepts one, but the only interesting field is `state`, which sorts alphabetically —
+`ALERT < OK < UNKNOWN` is severity in neither direction — so `Model.monitorsFrom` ranks by tone
+locally; the heartbeats endpoint takes no `sort` or `filter` at all and leaves no choice. And
+`heartbeatsFrom` deliberately drops `ping_url`: it is the token that lets anything on the internet
+mark the site alive, nothing here draws it, and a credential in a `var` property every panel
+re-reads is the deploy log's mistake with a worse string in it. A monitor has no name either — its
+identity is `type` + `operator` + `threshold`, assembled by `Model.monitorLabel` and nowhere else.
 
 The panel does *not* give this pane its own state, and neither does an event's output. Both read
 and write the deploy log's `logRequestKey`/`logLines`/`logError`/`logLoading`, because only one pane
@@ -592,7 +616,8 @@ different `rows`.
 
 `navStack` holds what has been pushed over the tree; `route` is its top. `rows` switches on it:
 nothing pushed is the tree, a `site` or `server` route is that subject's actions, an `events` route
-is a server's feed, a `recipes` route is the organization's recipes, and a `log`, `siteLog`,
+is a server's feed, a `recipes` route is the organization's recipes, a `monitors` route is a
+server's monitors, a `heartbeats` route is a site's heartbeats, and a `log`, `siteLog`,
 `commandOutput`, `eventOutput` or `recipeOutput` route is empty because a pane is not a list —
 `paneRoute` is the five of them together, drawn once rather than at each of
 the half-dozen places that has to know, and the pane's document, loading flag and empty text are
