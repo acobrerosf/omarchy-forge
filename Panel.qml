@@ -894,7 +894,7 @@ Panel {
   // One row from a view. An unavailable action says why rather than doing
   // nothing — a key that appears to have missed is worse than a refusal. The
   // row rather than the action, because a server action needs to know which
-  // server, and which row of the four is arming.
+  // server, and which row is arming.
   function runAction(row) {
     if (!row || !row.action) return
     var action = row.action

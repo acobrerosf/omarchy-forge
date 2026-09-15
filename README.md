@@ -27,7 +27,7 @@ Tick these scopes:
 | `server:view` | required — servers, sites, deployment status |
 | `site:manage-deploys` | deploy from the bar, and read deployment logs |
 | `server:manage-logs` | read a site's application and nginx logs |
-| `server:manage-services` | restart nginx or PHP-FPM, reboot a server |
+| `server:manage-services` | restart nginx, PHP-FPM, supervisor, redis or the database; reboot a server |
 | `site:manage-commands` | run a command on a site, toggle maintenance mode |
 | `recipe:view` | list the organization's recipes and follow a run |
 | `recipe:manage` | run a recipe on a server |
@@ -109,13 +109,17 @@ Opening a site gives you its actions and its details, all from data the refresh 
 
 | | |
 |---|---|
-| **Actions** | deploy, toggle maintenance mode, run a command, read the deployment log, read the three site logs, list its heartbeats, open the site, open it in Forge, copy its ssh command |
+| **Actions** | deploy, toggle maintenance mode, reload its PHP-FPM, run a command, read the deployment log, read the three site logs, list its heartbeats, open the site, open it in Forge, copy its ssh command |
 | **Details** | PHP version, app type, status, maintenance mode, isolation, zero-downtime, releases kept, aliases, healthcheck |
 
 An action that can't run says why — a site with no repository, or one that has never deployed.
 
 **Maintenance mode** takes the site offline behind a 503, and brings it back on the same two
 presses. Forge does the work out on the server, so the row says `enabling…` until it has landed.
+
+**Reload PHP-FPM** gracefully reloads the pool for the site's own PHP version, on two presses. The
+server view's PHP rows act on the server's default version, which is the wrong pool for an
+isolated site running another one.
 
 **Run a command** opens a prompt: type a command, enter to arm, `Y` to run. It runs as `forge` in
 the site's directory. Nothing is remembered between opens — no history, no repeat key, on purpose.
@@ -162,10 +166,18 @@ Press `l` on an unfolded server, or click the ⚙ on any server row.
 | **Restart nginx** | two presses |
 | **Reload PHP-FPM** | a graceful reload of the server's PHP version |
 | **Restart PHP-FPM** | the harder version |
+| **Restart supervisor** | every queue worker and daemon on the server, two presses |
+| **Restart redis** | two presses |
+| **Restart MySQL** | or MariaDB, or Postgres — named for what the server runs; two presses |
 | **Reboot server** | enter to arm, capital `Y` to send |
 | **Server events** | what Forge has done to the server, newest first — also `e` from any row |
 | **Run a recipe** | the organization's saved scripts; enter arms one, `Y` runs it here |
 | **Monitors** | Forge's own alerts for this server — CPU, disk, memory — and which are firing |
+
+A server lists only the services its type runs, since Forge reports no service status to go on:
+an app server has all of them, a web server no redis or database, a worker PHP and supervisor, a
+load balancer nginx alone, a database or cache server its one service. A server with no database
+has no database row, and a type the widget doesn't know lists everything and lets Forge answer.
 
 Forge does all of this asynchronously, so the answer is "requested" — what changed shows up in the
 next refresh.
@@ -317,8 +329,8 @@ reaches, and which is the default. Tokens are never in there.
 
 - **The dashboard URL is a template.** The Forge API hands out no web link, so
   `dashboardUrlTemplate` is a setting.
-- **The server view stops at four writes.** Stopping a service and power-cycling a server are
-  deliberately absent, as are the database and queue services.
+- **The server view restarts, it never stops.** Stopping a service and power-cycling a server are
+  deliberately absent: a service stopped from the bar is one nothing here could start again.
 - **Events have no status.** Forge's event record says what was done and what it printed, not
   whether it worked, so the feed cannot colour a failed step — open its output to find out.
 - **The server list stops at 150 rows** and says so rather than quietly showing a prefix. Sites are

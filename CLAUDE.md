@@ -187,7 +187,7 @@ program — goes through `Model.externalUrl`.
 
 ## Known gaps (from README)
 
-The dashboard URL is a template because the API hands out no web link; server actions beyond
-deploy are deliberately absent; the server list stops at 5 pages (150 rows) or when the account's
+The dashboard URL is a template because the API hands out no web link; stopping a service and
+power-cycling a server are deliberately absent; the server list stops at 5 pages (150 rows) or when the account's
 minute is nearly spent, and says so — the site list instead rotates one 5-page window per tick,
 resuming from a kept cursor, so large orgs are fully covered over several refreshes.

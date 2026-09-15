@@ -104,6 +104,11 @@ function serversFrom(body) {
       ip: a.ip_address ? String(a.ip_address) : "",
       sshPort: Number(a.ssh_port) || 22,
       phpVersion: a.php_version ? String(a.php_version) : "",
+      // "mysql8", "mariadb1011", "postgres17" — or null on a server without
+      // one. Kept for `databaseService` alone: it is the only thing in the
+      // payload that says which of Forge's two database endpoints a server has,
+      // because `db_status` and `redis_status` come back null on real servers.
+      databaseType: a.database_type ? String(a.database_type) : "",
       state: serverState(a)
     })
   }
@@ -668,12 +673,13 @@ function siteLogLabel(kind) {
 // the view teaches the accelerator rather than hiding it. An unavailable
 // action is still listed — a missing "Deployment log" would read as a bug,
 // where one that says "never deployed" answers the question. `armable` marks
-// the two that write: it is what `rowView` hangs the arm key on, and eight of
-// these eleven change nothing on a server — `command` is the third that writes,
+// the three that write: it is what `rowView` hangs the arm key on, and eight of
+// these twelve change nothing on a server — `command` is the fourth that writes,
 // and only because of what the prompt it opens eventually sends.
 //
-// Takes the org because the maintenance toggle sends somewhere, and a path
-// cannot be built without it — the same reason `serverActions` takes one.
+// Takes the org because the maintenance toggle and the PHP reload send
+// somewhere, and a path cannot be built without it — the same reason
+// `serverActions` takes one.
 function siteActions(org, site) {
   var deployable = canDeploy(site)
   var deployed = !!(site && site.deploymentId)
@@ -682,6 +688,7 @@ function siteActions(org, site) {
   // predicate here answers for that rather than reaching into nothing.
   var parked = !!(site && site.maintenance)
   var moving = site ? String(site.maintenanceStatus) : ""
+  var pool = sitePhpPool(site)
   // The three logs, on the same terms as `log` below: an id the panel switches
   // on, no `armable` and no `path`, because what they open is a pane. Generated
   // from `siteLogKinds` rather than written out, so the order and the wording
@@ -733,6 +740,28 @@ function siteActions(org, site) {
       // travels on stdin rather than in the argv this one rides. See
       // `siteCommandAction`.
       body: parked ? null : { status: 503 } },
+    // The server view's PHP rows act on the server's default pool, which is
+    // the wrong one for an isolated site on another version: this is the same
+    // endpoint with the site's own. A reload only — the graceful one; the hard
+    // restart stays the server view's. Its own id rather than that view's
+    // `php-reload`, because the two views prefix their arm keys with a site id
+    // and a server id, which Forge numbers separately and so can coincide.
+    //
+    // The pool rides the arm key for the maintenance toggle's reason: the body
+    // is the version the last sweep saw, and a site moved under the arm would
+    // otherwise reload the pool it just left. The server's state is not asked,
+    // as it is not for the deploy — this list does not take the server, and a
+    // refusal from Forge lands on the row all the same.
+    { id: "site-php-reload", label: "Reload PHP-FPM" + (pool ? " (" + pool + ")" : ""),
+      hint: "", armable: true, confirm: "again", armIntent: pool,
+      available: pool !== "",
+      reason: !site ? "not listed"
+        : site.phpVersion ? "unknown PHP version" : "no PHP version reported",
+      armedText: "press again to reload PHP-FPM",
+      done: "PHP-FPM reload requested",
+      scopeMessage: serverScopeMessage,
+      path: site ? serviceActionPath(org, site.serverId, "php") : "",
+      body: { action: "reload", version: pool } },
     // No `armable` and no path: this one opens a prompt, the way `log` opens a
     // pane. What it eventually sends is declared in `siteCommandAction`, which
     // cannot be built until there is a command to put in it.
@@ -970,26 +999,97 @@ function recipeRunFrom(body, serverId, sinceMs, afterId) {
 // ----------------------------------------------------------- server actions
 
 // Which PHP pool a PHP action would act on. Forge runs one FPM pool per version
-// and the endpoint takes the version rather than inferring it, so a server that
-// reported none has nothing to send. The class is the same idea as
+// and the endpoint takes the version rather than inferring it, so a subject
+// that reported none has nothing to send. The class is the same idea as
 // `sshCommand`'s: Forge's enum runs `php5` through `php85` with one `-old`
 // variant, and a value outside it would earn a 422 — a worse answer than a row
 // that says it doesn't know which pool it would restart. It also makes the
-// version safe to put in a label.
-function phpPoolVersion(server) {
-  var value = server ? String(server.phpVersion || "") : ""
-  return /^php[0-9]{1,3}(-old)?$/.test(value) ? value : ""
+// version safe to put in a label. A server's pool and a site's both come
+// through here, so the two views cannot disagree about what a pool is called.
+function phpPoolWord(value) {
+  var word = value === undefined || value === null ? "" : String(value)
+  return /^php[0-9]{1,3}(-old)?$/.test(word) ? word : ""
 }
+
+function phpPoolVersion(server) {
+  return phpPoolWord(server ? server.phpVersion : "")
+}
+
+// A site's `php_version` is not the word a server's is: the site payload
+// carries a display string — "PHP 8.4" — where the endpoint wants "php84". It
+// is turned into the word here and then held to the same class, so a value
+// that already is the word passes as it is, and anything else answers "" for
+// the row to say it doesn't know rather than send a guess.
+function sitePhpPool(site) {
+  var value = site ? String(site.phpVersion || "").trim() : ""
+  var match = /^PHP ([0-9]+)\.([0-9]+)$/.exec(value)
+  return phpPoolWord(match ? "php" + match[1] + match[2] : value)
+}
+
+// Which services a server runs, by its type — because the payload cannot say.
+// `db_status` and `redis_status` come back null on real servers and there is
+// no supervisor field at all, so this is Forge's own table (Servers → Types in
+// its docs) rather than anything read off the server. `database` here is only
+// permission: whether there is one, and which, is `databaseService`'s to say.
+//
+// A type missing from the table — empty, or one Forge adds later — runs
+// everything, so the failure is a row too many that Forge refuses, never a
+// server with nothing to press. A server gone from the API arrives as null and
+// takes the same road, where every row is unavailable anyway.
+var serverTypeServices = {
+  app: ["nginx", "php", "supervisor", "redis", "database"],
+  web: ["nginx", "php", "supervisor"],
+  worker: ["php", "supervisor"],
+  loadbalancer: ["nginx"],
+  database: ["database"],
+  cache: ["redis"],
+  meilisearch: [],
+  openclaw: []
+}
+
+function serverRuns(server, service) {
+  var kind = server ? String(server.kind || "") : ""
+  if (!Object.prototype.hasOwnProperty.call(serverTypeServices, kind)) return true
+  return serverTypeServices[kind].indexOf(service) !== -1
+}
+
+// Which database endpoint a server has, and what to call it. Forge has two —
+// `mysql`, the only one a MariaDB server could mean, and `postgres` — and
+// `database_type` only chooses between them: its prefix is matched and the word
+// is picked here, so what reaches `serviceActionPath` is never the payload's
+// own string. No type is no database and no row. A type with neither prefix is
+// a database this widget cannot name: it answers with an empty endpoint, so the
+// row is listed and says so — a server that plainly has a database and nothing
+// to restart it with would read as a bug.
+function databaseService(server) {
+  var type = server ? String(server.databaseType || "") : ""
+  if (type === "") return null
+  if (type.indexOf("mysql") === 0) return { endpoint: "mysql", label: "MySQL" }
+  if (type.indexOf("mariadb") === 0) return { endpoint: "mysql", label: "MariaDB" }
+  if (type.indexOf("postgres") === 0) return { endpoint: "postgres", label: "Postgres" }
+  return { endpoint: "", label: "" }
+}
+
+// The refusal for every write gated behind `server:manage-services`: all of the
+// server view's, and the site view's PHP reload, which goes to the same
+// endpoint. It rides the action rather than the service because it is the
+// wording for *that* endpoint, and the wrapper that sends it is shared.
+var serverScopeMessage = "Your token can't manage servers — that needs "
+  + "the server:manage-services scope"
 
 // What the server view offers. Shaped like `siteActions` — the same
 // {id,label,hint,available,reason} the panel turns into rows — plus what a
 // write needs: the path and body to send, what the row says while it is armed,
 // what to flash when Forge takes it, and how it has to be confirmed.
 //
-// Only the everyday restarts are here. The API also offers `stop` on every
-// service and `power-cycle` on the server; neither belongs on a keypress from a
-// bar, and a service stopped from here is one nothing in this widget could
-// start again.
+// Only restarts are here, and only of what the server's type runs — see
+// `serverTypeServices` for why the type decides rather than the payload. A row
+// the type lacks is dropped rather than listed unavailable: the view is the
+// handful of things worth pressing on *this* server, and a load balancer that
+// said "not available" six times over would be a list. The API also offers
+// `stop` on nginx and the databases and `power-cycle` on the server; neither
+// belongs on a keypress from a bar, and a service stopped from here is one
+// nothing in this widget could start again.
 //
 // A server that is provisioning or revoked answers 4xx to all of this, so the
 // row says the state instead of spending a request to be told it. Rebooting is
@@ -1006,36 +1106,69 @@ function serverActions(org, server) {
   var ssh = sshCommand(server)
   var id = server ? server.id : ""
   var suffix = php ? " (" + php + ")" : ""
-  // All four writes here go out on the one scope, so the refusal is written
-  // once. It rides the action rather than the service because it is the wording
-  // for *this* endpoint, and the wrapper that sends it is shared.
-  var scopeMessage = "Your token can't manage servers — that needs "
-    + "the server:manage-services scope"
+  var db = databaseService(server)
+  var dbKnown = !!db && db.endpoint !== ""
+  var dbName = dbKnown ? db.label : "database"
+  var dbAvailable = ready && dbKnown
   return [
-    { id: "nginx-restart", label: "Restart nginx", hint: "",
+    { id: "nginx-restart", service: "nginx", label: "Restart nginx", hint: "",
       available: ready, reason: ready ? "" : stateReason,
       armable: true, confirm: "again",
       armedText: "press again to restart nginx",
       done: "nginx restart requested",
-      scopeMessage: scopeMessage,
+      scopeMessage: serverScopeMessage,
       path: serviceActionPath(org, id, "nginx"),
       body: { action: "reboot" } },
-    { id: "php-reload", label: "Reload PHP-FPM" + suffix, hint: "",
+    // The pool rides the arm key on both PHP rows, as it does in the site view:
+    // the version in the body is the server's default as of the last sweep.
+    { id: "php-reload", service: "php", label: "Reload PHP-FPM" + suffix, hint: "",
       available: hasPhp, reason: hasPhp ? "" : !ready ? stateReason : "no PHP version reported",
-      armable: true, confirm: "again",
+      armable: true, confirm: "again", armIntent: php,
       armedText: "press again to reload PHP-FPM",
       done: "PHP-FPM reload requested",
-      scopeMessage: scopeMessage,
+      scopeMessage: serverScopeMessage,
       path: serviceActionPath(org, id, "php"),
       body: { action: "reload", version: php } },
-    { id: "php-restart", label: "Restart PHP-FPM" + suffix, hint: "",
+    { id: "php-restart", service: "php", label: "Restart PHP-FPM" + suffix, hint: "",
       available: hasPhp, reason: hasPhp ? "" : !ready ? stateReason : "no PHP version reported",
-      armable: true, confirm: "again",
+      armable: true, confirm: "again", armIntent: php,
       armedText: "press again to restart PHP-FPM",
       done: "PHP-FPM restart requested",
-      scopeMessage: scopeMessage,
+      scopeMessage: serverScopeMessage,
       path: serviceActionPath(org, id, "php"),
       body: { action: "reboot", version: php } },
+    // "The queue workers are wedged" is as everyday as "PHP is wedged". It is
+    // supervisor itself that restarts, so every program it runs goes down and
+    // back up with it — every worker on the box, not one site's.
+    { id: "supervisor-restart", service: "supervisor", label: "Restart supervisor", hint: "",
+      available: ready, reason: ready ? "" : stateReason,
+      armable: true, confirm: "again",
+      armedText: "press again to restart supervisor",
+      done: "supervisor restart requested",
+      scopeMessage: serverScopeMessage,
+      path: serviceActionPath(org, id, "supervisor"),
+      body: { action: "reboot" } },
+    { id: "redis-restart", service: "redis", label: "Restart redis", hint: "",
+      available: ready, reason: ready ? "" : stateReason,
+      armable: true, confirm: "again",
+      armedText: "press again to restart redis",
+      done: "redis restart requested",
+      scopeMessage: serverScopeMessage,
+      path: serviceActionPath(org, id, "redis"),
+      body: { action: "reboot" } },
+    // Named for what the server runs, so the row says "MariaDB" where that is
+    // what goes down. Two presses like the others rather than the reboot's `Y`:
+    // queries fail for the seconds it takes, but nothing needs bringing back by
+    // hand afterwards.
+    { id: "database-restart", service: "database", label: "Restart " + dbName, hint: "",
+      available: dbAvailable,
+      reason: dbAvailable ? "" : !ready ? stateReason : "unknown database type",
+      armable: true, confirm: "again",
+      armedText: "press again to restart " + dbName,
+      done: dbName + " restart requested",
+      scopeMessage: serverScopeMessage,
+      path: dbKnown ? serviceActionPath(org, id, db.endpoint) : "",
+      body: { action: "reboot" } },
     // The one row here that takes every site on the server down with it, so it
     // is confirmed by a key nothing else in the panel uses and no movement key
     // could reach. See the panel's `runWriteAction`.
@@ -1044,7 +1177,7 @@ function serverActions(org, server) {
       armable: true, confirm: "Y",
       armedText: "press Y to reboot",
       done: "Reboot requested",
-      scopeMessage: scopeMessage,
+      scopeMessage: serverScopeMessage,
       // A restarted service changes nothing this widget draws. A rebooting
       // server changes its own state, and that arrives with the server list.
       refetch: "org",
@@ -1066,7 +1199,14 @@ function serverActions(org, server) {
     { id: "forge", label: "Open in Forge", hint: "f", available: true, reason: "" },
     { id: "ssh", label: "Copy ssh command", hint: "s",
       available: ssh !== "", reason: ssh !== "" ? "" : "no public IP" }
-  ]
+  ].filter(function (action) {
+    // `service` is what the type table is asked about; a row without one is
+    // the server's own and always listed. The database row answers to
+    // `database_type` as well, since the table only says a type *may* run one.
+    if (!action.service) return true
+    if (action.service === "database" && !db) return false
+    return serverRuns(server, action.service)
+  })
 }
 
 // The rest of the site payload, which `sitesFrom` keeps and nothing showed
@@ -1665,7 +1805,9 @@ function serverActionPath(org, serverId) {
   return serverPath(org, serverId) + "/actions"
 }
 
-// `service` is never API data: it comes from the fixed list in `serverActions`.
+// `service` is never API data: it is a literal in `serverActions` or
+// `siteActions`, or one of the two words `databaseService` picks from a prefix
+// — never `database_type` itself.
 function serviceActionPath(org, serverId, service) {
   return serverPath(org, serverId) + "/services/" + encode(service) + "/actions"
 }

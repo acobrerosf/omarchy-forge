@@ -735,7 +735,9 @@ invalidate the arm instead of silently retargeting it — visibly, on the row, w
 command row's intent is the typed command itself, which is the sharper case: that row is nothing
 *but* its text, and the field keeps focus for one turn of the event loop after enter has armed it,
 so a keystroke landing in that window would otherwise leave the arm pointing at something the row
-never named. `confirmArmed` says so when the key no longer matches, rather than doing nothing.
+never named. `confirmArmed` says so when the key no longer matches, rather than doing nothing. The
+PHP rows carry their pool, in both views, on the maintenance row's reasoning: the version in the
+body is the one the last sweep saw.
 
 **Two confirms, not one.** A deploy and a service restart take the same two presses. A reboot takes
 enter to arm and a capital `Y` to send, and every other key — a second enter, a lower-case `y` —
@@ -744,6 +746,27 @@ movement, so nothing a mistyped navigation keypress can land on is ever the last
 server goes down. It follows that the mouse can arm a reboot but not confirm one, which is a cost
 worth paying. `Model.serverActions` carries the `confirm` each row wants, so the rule is data
 rather than a branch in the key handler.
+
+**What a server lists is decided by its type, because the payload can't say.** `db_status` and
+`redis_status` come back null on real servers and there is no supervisor field at all, so
+`Model.serverTypeServices` carries Forge's own table of which type runs what, and `serverActions`
+filters its rows through it. They are dropped, not dimmed: the view is the handful of things worth
+pressing on *this* server, and a load balancer reading "not available" six times over would be a
+list. A type missing from the table lists everything, so a type Forge adds later costs a row it
+refuses rather than a server with nothing to press.
+
+The database row is the one that reads a payload field, and only its prefix. `database_type` says
+`mysql8`, `mariadb1011` or `postgres17`; Forge has two endpoints, `mysql` — the only one a MariaDB
+server could mean — and `postgres`, and `Model.databaseService` picks one of those two words from
+the prefix. That is what keeps `serviceActionPath`'s rule, that a service name is never API data,
+true for the one row whose service the API decides. A type with neither prefix lists a row that
+says so rather than none, since a server that plainly has a database and nothing to restart it
+with reads as a bug.
+
+A site's PHP reload is the server view's reload sent with the site's own version, for the isolated
+site that runs another one. The site payload hands that version out as a display string — `PHP 8.4`
+— where the server's is the enum word `php84`, so `Model.sitePhpPool` turns the one into the other
+and then holds it to the class the server's version already has to pass.
 
 ### Text is never left to guess
 
