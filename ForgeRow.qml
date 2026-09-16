@@ -45,11 +45,11 @@ Rectangle {
   property bool showActions: false
   // Nothing that changes a real server goes on one press, and the row is where
   // both are reported: the arm as `armedText`, the request on its way as
-  // `sending`. The wording belongs to the action — "press again to deploy",
+  // `sending`. The wording belongs to the action — "press Y to deploy",
   // "press Y to reboot" — so it arrives with the rest of the row's text rather
   // than being decided here.
   property bool armed: false
-  property string armedText: "press again to deploy"
+  property string armedText: "press Y to deploy"
   property bool sending: false
 
   property color foreground: Color.foreground

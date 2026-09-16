@@ -48,8 +48,8 @@ the recipe list and for following a run that `recipe:manage` started.
 It asks for the token, then lets you pick which of that token's organizations to watch.
 
 **4. That's it.** The Forge mark appears in the bar. Click it, or press its key, and the panel opens
-with your organizations. Move with `j`/`k`, press enter to unfold, press `d` twice on a site to
-deploy it.
+with your organizations. Move with `j`/`k`, press enter to unfold, press `d` on a site and then `Y`
+to deploy it.
 
 Tokens are stored in your login keyring, never in a config file, and the widget never handles them
 — every request is made by the bundled `omarchy-forge` helper.
@@ -81,27 +81,30 @@ commit. A server whose site starts failing unfolds itself once.
 | enter / space | unfold an organization or server, or open a site |
 | `l` or → | go deeper — on an unfolded server, opens its actions |
 | `h` or ← | back, or fold up the current row |
-| `d` | deploy the site under the cursor (press twice) |
+| `d` | arm a deploy of the site under the cursor — `Y` sends it |
 | `e` | the server's event feed — what Forge has done to it, newest first |
 | `o` | open the site's URL, or a server's page in Forge |
 | `f` | open the row in the Forge dashboard |
 | `s` | copy an `ssh forge@…` command for the server |
 | `r` | refresh now |
 | `a` | add an organization |
-| `Y` | confirm a reboot, a command or a recipe that enter has armed |
+| `Y` | send whatever enter, a click or `d` has armed |
 | esc | back one level, or close |
 
-Anything that changes something takes **two presses**: the first arms the row and says so, the
-second sends it. Arms expire after a few seconds. A reboot and a command need a capital `Y` for the
-second press rather than enter, so a mistyped `j` or `k` can never be the last key before a server
-goes down.
+Anything that changes something takes **two keys**: enter (or `d`, or a click) arms the row and
+says so, and a capital `Y` sends it. Any other key cancels — enter again, a lower-case `y`, `j`,
+escape — and does nothing else; an arm left alone lapses after eight seconds. `Y` rather than a
+second enter, so a doubled keypress or a mistyped `j` or `k` can never be the last key before
+something changes on a server.
 
 The line at the bottom of the panel names what the row under the cursor can do.
 
 Mouse: left click a row to unfold it or open a site; click the ⚙ on a server row for its actions;
-right click to open it in Forge. Inside a view, the trail at the top left is the way back.
+right click to open it in Forge. Inside a view, the trail at the top left is the way back. A click
+arms an action but never sends one — that is always `Y` — and a click while something is armed
+cancels it.
 
-<img src="screenshots/deploy.png" alt="A site row armed, reading 'press again to deploy'" width="420">
+<img src="screenshots/deploy.png" alt="A site row armed, reading 'press Y to deploy'" width="420">
 
 ### A site
 
@@ -114,12 +117,12 @@ Opening a site gives you its actions and its details, all from data the refresh 
 
 An action that can't run says why — a site with no repository, or one that has never deployed.
 
-**Maintenance mode** takes the site offline behind a 503, and brings it back on the same two
-presses. Forge does the work out on the server, so the row says `enabling…` until it has landed.
+**Maintenance mode** takes the site offline behind a 503, and brings it back the same way. Forge
+does the work out on the server, so the row says `enabling…` until it has landed.
 
-**Reload PHP-FPM** gracefully reloads the pool for the site's own PHP version, on two presses. The
-server view's PHP rows act on the server's default version, which is the wrong pool for an
-isolated site running another one.
+**Reload PHP-FPM** gracefully reloads the pool for the site's own PHP version. The server view's
+PHP rows act on the server's default version, which is the wrong pool for an isolated site running
+another one.
 
 **Run a command** opens a prompt: type a command, enter to arm, `Y` to run. It runs as `forge` in
 the site's directory. Nothing is remembered between opens — no history, no repeat key, on purpose.
@@ -163,13 +166,13 @@ Press `l` on an unfolded server, or click the ⚙ on any server row.
 
 | | |
 |---|---|
-| **Restart nginx** | two presses |
+| **Restart nginx** | the web server in front of every site on it |
 | **Reload PHP-FPM** | a graceful reload of the server's PHP version |
 | **Restart PHP-FPM** | the harder version |
-| **Restart supervisor** | every queue worker and daemon on the server, two presses |
-| **Restart redis** | two presses |
-| **Restart MySQL** | or MariaDB, or Postgres — named for what the server runs; two presses |
-| **Reboot server** | enter to arm, capital `Y` to send |
+| **Restart supervisor** | every queue worker and daemon on the server |
+| **Restart redis** | the server's redis, and whatever its sites keep in it |
+| **Restart MySQL** | or MariaDB, or Postgres — named for what the server runs |
+| **Reboot server** | every site on it goes down with it; still offered when the server is unreachable |
 | **Server events** | what Forge has done to the server, newest first — also `e` from any row |
 | **Run a recipe** | the organization's saved scripts; enter arms one, `Y` runs it here |
 | **Monitors** | Forge's own alerts for this server — CPU, disk, memory — and which are firing |
@@ -298,6 +301,10 @@ omarchy-forge status [--org SLUG]          # server health as a table
 omarchy-forge doctor                       # every account: token, auth, rate limit left
 omarchy-forge api --account default GET /orgs/acme/servers      # raw request
 ```
+
+`remove` and `logout` say what they are about to drop and wait for a capital `Y`, the same as the
+panel. `--yes` answers for them, and a script needs it: with no terminal to ask on they refuse
+rather than assume.
 
 To have it on your `PATH`:
 

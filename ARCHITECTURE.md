@@ -663,10 +663,10 @@ that made it, and the `Y` that should have confirmed went into the command as a 
 of the event loop is the whole fix.
 
 The arm's expiry is the other half of that lesson. Every *deliberate* way of dropping it returns to
-the field with the text intact — a stray key at the confirm, `j`/`k`, enter again — because the
-likely next move is fixing a typo. The eight-second timer does not, and must not: taking the
-keyboard back on a timer is a silent change of what the next key means, and the next key after a
-confirm line is overwhelmingly `Y`.
+the field with the text intact — a stray key at the confirm, `j`/`k`, `h`, escape, enter again —
+because the likely next move is fixing a typo. The eight-second timer does not, and must not:
+taking the keyboard back on a timer is a silent change of what the next key means, and the next
+key after a confirm line is overwhelmingly `Y`.
 
 The prompt is also the one view that is *replaced* rather than pushed. Once it has sent, backing out
 onto a filled-in command that has already run is an invitation to run it twice, so `replaceView`
@@ -675,9 +675,9 @@ swaps it for the output pane and `h` lands on the site.
 Two keys had to come from somewhere, and the horizontal axis is where. `PanelKeyCatcher` reads
 `h j k l` as movement before `onTextKey` ever sees them, so a letter for "open the log" was never
 available; and until sites had anything inside them, right and `l` were a second way to press `j`.
-So right drills in, left goes back, and Escape goes back before it closes. `d` still deploys from
-anywhere with its two presses, because an accelerator that survives the reorganisation is the
-thing that makes the reorganisation cost nothing.
+So right drills in, left goes back, and Escape goes back before it closes. `d` still arms a deploy
+from anywhere, because an accelerator that survives the reorganisation is the thing that makes the
+reorganisation cost nothing.
 
 The server view came out of the same axis, and cost nothing for the same reason: on a server that
 is *already* unfolded, right had nothing left to do — `drillIn` refused to re-toggle it, precisely
@@ -691,8 +691,9 @@ and is now a better line for it: four short lines instead of one wrapped list of
 rules keep it from being a nuisance. Every variant is short enough to stay one line, so moving the
 cursor changes the words and not the height of the panel under them; and until the cursor is
 *active* nothing is highlighted, so the line claims nothing about a particular row. The same rule
-retires `[Y] confirm` from the server view's footer onto the reboot row alone, where it stops being
-a puzzle.
+keeps `[Y] confirm` to the rows that write, where it is an instruction rather than a puzzle. An arm
+outranks all of it: while one is up the line is `[Y] confirm · any other key cancels` in every
+route, which is the only place a deploy armed with `d` from a pane shows at all.
 
 The second cost was structural, and was a bug the whole time: the footer was the last thing inside
 the scrolling `Column`, so a server with enough sites pushed it out of the viewport — the line that
@@ -728,9 +729,9 @@ armed in lockstep with the deploy and shown `sending…` beside it.
 
 An action whose meaning depends on live state also declares an **`armIntent`**, folded into the
 same key. `actionRows` is rebuilt on every refresh, and the maintenance row's label, method and
-body are all derived from `maintenance_mode`; without this, a sweep landing inside the four-second
-arm window would leave `armedKey` still matching a row that now means the opposite, and the second
-press would send a DELETE where a POST was armed. Putting the intent in the key makes the flip
+body are all derived from `maintenance_mode`; without this, a sweep landing inside the eight-second
+arm window would leave `armedKey` still matching a row that now means the opposite, and `Y` would
+send a DELETE where a POST was armed. Putting the intent in the key makes the flip
 invalidate the arm instead of silently retargeting it — visibly, on the row, with no timer. The
 command row's intent is the typed command itself, which is the sharper case: that row is nothing
 *but* its text, and the field keeps focus for one turn of the event loop after enter has armed it,
@@ -739,13 +740,21 @@ never named. `confirmArmed` says so when the key no longer matches, rather than 
 PHP rows carry their pool, in both views, on the maintenance row's reasoning: the version in the
 body is the one the last sweep saw.
 
-**Two confirms, not one.** A deploy and a service restart take the same two presses. A reboot takes
-enter to arm and a capital `Y` to send, and every other key — a second enter, a lower-case `y` —
-disarms and spends itself saying so. The letter matters less than where it isn't: `h j k l` are
-movement, so nothing a mistyped navigation keypress can land on is ever the last press before a
-server goes down. It follows that the mouse can arm a reboot but not confirm one, which is a cost
-worth paying. `Model.serverActions` carries the `confirm` each row wants, so the rule is data
-rather than a branch in the key handler.
+**One confirm.** Every write — a deploy, a restart, a maintenance toggle, a reboot, a command, a
+recipe — arms on its first press and is sent by a capital `Y`, and by nothing else. An armed panel
+owns the next input: `cancelArmed` spends every other key — a second enter, a lower-case `y`,
+`j`/`k`, `h`, escape — on dropping the arm and saying so, rather than dropping it and then also
+doing what the key usually does. The letter matters less than where it isn't: `h j k l` are
+movement and enter is what armed, so no doubled or mistyped keypress is ever the last press before
+something changes on a server.
+
+That is also what lets `confirmArmed` trust the cursor. Nothing on the keyboard can move it while an
+arm is up, and the pointer is not allowed to either: hover leaves the cursor alone, and a click on a
+row is a press like the rest. So the mouse arms but never sends, which is a cost worth paying. A
+deploy is the one arm a row does not hold — `d` arms on the *site*, from rows that don't carry its
+key and from panes that have no rows — so `confirmArmed` recognises it by the site before asking
+the row. There is no per-entry `confirm` in `Model`: this used to be two weights, "press again" for
+anything reversible and `Y` for a reboot, and a knob a new write can set is one it can set wrong.
 
 **What a server lists is decided by its type, because the payload can't say.** `db_status` and
 `redis_status` come back null on real servers and there is no supervisor field at all, so

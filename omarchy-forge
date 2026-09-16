@@ -35,6 +35,21 @@ warn() {
   echo "omarchy-forge: $1" >&2
 }
 
+# Set by `--yes` on the commands that ask before they drop something.
+ASSUME_YES=0
+
+# The panel's rule, on a terminal: what is about to go is named, and only a
+# capital Y lets it. Anything else — `y`, a bare enter, EOF — changes nothing.
+# With no terminal there is nobody to ask, so it refuses rather than assuming
+# yes; `--yes` is how a script says it means it.
+confirm() {
+  ((ASSUME_YES)) && return 0
+  [[ -t 0 ]] || die "this asks for confirmation and there is no terminal to ask on — pass --yes"
+  local answer=""
+  read -rp "$1 Type Y to confirm: " answer || true
+  [[ $answer == Y ]] || die "not confirmed — nothing changed"
+}
+
 need() {
   command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"
 }
@@ -727,17 +742,26 @@ cmd_rename() {
 }
 
 cmd_logout() {
-  local account=${1:-}
+  local account="" arg mapped
+  for arg in "$@"; do
+    case $arg in
+    --yes) ASSUME_YES=1 ;;
+    -*) die "unknown option '$arg'" ;;
+    *) account=$arg ;;
+    esac
+  done
   if [[ -z $account ]]; then
     if (($(account_count) > 1)); then
       die "more than one account — name one: omarchy-forge logout <account>"
     fi
     account=$(default_account)
   fi
+  mapped=$(orgs_of_account "$account" | paste -sd', ' || true)
+  # No check that the account is still in the state file: `logout <old>` is
+  # how the keyring copy an interrupted `rename` leaves behind gets cleared.
+  confirm "Remove the token for '$account' from the keyring?${mapped:+ $mapped will stop refreshing.}"
   token_clear "$account"
   echo "Token for '$account' removed from the keyring."
-  local mapped
-  mapped=$(orgs_of_account "$account" | paste -sd', ' || true)
   if [[ -n $mapped ]]; then
     echo "Still mapped to $mapped — drop those too with:"
     echo "  omarchy-forge remove --account $account"
@@ -812,20 +836,31 @@ cmd_org() {
 }
 
 cmd_remove() {
-  local account="" slug=""
-  case ${1:-} in
-  "") die "usage: omarchy-forge remove <org> | --account <name>" ;;
-  --account)
-    [[ $# -ge 2 ]] || die "--account needs an account name"
-    account=$2
-    ;;
-  --account=*) account=${1#--account=} ;;
-  *) slug=$1 ;;
-  esac
+  local account="" slug="" orgs
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+    --yes) ASSUME_YES=1; shift ;;
+    --account)
+      [[ $# -ge 2 ]] || die "--account needs an account name"
+      account=$2
+      shift 2
+      ;;
+    --account=*) account=${1#--account=}; shift ;;
+    -*) die "unknown option '$1'" ;;
+    *)
+      [[ -z $slug ]] || die "one organization at a time"
+      slug=$1
+      shift
+      ;;
+    esac
+  done
+  [[ -n $slug || -n $account ]] || die "usage: omarchy-forge remove <org> | --account <name> [--yes]"
+  [[ -z $slug || -z $account ]] || die "an organization or --account, not both"
 
   if [[ -n $slug ]]; then
-    [[ -n $(account_of_org "$slug") ]] || die "'$slug' is not being watched"
     account=$(account_of_org "$slug")
+    [[ -n $account ]] || die "'$slug' is not being watched"
+    confirm "Stop watching $slug?"
     state_apply "del(.organizations[\$s]) | $REPOINT_DEFAULT" --arg s "$slug"
     echo "Stopped watching $slug."
     if [[ -z $(orgs_of_account "$account") ]]; then
@@ -835,8 +870,13 @@ cmd_remove() {
     return 0
   fi
 
-  [[ -n $account ]] || die "usage: omarchy-forge remove --account <name>"
   account_exists "$account" || die "no account named '$account'"
+  orgs=$(orgs_of_account "$account" | paste -sd', ' || true)
+  if [[ -n $orgs ]]; then
+    confirm "Remove account '$account', its token, and everything it watches ($orgs)?"
+  else
+    confirm "Remove account '$account' and its token?"
+  fi
   token_clear "$account"
   state_apply "del(.accounts[\$a])
                | .organizations = (.organizations | with_entries(select(.value.account != \$a)))
@@ -952,11 +992,12 @@ Laravel Forge for the Omarchy bar.
   omarchy-forge accounts                  accounts, tokens, and what each watches
   omarchy-forge orgs [account]            organizations a token can see
   omarchy-forge org [slug]                show or set the default organization
-  omarchy-forge remove <slug>             stop watching an organization
-  omarchy-forge remove --account NAME     drop an account, its token, and its orgs
+  omarchy-forge remove <slug> [--yes]     stop watching an organization
+  omarchy-forge remove --account NAME [--yes]
+                                          drop an account, its token, and its orgs
   omarchy-forge rename OLD NEW            give an account a different handle
   omarchy-forge login [--account NAME]    replace the token on an account
-  omarchy-forge logout [account]          remove an account's token
+  omarchy-forge logout [account] [--yes]  remove an account's token
   omarchy-forge status [--org SLUG]       server health as a table
   omarchy-forge doctor                    every account: token, auth, rate limit
   omarchy-forge api [--account NAME|--org SLUG] GET /orgs/...
@@ -967,6 +1008,9 @@ Laravel Forge for the Omarchy bar.
 One token per account; an account can watch several organizations. An account
 name is only a handle for this CLI — it is derived from whoever the token
 belongs to, and never appears in the bar.
+
+remove and logout say what they are about to drop and wait for a capital Y.
+--yes answers for them, and is needed where there is no terminal to ask on.
 EOF
 }
 

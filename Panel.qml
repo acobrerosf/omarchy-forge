@@ -173,11 +173,12 @@ Panel {
   // the file `w` writes; nothing else here needs it.
   property string commandId: ""
   // Nothing here that changes a real server goes on one press: the first arms
-  // the row, the second sends it. `armedConfirm` is what the second press has
-  // to be — "again" for a deploy or a service restart, "Y" for a reboot, which
-  // is a different order of destructive and gets a key of its own.
+  // the row, and only a capital `Y` sends it — `cancelArmed` is what every
+  // other key does instead. `armedLabel` names what was armed, as it was named
+  // then, for the words a cancel is spent on: the cursor is not always on the
+  // row that lit up, because `d` arms a deploy from anywhere that names a site.
   property string armedKey: ""
-  property string armedConfirm: ""
+  property string armedLabel: ""
   // What this widget asked the service to send. The service's result is
   // session-wide, so without this every screen would flash the same message.
   property string actionRequestedKey: ""
@@ -668,8 +669,8 @@ Panel {
   // this row is about — which is why a site opens its actions here rather than
   // arming a deploy: on an organization and a server the key already meant
   // "show me what is inside this", and a site having been the exception was an
-  // accident of sites having had nothing inside them. `d` still deploys from
-  // anywhere, two presses, unchanged.
+  // accident of sites having had nothing inside them. `d` still arms a deploy
+  // from anywhere, unchanged.
   function activate() {
     var row = currentRow()
     if (!row) return
@@ -841,19 +842,24 @@ Panel {
   // them. Until the cursor is active nothing is highlighted, so nothing is
   // claimed about a particular row.
   readonly property string hintText: {
+    // Two lines because it is two states, and the one it is in is the whole
+    // question: a field that is typing into and a row that is waiting for `Y`
+    // look similar and take completely different keys. At the confirm every
+    // key but `Y` goes back to the field, `h` included — see `cancelArmed`.
+    if (routeKind === "command")
+      return commandEditing ? "type a command · [enter] arm · [esc] cancel"
+        : armedKey !== "" ? "[Y] run · any other key edits again"
+        : "[enter] arm · [h] back"
+    // An arm outranks whatever the view would say: it owns the next key, and
+    // this line is on screen in every route — a deploy armed with `d` from a
+    // pane has no row to light up, so this is the only place it shows.
+    if (armedKey !== "") return "[Y] confirm · any other key cancels"
     if (routeKind === "log")
       return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [h] back"
     if (runPane || routeKind === "eventOutput" || routeKind === "siteLog")
       return "[j/k] scroll · [g/G] top/bottom · [c] copy · [w] save · [r] look again · [h] back"
     if (routeKind === "events")
       return "[enter] output · [r] refresh · [h] back"
-    // Two lines because it is two states, and the one it is in is the whole
-    // question: a field that is typing into and a row that is waiting for `Y`
-    // look similar and take completely different keys.
-    if (routeKind === "command")
-      return commandEditing ? "type a command · [enter] arm · [esc] cancel"
-        : armedKey !== "" ? "[Y] run · [enter] edit again · [h] back"
-        : "[enter] arm · [h] back"
     var row = cursorActive ? currentRow() : null
     // Every row here sends, so the confirm key is the line — except the last
     // one, which only fetches the next page.
@@ -868,9 +874,9 @@ Panel {
         ? "[enter] more · [r] refresh · [h] back"
         : "[r] refresh · [h] back"
     if (routeKind === "site" || routeKind === "server") {
-      // The confirm key is worth naming on the one row that wants it, and
-      // nowhere else — on `Restart nginx` it would only be a puzzle.
-      if (row && row.action && String(row.action.confirm) === "Y")
+      // The confirm key is named on the rows that write and nowhere else — on
+      // `Open in Forge` enter is the whole story, and `[Y]` would be a puzzle.
+      if (row && String(row.armKey || "") !== "")
         return "[enter] arm · [Y] confirm · [h] back"
       return "[enter] run · [h] back · [r] refresh"
     }
@@ -912,13 +918,6 @@ Panel {
     switch (String(action.id)) {
     case "deploy": deployCurrent(); break
     case "command": openCommandPrompt(); break
-    // The prompt's own row. It reaches the same two presses as a reboot, so it
-    // reaches them through the same function — except for the second enter,
-    // which everywhere else means "never mind" and here means "let me fix it".
-    case "command-run":
-      if (armedKey === row.armKey && armedConfirm === "Y") reopenCommandPrompt()
-      else runWriteAction(row)
-      break
     case "log": openLog(); break
     case "events": openServerEvents(); break
     case "events-more": fetchEvents(eventsCursor); break
@@ -935,11 +934,17 @@ Panel {
     // arm key to exactly the rows that write, so the row itself says which door
     // it takes — and a new write is a Model entry with `armable` and a `path`,
     // not a case added here. The doors above are the ones that are *not* an
-    // ordinary write: they open something, or they page a list.
+    // ordinary write: they open something, or they page a list. The command
+    // prompt's own row comes through here too; the one thing it does
+    // differently — a second enter means "let me fix it" rather than "never
+    // mind" — is `cancelArmed`'s, since an armed panel never gets this far.
     default: if (row.armKey !== "") runWriteAction(row)
     }
   }
 
+  // `d`, and enter on the Deploy row. It arms and nothing more: the send is
+  // `confirmArmed`'s, as every write's is, and a second `d` never gets here —
+  // the key catcher spends it on `cancelArmed` first.
   function deployCurrent() {
     var site = currentSite()
     if (!site) return
@@ -947,45 +952,61 @@ Panel {
       say(site.name + " has no repository to deploy")
       return
     }
-    if (armedKey !== site.key) { arm(site.key, "again"); return }
+    arm(site.key, "Deploy")
+  }
+
+  // The deploy's half of `confirmArmed`. The repository is checked again
+  // because it can go from the API inside the confirm window, and this path
+  // never went back past `deployCurrent`'s check.
+  function sendDeploy(site) {
     disarm()
     if (!forge) return
+    if (!Model.canDeploy(site)) {
+      say(site.name + " has no repository to deploy")
+      return
+    }
     actionRequestedKey = site.key
     forge.deploy(currentOrg(), site)
   }
 
-  // The two confirms. A service restart and a maintenance toggle take the
-  // deploy's two presses. A reboot takes a key of its own: enter is one row
-  // away from enter on something harmless, and no key a mistyped movement could
-  // land on should ever be the last press before a server goes down.
+  // One confirm, whatever the write. Enter only ever arms: pressing the same
+  // key twice is exactly the mistake a confirm is there to catch, so the key
+  // that sends is one neither a doubled press nor a mistyped movement can land
+  // on. A second enter never reaches this — an armed panel hands every key but
+  // `Y` to `cancelArmed`.
   function runWriteAction(row) {
-    // `""` is also the disarmed state, so a row with no arm key would match on
-    // its *first* press and send without a confirm. `actionRow` is what makes
-    // that unreachable — a non-writing row has no arm key at all — and this is
-    // the guarantee resting on it rather than on an availability check
-    // elsewhere staying correct.
+    // `""` is also the disarmed state, so arming on it would light nothing and
+    // leave `Y` nothing to match. `actionRow` is what makes that unreachable —
+    // a non-writing row has no arm key at all — and this is the guarantee
+    // resting on it rather than on an availability check elsewhere staying
+    // correct.
     if (String(row.armKey) === "") return
-    if (armedKey !== row.armKey) {
-      arm(row.armKey, String(row.action.confirm || "again"))
-      return
-    }
-    // A second enter on a Y-confirm disarms rather than sends: pressing the
-    // same key twice is exactly the mistake the extra key is there to catch.
-    if (armedConfirm === "Y") { disarm(); return }
-    sendWriteAction(row)
+    arm(row.armKey, String(row.action.label))
   }
 
-  // `Y`, and only for the row that asked for it. The cursor cannot have moved
-  // since the arm — every move disarms — so the armed row is the one under it.
+  // `Y`, and only for what was armed. The cursor cannot have moved since the
+  // arm — every key but `Y` is spent on `cancelArmed`, and the pointer leaves
+  // the cursor alone while an arm is up — so the armed row is the one under it.
   function confirmArmed() {
+    if (armedKey === "") return
+    // A deploy arms on its site rather than on a row: `d` reaches it from rows
+    // that don't carry the site's key — the tree's site row, every row of the
+    // site view, the heartbeat list — and from the panes, which have no rows at
+    // all. So it is recognised by the site before any row is asked. A site's
+    // key is `server:site` where a row's arm key is `org/…`, so neither can be
+    // taken for the other.
+    var site = currentSite()
+    if (site && String(site.key) === armedKey) {
+      sendDeploy(site)
+      return
+    }
     var row = currentRow()
-    if (!row || armedConfirm !== "Y" || armedKey === "") return
     // The arm lapsed rather than missed: an arm key carries what the row meant
     // when it was armed — the command that was typed, the direction a toggle
     // was pointing — so a row that no longer matches is one that changed under
     // the arm. The press is spent saying so rather than sending something the
     // row never named.
-    if (row.armKey !== armedKey) {
+    if (!row || String(row.armKey || "") !== armedKey) {
       disarm()
       say("That changed while it was armed — arm it again")
       return
@@ -1050,13 +1071,30 @@ Panel {
     forge.sendAction(row.org, row.serverId, row.action, row.armKey)
   }
 
-  function arm(key, confirm) {
+  function arm(key, label) {
     armedKey = key
-    armedConfirm = confirm
-    // The stronger confirm gets longer: it asks for a key that is not already
-    // under the hand, and timing out mid-reach is its own kind of annoying.
-    disarmTimer.interval = confirm === "Y" ? 8000 : 4000
+    armedLabel = label
     disarmTimer.restart()
+  }
+
+  // Every key but `Y` while something is armed, and every click on a row: the
+  // press is spent dropping the arm and saying so, rather than dropping it and
+  // then also doing whatever it usually does — so a doubled enter, a `j` on
+  // the way to `Y` or an escape is never the first half of something else. A
+  // command that was not confirmed goes back to being editable rather than
+  // being thrown away: the press was most likely aimed at a typo. False when
+  // nothing was armed, so the caller goes on to do what the press is for.
+  function cancelArmed() {
+    if (armedKey === "") return false
+    if (routeKind === "command") {
+      reopenCommandPrompt()
+      say("Not confirmed — still editing")
+      return true
+    }
+    var label = armedLabel
+    disarm()
+    say(label !== "" ? label + " — not confirmed" : "Not confirmed")
+    return true
   }
 
   // ------------------------------------------------------------- deploy log
@@ -1410,10 +1448,10 @@ Panel {
     stopCommandEditing()
     cursorActive = true
     cursorIndex = 0
-    arm(row.armKey, "Y")
+    arm(row.armKey, String(row.action.label))
   }
 
-  // Both ways out of an armed command that was not confirmed: the text is kept
+  // Every way out of an armed command that was not confirmed: the text is kept
   // and the field takes focus back, because the likely next move is to fix a
   // typo rather than to start again.
   function reopenCommandPrompt() {
@@ -1441,7 +1479,7 @@ Panel {
 
   function disarm() {
     armedKey = ""
-    armedConfirm = ""
+    armedLabel = ""
     disarmTimer.stop()
   }
 
@@ -1696,10 +1734,11 @@ Panel {
     }
   }
 
-  // The interval is set per arm — see `arm()` — so this is only the default.
+  // Long enough to reach for a key that is not under the hand — every arm here
+  // waits for `Y` — since timing out mid-reach is its own kind of annoying.
   Timer {
     id: disarmTimer
-    interval: 4000
+    interval: 8000
     // Plain `disarm()`, deliberately: every *deliberate* way of dropping an arm
     // hands the command field its focus back, and this one must not — the key
     // most likely to follow a confirm line is `Y`, and it would land in the
@@ -1801,11 +1840,12 @@ Panel {
       // from. It cost nothing to take: until the site view existed, right and
       // `l` were a second way to press `j`.
       onMoveRequested: function(dx, dy) {
+        // An arm owns the next key, movement included: see `cancelArmed`.
+        if (root.cancelArmed()) return
         if (dy !== 0) {
           if (root.paneRoute) logView.scrollBy(dy)
           // One row and a field above it: there is nowhere to move to, so j/k
-          // means what every other stray key at the confirm means — back to
-          // typing, with what was typed still there.
+          // goes back to typing, with what was typed still there.
           else if (root.routeKind === "command") root.reopenCommandPrompt()
           else root.moveCursor(dy)
           return
@@ -1815,35 +1855,31 @@ Panel {
       }
       // Enter raises returnRequested AND activateRequested; space raises only
       // activateRequested. Handling both would run the action twice — which
-      // would arm a deploy and immediately send it, skipping the confirm.
-      onActivateRequested: if (!root.paneRoute) root.activate()
-      // Out of the view first, out of the panel only from the tree.
-      onCloseRequested: if (!root.back()) root.close()
+      // would arm a row and spend the arm on the same press.
+      onActivateRequested: {
+        if (root.cancelArmed()) return
+        if (!root.paneRoute) root.activate()
+      }
+      // Out of an arm first, then out of the view, and out of the panel only
+      // from the tree.
+      onCloseRequested: {
+        if (root.cancelArmed()) return
+        if (!root.back()) root.close()
+      }
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
         // Before everything, and before the fold to lower case: a row waiting
         // for `Y` must not have one keypress mean two things, and `Y` is a
         // different key from `y` here — which is the whole point of it.
-        if (root.armedConfirm === "Y") {
-          if (text === "Y") { root.confirmArmed(); return }
-          // Anything else was not the confirmation, lower-case `y` included.
-          // The press is spent disarming and says so, rather than disarming
-          // and then also doing whatever it usually does.
-          var armedRow = root.currentRow()
-          // A command that was not confirmed goes back to being editable
-          // rather than being thrown away — the press that disarmed it was
-          // most likely aimed at the typo it names.
-          if (root.routeKind === "command") {
-            root.reopenCommandPrompt()
-            root.say("Not confirmed — still editing")
-            return
-          }
-          root.disarm()
-          root.say(armedRow && armedRow.action
-                   ? String(armedRow.action.label) + " — not confirmed"
-                   : "Not confirmed")
+        // Anything else was not the confirmation, lower-case `y` included.
+        if (root.armedKey !== "") {
+          if (text === "Y") root.confirmArmed()
+          else root.cancelArmed()
           return
         }
+        // Said rather than swallowed: the likeliest reason for a `Y` with
+        // nothing armed is an arm that lapsed while the hand was on its way.
+        if (text === "Y") { root.say("Nothing to confirm"); return }
         // Before the fold to lower case, because these two are a pair that
         // only means anything while their case is intact.
         if (root.paneRoute) {
@@ -2169,21 +2205,30 @@ Panel {
                 cursorFill: root.hoverFill
                 fontFamily: root.fontFamily
 
+                // An arm pins the cursor: `Y` confirms the row under it, and a
+                // pointer drifting on its way to the keyboard is not a choice
+                // of another row.
                 onEntered: {
+                  if (root.armedKey !== "") return
                   root.cursorActive = true
                   root.cursorIndex = rowItem.index
                 }
+                // A click is a press like any other, so while something is
+                // armed it is spent cancelling: the mouse arms, never sends.
                 onActivated: {
+                  if (root.cancelArmed()) return
                   root.cursorIndex = rowItem.index
                   root.cursorActive = true
                   root.activate()
                 }
                 onContextRequested: {
+                  if (root.cancelArmed()) return
                   root.cursorIndex = rowItem.index
                   root.cursorActive = true
                   root.openCurrentInForge()
                 }
                 onActionsRequested: {
+                  if (root.cancelArmed()) return
                   root.cursorIndex = rowItem.index
                   root.cursorActive = true
                   root.openServerActions(rowItem.modelData)

@@ -704,24 +704,20 @@ function siteActions(org, site) {
       // same site reports the same deploy and has to light up with it.
       armsSubject: true,
       available: deployable, reason: deployable ? "" : "no repository" },
-    // Takes the site offline for everyone who visits it, and brings it back on
-    // the same two presses — so the deploy's confirm is the right weight, and
-    // the reboot's `Y` would be miscalibrated for something this reversible.
-    //
     // `armIntent` rides into the arm key. The label and the method here are
     // derived from live state, and this list is rebuilt on every refresh, so a
-    // sweep landing inside the arm window would otherwise turn a "press again
-    // to take the site offline" into a DELETE. Folding the intent into the key
+    // sweep landing inside the arm window would otherwise turn a "press Y to
+    // take the site offline" into a DELETE. Folding the intent into the key
     // means the flip invalidates the arm instead of silently retargeting it.
     { id: "maintenance", hint: "",
       label: parked ? "Disable maintenance mode" : "Enable maintenance mode",
-      armable: true, confirm: "again", armIntent: parked ? "off" : "on",
+      armable: true, armIntent: parked ? "off" : "on",
       // Forge is out on the box doing the flip; pressing again until it lands
       // would only race it.
       available: !!site && moving === "",
       reason: !site ? "not listed" : moving ? moving + " now" : "",
-      armedText: parked ? "press again to bring the site back"
-                        : "press again to take the site offline",
+      armedText: parked ? "press Y to bring the site back"
+                        : "press Y to take the site offline",
       done: parked ? "Maintenance mode off — requested"
                    : "Maintenance mode on — requested",
       method: parked ? "DELETE" : "POST",
@@ -753,11 +749,11 @@ function siteActions(org, site) {
     // as it is not for the deploy — this list does not take the server, and a
     // refusal from Forge lands on the row all the same.
     { id: "site-php-reload", label: "Reload PHP-FPM" + (pool ? " (" + pool + ")" : ""),
-      hint: "", armable: true, confirm: "again", armIntent: pool,
+      hint: "", armable: true, armIntent: pool,
       available: pool !== "",
       reason: !site ? "not listed"
         : site.phpVersion ? "unknown PHP version" : "no PHP version reported",
-      armedText: "press again to reload PHP-FPM",
+      armedText: "press Y to reload PHP-FPM",
       done: "PHP-FPM reload requested",
       scopeMessage: serverScopeMessage,
       path: site ? serviceActionPath(org, site.serverId, "php") : "",
@@ -786,16 +782,12 @@ function siteActions(org, site) {
 // from the site alone — which is why it is a function of its own and not a
 // seventh entry in `siteActions`. Everything else about it is an ordinary write
 // job, so `Panel.runWriteAction` and `Service._startAction` need no special
-// case beyond the two below.
+// case beyond the one below.
 //
-// `confirm: "Y"` rather than the deploy's "again": this is arbitrary remote
-// code execution, so it takes the same second key a reboot does, and for the
-// same reason — the press that sends it should be one nothing else means.
-//
-// `bodyStdin` is the other difference. Every other body here is a fixed word
-// decided in this file; this one is what someone typed, and while it is not a
-// credential it can quote one, so it does not go in an argv that
-// /proc/<pid>/cmdline hands to every process on the machine.
+// `bodyStdin` is that one. Every other body here is a fixed word decided in
+// this file; this one is what someone typed, and while it is not a credential
+// it can quote one, so it does not go in an argv that /proc/<pid>/cmdline
+// hands to every process on the machine.
 //
 // The text is trimmed once, here, and everything downstream uses what this
 // sends: Forge stores the command as it received it and `commandFrom` compares
@@ -805,7 +797,7 @@ function siteCommandAction(org, site, command) {
   var text = String(command === undefined || command === null ? "" : command).trim()
   var ready = !!site && text !== ""
   return { id: "command-run", label: "Run", hint: "",
-           armable: true, confirm: "Y",
+           armable: true,
            // Rides into the arm key, for the reason the maintenance toggle's
            // does — and more so: this row *is* its text. The field can still be
            // typed into for one turn of the event loop after enter has armed it
@@ -900,12 +892,10 @@ function commandFrom(body, sent, sinceMs, afterMs) {
 // here rather than typed, so unlike the site command it rides the argv the way
 // the maintenance toggle's does — there is nothing in it a user wrote.
 //
-// `Y` rather than two presses, on the reboot's reasoning and more of it: a
-// recipe is an arbitrary script, usually run as root, and this widget cannot
-// show what is in it. No `armIntent`: neither the path nor the body depends on
-// live state, so a refresh landing inside the arm window rebuilds a row that
-// means exactly what it meant — and a recipe deleted under the arm loses its
-// row entirely, which `confirmArmed` already reports.
+// No `armIntent`: neither the path nor the body depends on live state, so a
+// refresh landing inside the arm window rebuilds a row that means exactly what
+// it meant — and a recipe deleted under the arm loses its row entirely, which
+// `confirmArmed` already reports.
 function recipeRunAction(org, server, recipe) {
   var state = server ? String(server.state) : "unknown"
   var ready = state === "ready"
@@ -915,7 +905,7 @@ function recipeRunAction(org, server, recipe) {
   var addressable = !!recipe && isFinite(serverId)
   var available = addressable && ready
   return { id: "recipe-run", label: recipe ? String(recipe.name) : "",
-           hint: "", armable: true, confirm: "Y",
+           hint: "", armable: true,
            available: available,
            reason: available ? "" : !addressable ? "not listed" : serverStateLabel(state),
            armedText: "press Y to run on " + (server ? String(server.name) : "this server"),
@@ -1080,7 +1070,7 @@ var serverScopeMessage = "Your token can't manage servers — that needs "
 // What the server view offers. Shaped like `siteActions` — the same
 // {id,label,hint,available,reason} the panel turns into rows — plus what a
 // write needs: the path and body to send, what the row says while it is armed,
-// what to flash when Forge takes it, and how it has to be confirmed.
+// and what to flash when Forge takes it.
 //
 // Only restarts are here, and only of what the server's type runs — see
 // `serverTypeServices` for why the type decides rather than the payload. A row
@@ -1113,8 +1103,8 @@ function serverActions(org, server) {
   return [
     { id: "nginx-restart", service: "nginx", label: "Restart nginx", hint: "",
       available: ready, reason: ready ? "" : stateReason,
-      armable: true, confirm: "again",
-      armedText: "press again to restart nginx",
+      armable: true,
+      armedText: "press Y to restart nginx",
       done: "nginx restart requested",
       scopeMessage: serverScopeMessage,
       path: serviceActionPath(org, id, "nginx"),
@@ -1123,16 +1113,16 @@ function serverActions(org, server) {
     // the version in the body is the server's default as of the last sweep.
     { id: "php-reload", service: "php", label: "Reload PHP-FPM" + suffix, hint: "",
       available: hasPhp, reason: hasPhp ? "" : !ready ? stateReason : "no PHP version reported",
-      armable: true, confirm: "again", armIntent: php,
-      armedText: "press again to reload PHP-FPM",
+      armable: true, armIntent: php,
+      armedText: "press Y to reload PHP-FPM",
       done: "PHP-FPM reload requested",
       scopeMessage: serverScopeMessage,
       path: serviceActionPath(org, id, "php"),
       body: { action: "reload", version: php } },
     { id: "php-restart", service: "php", label: "Restart PHP-FPM" + suffix, hint: "",
       available: hasPhp, reason: hasPhp ? "" : !ready ? stateReason : "no PHP version reported",
-      armable: true, confirm: "again", armIntent: php,
-      armedText: "press again to restart PHP-FPM",
+      armable: true, armIntent: php,
+      armedText: "press Y to restart PHP-FPM",
       done: "PHP-FPM restart requested",
       scopeMessage: serverScopeMessage,
       path: serviceActionPath(org, id, "php"),
@@ -1142,39 +1132,34 @@ function serverActions(org, server) {
     // back up with it — every worker on the box, not one site's.
     { id: "supervisor-restart", service: "supervisor", label: "Restart supervisor", hint: "",
       available: ready, reason: ready ? "" : stateReason,
-      armable: true, confirm: "again",
-      armedText: "press again to restart supervisor",
+      armable: true,
+      armedText: "press Y to restart supervisor",
       done: "supervisor restart requested",
       scopeMessage: serverScopeMessage,
       path: serviceActionPath(org, id, "supervisor"),
       body: { action: "reboot" } },
     { id: "redis-restart", service: "redis", label: "Restart redis", hint: "",
       available: ready, reason: ready ? "" : stateReason,
-      armable: true, confirm: "again",
-      armedText: "press again to restart redis",
+      armable: true,
+      armedText: "press Y to restart redis",
       done: "redis restart requested",
       scopeMessage: serverScopeMessage,
       path: serviceActionPath(org, id, "redis"),
       body: { action: "reboot" } },
     // Named for what the server runs, so the row says "MariaDB" where that is
-    // what goes down. Two presses like the others rather than the reboot's `Y`:
-    // queries fail for the seconds it takes, but nothing needs bringing back by
-    // hand afterwards.
+    // what goes down.
     { id: "database-restart", service: "database", label: "Restart " + dbName, hint: "",
       available: dbAvailable,
       reason: dbAvailable ? "" : !ready ? stateReason : "unknown database type",
-      armable: true, confirm: "again",
-      armedText: "press again to restart " + dbName,
+      armable: true,
+      armedText: "press Y to restart " + dbName,
       done: dbName + " restart requested",
       scopeMessage: serverScopeMessage,
       path: dbKnown ? serviceActionPath(org, id, db.endpoint) : "",
       body: { action: "reboot" } },
-    // The one row here that takes every site on the server down with it, so it
-    // is confirmed by a key nothing else in the panel uses and no movement key
-    // could reach. See the panel's `runWriteAction`.
     { id: "reboot", label: "Reboot server", hint: "",
       available: rebootable, reason: rebootable ? "" : stateReason,
-      armable: true, confirm: "Y",
+      armable: true,
       armedText: "press Y to reboot",
       done: "Reboot requested",
       scopeMessage: serverScopeMessage,
@@ -1359,7 +1344,7 @@ function deploymentLabel(status) {
 // A site row in the tree arms without going through an action at all — `d`
 // reaches it directly — so the deploy's wording is the default rather than
 // something the deploy action has to carry.
-var defaultArmedText = "press again to deploy"
+var defaultArmedText = "press Y to deploy"
 
 function rowView(row, ctx) {
   var kind = row ? String(row.kind) : ""
